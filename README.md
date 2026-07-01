@@ -60,6 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/in
 - **대화 본문 미열람** — JSONL에서 읽는 것은 **사용량 메타데이터뿐**입니다: 타임스탬프, 모델명, 토큰 수(`message.usage`), 메시지 UUID. 프롬프트·응답 등 대화 내용은 파싱하지 않습니다.
 - **읽기 전용** — `~/.claude/stats-cache.json`과 `~/.claude/projects/**/*.jsonl`을 읽기만 하며 수정하지 않습니다.
 - **로컬 로그** — LaunchAgent 실행 시 stdout/stderr가 `~/.claude-monitor.log`에만 기록됩니다.
+- **중복 실행 방지** — 실행 시 `~/.claude-monitor.lock`에 파일 잠금을 걸어 인스턴스가 하나만 뜨도록 합니다(프로세스 종료 시 자동 해제).
 
 소스는 단일 파일(`ClaudeMonitor.swift`)이라 위 내용을 직접 감사할 수 있습니다.
 

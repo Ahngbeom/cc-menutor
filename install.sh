@@ -39,7 +39,10 @@ cat > "$PLIST_DST" << EOF
     <true/>
 
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>StandardErrorPath</key>
     <string>${HOME}/.claude-monitor.log</string>

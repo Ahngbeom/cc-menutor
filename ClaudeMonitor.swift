@@ -1586,6 +1586,12 @@ func runSelfTests() -> Never {
         else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
     }
 
+    // acquireSingleInstanceLock (실제 ~/.claude-monitor.lock 대신 임시 경로 사용)
+    let lockTestPath = NSTemporaryDirectory() + "ClaudeMonitorSelfTest-\(UUID().uuidString).lock"
+    check(acquireSingleInstanceLock(path: lockTestPath), "lock: 첫 획득 성공")
+    check(!acquireSingleInstanceLock(path: lockTestPath), "lock: 동일 파일 재획득 실패(중복 인스턴스 차단)")
+    try? FileManager.default.removeItem(atPath: lockTestPath)
+
     if failures == 0 {
         print("All tests passed. ✅")
         exit(0)
@@ -1595,10 +1601,33 @@ func runSelfTests() -> Never {
     }
 }
 
+// MARK: - Single Instance Guard
+//
+// 이 앱은 번들 ID가 없는 bare 실행 파일이라 NSRunningApplication 번들 기반 중복 체크를 쓸 수 없다.
+// flock은 파일 디스크립터 단위로 걸리고 프로세스 종료 시 커널이 자동 해제하므로,
+// PID 파일 방식과 달리 크래시로 인한 스테일 락이 남지 않는다.
+
+import Darwin
+
+let defaultLockPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".claude-monitor.lock").path
+
+// fd는 의도적으로 닫지 않는다 — 락은 프로세스 생존 동안 유지되어야 하며 종료 시 커널이 자동 해제한다.
+func acquireSingleInstanceLock(path: String = defaultLockPath) -> Bool {
+    let fd = open(path, O_CREAT | O_RDWR, 0o644)
+    guard fd >= 0 else { return true }  // 락 파일 자체를 못 열면(권한 등) 차단하지 않고 통과
+    return flock(fd, LOCK_EX | LOCK_NB) == 0
+}
+
 // MARK: - Entry Point
 
 if CommandLine.arguments.contains("--test") {
     runSelfTests()
+}
+
+guard acquireSingleInstanceLock() else {
+    FileHandle.standardError.write("이미 실행 중인 인스턴스가 있어 종료합니다.\n".data(using: .utf8)!)
+    exit(0)
 }
 
 let app = NSApplication.shared
