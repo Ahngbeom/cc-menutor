@@ -1,0 +1,40 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 프로젝트 개요
+
+macOS 메뉴바에서 Claude Code의 5시간 블록 사용량(토큰·비용)을 보여주는 **단일 파일 네이티브 Swift 앱**. 전체 로직이 `ClaudeMonitor.swift` 하나에 들어 있고, 나머지는 빌드/설치 셸 스크립트다. Xcode 프로젝트나 SwiftPM 매니페스트는 없다.
+
+## 명령어
+
+```bash
+./build.sh        # swiftc -O -framework Cocoa 로 단일 파일 컴파일 (캐시: /tmp/swiftmodulecache)
+./ClaudeMonitor   # 포그라운드 실행 (Dock 미표시 accessory 앱) — 동작 확인용
+./install.sh      # LaunchAgent(io.github.ahngbeom.claude-monitor.plist) 생성·로드 → 로그인 시 자동 시작
+./setup.sh        # build + install 한 번에
+./uninstall.sh    # LaunchAgent 언로드·제거
+tail -f ~/.claude-monitor.log   # LaunchAgent 실행 시 stdout/stderr 로그
+```
+
+테스트 프레임워크·린터·패키지 매니저는 없다. **검증은 `./build.sh` 성공 + `./ClaudeMonitor` 수동 실행으로 메뉴바 동작을 직접 확인**하는 것이 전부다.
+
+요구사항: macOS 12+, Xcode Command Line Tools(`swiftc`), 데이터 소스를 만드는 Claude Code CLI.
+
+## 아키텍처
+
+`ClaudeMonitor.swift` 한 파일이지만 데이터 흐름은 4단계로 나뉜다:
+
+1. **데이터 소스** — `UsageDataReader.readAll()`이 `~/.claude/projects/`를 재귀 순회하며 `.jsonl`을 읽는다. `type=="assistant"` 라인만 파싱하고, `uuid`로 중복 제거하며, ISO8601(소수초 유무 둘 다) 타임스탬프를 처리한다. 외부 전송 없는 완전 오프라인.
+2. **가격/비용** — `PRICING` 패턴 테이블 + `getPricing(for:)`(부분 문자열 매칭, 미매칭 시 `DEFAULT_PRICING`=Sonnet 단가). `UsageEntry.cost`가 input/output/cacheRead/cacheWrite 4종 토큰으로 비용을 산출한다.
+3. **집계** — `UsageStats`가 entry 배열을 받아 합계·모델별 breakdown을 계산. `FiveHourBlock.active(from:now:)`는 **부동 앵커** 도메인 로직이다: 유휴(>5시간 공백) 후 첫 활동 시각을 UTC 정시로 내림한 지점에서 시작해 5시간 윈도우를 +5h씩 체인한다(고정 00/05/10/15/20 정렬이 **아님**). 1차(stats-cache) 경로에서는 이 계산 대신 CLI가 산출한 `startTime/endTime`을 그대로 쓴다.
+4. **UI** — `ClaudeMonitorApp`(NSApplicationDelegate)이 30초 `Timer`로 `refresh()` → `readAll()` → `buildMenu()`를 반복한다. 메뉴바 타이틀은 현재 블록의 **output-only 토큰 + 비용**.
+
+## 변경 시 주의점
+
+- **새 모델 추가·단가 변경 시 두 곳을 함께 고친다**: `PRICING`(비용)과 `shortModelName()`(표시명). 둘 다 부분 문자열 매칭이므로 더 구체적인 패턴을 앞에 둬야 한다(예: `opus-4`가 `opus`보다 먼저).
+- `PRICING`/비용은 **추정값**이며 Pro/Max 플랜의 실제 청구액이 아니다. 비용 로직을 바꿔도 이 전제를 유지한다.
+- **비용 소스는 2경로다**: 1차는 `stats-cache.json`(CLI 실측 `costUSD`), 폴백은 JSONL+`PRICING`(추정). 두 숫자는 분기할 수 있으며, 폴백 진입 시 메뉴 상단에 "추정 모드" 헤더로 사용자에게 고지한다(`buildMenuFromEntries`). 단가 로직 수정은 폴백에만 영향, 1차 경로는 CLI가 계산한다.
+- LaunchAgent plist는 `install.sh`가 바이너리 **절대경로를 박아** 생성한다. 바이너리 위치를 옮기면 재설치 필요.
+- 사용자 조정 지점은 README "커스터마이징" 섹션 참고: `PRICING` 단가, 30초 `Timer` 간격, `FiveHourBlock.active()` 윈도우 계산.
+- **5시간 사용 블록 ≠ 서버 rate-limit 리셋**: 이 앱의 블록은 메시지 타임스탬프 기반 **부동(첫 활동 기준)** 윈도우다. Claude Code의 "한도 90% 근접, X시 리셋" 경고는 서버 응답 헤더 기반 롤링 윈도우라 기준·리셋 시각이 다르며, 그 값은 로컬에 저장되지 않는다. 두 개념을 혼동하지 말 것.

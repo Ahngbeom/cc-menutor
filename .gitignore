@@ -1,0 +1,16 @@
+# Compiled binary (build with ./build.sh)
+/ClaudeMonitor
+
+# Swift build artifacts
+.build/
+*.o
+*.swiftmodule
+*.swiftdoc
+/tmp/swiftmodulecache/
+
+# Runtime logs
+*.log
+.claude-monitor.log
+
+# macOS
+.DS_Store
