@@ -55,6 +55,145 @@ func usageWarning(tokens: Int, cost: Double) -> UsageWarning? {
                         warnAt: WARN_RATIO, critAt: CRIT_RATIO)
 }
 
+// MARK: - Title Field Customization (메뉴바 표시 항목 선택 — UserDefaults 영속화)
+
+enum TitleField: String, CaseIterable {
+    case outputTokens, totalTokens, cost, remainingTime, model
+
+    var label: String {
+        switch self {
+        case .outputTokens:  return "출력 토큰"
+        case .totalTokens:   return "전체 토큰"
+        case .cost:          return "비용"
+        case .remainingTime: return "남은 시간"
+        case .model:         return "모델명"
+        }
+    }
+
+    var defaultsKey: String { "titleShow_\(rawValue)" }
+}
+
+enum TitleSettings {
+    private static let defaultEnabled: Set<TitleField> = [.model, .totalTokens, .cost, .remainingTime]
+
+    static func isEnabled(_ field: TitleField, defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: field.defaultsKey) != nil else { return defaultEnabled.contains(field) }
+        return defaults.bool(forKey: field.defaultsKey)
+    }
+
+    static func enabledFields(defaults: UserDefaults = .standard) -> [TitleField] {
+        TitleField.allCases.filter { isEnabled($0, defaults: defaults) }
+    }
+
+    // 마지막 남은 1개는 해제 불가
+    static func toggle(_ field: TitleField, defaults: UserDefaults = .standard) {
+        let turningOff = isEnabled(field, defaults: defaults)
+        if turningOff && enabledFields(defaults: defaults).count <= 1 { return }
+        defaults.set(!turningOff, forKey: field.defaultsKey)
+    }
+}
+
+enum TitleMoveDirection { case up, down }
+
+extension TitleSettings {
+    private static let orderKey = "titleFieldsOrder"
+    private static let defaultOrder: [TitleField] = [.model, .totalTokens, .cost, .remainingTime, .outputTokens]
+
+    // 저장된 순서 + 신규/누락 필드는 끝에 자동 보강 (스키마 드리프트 내성 — StatsBlock 옵셔널 필드와 동일한 사고방식)
+    static func order(defaults: UserDefaults = .standard) -> [TitleField] {
+        guard let raw = defaults.array(forKey: orderKey) as? [String] else { return defaultOrder }
+        let known = raw.compactMap(TitleField.init(rawValue:))
+        let missing = defaultOrder.filter { !known.contains($0) }
+        return known + missing
+    }
+
+    static func enabledFieldsInOrder(defaults: UserDefaults = .standard) -> [TitleField] {
+        order(defaults: defaults).filter { isEnabled($0, defaults: defaults) }
+    }
+
+    // 경계(맨 위/맨 아래)에서는 조용히 무시
+    static func move(_ field: TitleField, direction: TitleMoveDirection, defaults: UserDefaults = .standard) {
+        var current = order(defaults: defaults)
+        guard let idx = current.firstIndex(of: field) else { return }
+        let newIdx = direction == .up ? idx - 1 : idx + 1
+        guard current.indices.contains(newIdx) else { return }
+        current.swapAt(idx, newIdx)
+        defaults.set(current.map(\.rawValue), forKey: orderKey)
+    }
+}
+
+enum TitleSeparator: String, CaseIterable {
+    case space = " ", dot = " · ", pipe = " | ", none = ""
+    var label: String {
+        switch self {
+        case .space: return "공백"
+        case .dot:   return "가운데점 (·)"
+        case .pipe:  return "세로막대 (|)"
+        case .none:  return "없음"
+        }
+    }
+}
+
+extension TitleSettings {
+    private static let separatorKey = "titleSeparator"
+    static func separator(defaults: UserDefaults = .standard) -> TitleSeparator {
+        guard let raw = defaults.string(forKey: separatorKey), let s = TitleSeparator(rawValue: raw) else { return .dot }
+        return s
+    }
+    static func setSeparator(_ sep: TitleSeparator, defaults: UserDefaults = .standard) {
+        defaults.set(sep.rawValue, forKey: separatorKey)
+    }
+}
+
+enum TitleIcon: String, CaseIterable {
+    case keyboard = "⌨", robot = "🤖", brain = "🧠", chat = "💬", bolt = "⚡", chart = "📊", diamond = "🔶", none = ""
+    var label: String {
+        switch self {
+        case .keyboard: return "⌨️ 키보드 (기본)"
+        case .robot:    return "🤖 로봇"
+        case .brain:    return "🧠 두뇌"
+        case .chat:     return "💬 말풍선"
+        case .bolt:     return "⚡ 번개"
+        case .chart:    return "📊 차트"
+        case .diamond:  return "🔶 다이아몬드"
+        case .none:     return "표시 안 함"
+        }
+    }
+}
+
+extension TitleSettings {
+    private static let iconKey = "titleIcon"
+    static func icon(defaults: UserDefaults = .standard) -> TitleIcon {
+        guard let raw = defaults.string(forKey: iconKey), let i = TitleIcon(rawValue: raw) else { return .keyboard }
+        return i
+    }
+    static func setIcon(_ icon: TitleIcon, defaults: UserDefaults = .standard) {
+        defaults.set(icon.rawValue, forKey: iconKey)
+    }
+}
+
+enum RefreshInterval: TimeInterval, CaseIterable {
+    case sec10 = 10, sec30 = 30, min1 = 60, min5 = 300
+    var label: String {
+        switch self {
+        case .sec10: return "10초"
+        case .sec30: return "30초"
+        case .min1:  return "1분"
+        case .min5:  return "5분"
+        }
+    }
+}
+
+enum RefreshSettings {
+    private static let intervalKey = "refreshIntervalSeconds"
+    static func interval(defaults: UserDefaults = .standard) -> RefreshInterval {
+        RefreshInterval(rawValue: defaults.double(forKey: intervalKey)) ?? .sec30
+    }
+    static func setInterval(_ interval: RefreshInterval, defaults: UserDefaults = .standard) {
+        defaults.set(interval.rawValue, forKey: intervalKey)
+    }
+}
+
 // MARK: - Model Pricing (USD per million tokens)
 
 struct ModelPricing {
@@ -443,6 +582,38 @@ func formatTimeShort(_ date: Date) -> String {
     return formatter.string(from: date)
 }
 
+// MARK: - Title Text Rendering (경로 무관 공통 조합)
+
+struct TitleContext {
+    let outputTokens: Int
+    let totalTokens: Int
+    let cost: Double
+    let remainingText: String?   // 이미 formatTime()된 문자열, 알 수 없으면 nil
+    let model: String?           // shortModelName 적용 전 원본 모델 문자열
+}
+
+// idle/no-data 고정 문자열과 launch placeholder도 이 값을 공유해 커스터마이징과 어긋나지 않게 한다.
+func titleIconPrefix() -> String {
+    let icon = TitleSettings.icon().rawValue
+    return icon.isEmpty ? "" : "\(icon) "
+}
+
+func buildTitleText(_ ctx: TitleContext) -> String {
+    var parts: [String] = []
+    let icon = TitleSettings.icon().rawValue
+    if !icon.isEmpty { parts.append(icon) }
+    for field in TitleSettings.enabledFieldsInOrder() {
+        switch field {
+        case .outputTokens:  parts.append(formatTokens(ctx.outputTokens))
+        case .totalTokens:   parts.append(formatTokens(ctx.totalTokens))
+        case .cost:          parts.append(formatCost(ctx.cost))
+        case .remainingTime: if let r = ctx.remainingText { parts.append(r) }
+        case .model:         if let m = ctx.model { parts.append(shortModelName(m)) }
+        }
+    }
+    return parts.joined(separator: TitleSettings.separator().rawValue)
+}
+
 // MARK: - Stats Cache (Claude Code's own aggregate, ~/.claude/stats-cache.json)
 //
 // Claude Code CLI가 직접 유지하는 권위 있는 사용량 집계. 이 앱이 손으로 재구현하던
@@ -600,17 +771,23 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     var cachedAll: [UsageEntry] = []
     var cachedStats: StatsCache?
     private var isRefreshing = false
+    weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)  // Hide from Dock
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        statusItem.button?.title = "⌨ …"
+        statusItem.button?.title = "\(titleIconPrefix())…"
 
         refresh()
+        rescheduleTimer()
+    }
 
-        timer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+    // 갱신 주기 변경 시 기존 타이머를 무효화하고 새 간격으로 재스케줄
+    func rescheduleTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: RefreshSettings.interval().rawValue, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
@@ -642,6 +819,64 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    // 메뉴 트리 전체를 재구성하지 않고 상태바 타이틀만 즉시 재계산 — 서브메뉴가 열려 있는 동안의
+    // 경량 갱신(refreshTitleFieldsSubmenu())에서 재사용하기 위해 buildMenu(fromCache:)/
+    // buildMenuFromEntries()의 타이틀 계산 로직과 분리해 둔다.
+    func updateStatusBarTitle() {
+        if let stats = cachedStats {
+            updateStatusBarTitle(fromCache: stats)
+        } else {
+            updateStatusBarTitleFromEntries()
+        }
+    }
+
+    func updateStatusBarTitle(fromCache stats: StatsCache) {
+        let active = stats.activeBlock()
+        let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
+        let resetText: String = {
+            guard let b = active else { return "" }
+            if let rm = b.projection?.remainingMinutes { return formatTime(Double(rm) * 60) }
+            if let e = parseISO(b.endTime) { return formatTime(max(0, e.timeIntervalSinceNow)) }
+            return ""
+        }()
+        if let b = active {
+            let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
+                                   totalTokens: b.totalTokens,
+                                   cost: b.costUSD,
+                                   remainingText: resetText.isEmpty ? nil : resetText,
+                                   model: b.models.last)
+            renderTitle(normal: buildTitleText(ctx), warning: warning)
+        } else {
+            renderTitle(normal: "\(titleIconPrefix())idle", warning: nil)
+        }
+    }
+
+    func updateStatusBarTitleFromEntries() {
+        let block = FiveHourBlock.active(from: cachedAll)
+        let blockEntries: [UsageEntry]
+        if let block = block {
+            blockEntries = cachedAll.filter { $0.timestamp >= block.start && $0.timestamp < block.end }
+        } else {
+            blockEntries = []
+        }
+        let blockStats = UsageStats(entries: blockEntries)
+        let noData = cachedAll.isEmpty && !FileManager.default.fileExists(atPath: reader.projectsDir.path)
+        let warning = (block != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
+
+        if noData {
+            renderTitle(normal: "\(titleIconPrefix())no data", warning: nil)
+        } else if block == nil {
+            renderTitle(normal: "\(titleIconPrefix())idle", warning: nil)
+        } else if let b = block {
+            let ctx = TitleContext(outputTokens: blockStats.outputTokens,
+                                   totalTokens: blockStats.totalTokens,
+                                   cost: blockStats.totalCost,
+                                   remainingText: b.remaining > 0 ? formatTime(b.remaining) : nil,
+                                   model: blockEntries.last?.model)
+            renderTitle(normal: buildTitleText(ctx), warning: warning)
+        }
+    }
+
     // ── 1차 경로: Claude Code stats-cache.json (권위 비용·실제 5시간 블록) ──
     func buildMenu(fromCache stats: StatsCache) {
         let active = stats.activeBlock()
@@ -653,13 +888,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             return ""
         }()
 
-        // --- Menu Bar Title ---
-        if let b = active {
-            renderTitle(normal: "⌨ \(formatTokens(b.tokenCounts.outputTokens)) \(formatCost(b.costUSD))",
-                        warning: warning)
-        } else {
-            renderTitle(normal: "⌨ idle", warning: nil)
-        }
+        updateStatusBarTitle(fromCache: stats)
 
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -699,7 +928,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                     addLabel(menu, "  ⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음")
                 }
             }
-            addLabel(menu, "  ⌨ 타이틀 = 블록 output 토큰 · 비용")
         } else {
             addLabel(menu, "  현재 활성 블록 없음")
             addLabel(menu, "  다음 메시지부터 새 블록이 시작됩니다.")
@@ -741,14 +969,30 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    // ── 메뉴 하단 공통(최종 업데이트·새로고침·버전·종료) ──
+    // ── 메뉴 하단 공통(최종 업데이트·새로고침·표시 항목·버전·종료) ──
     func appendFooter(_ menu: NSMenu) {
         let updateStr = formatTimeShort(lastUpdateTime)
-        addLabel(menu, "  최종 업데이트: \(updateStr) (30초 자동 갱신)")
+        addLabel(menu, "  최종 업데이트: \(updateStr) (\(RefreshSettings.interval().label) 자동 갱신)")
 
         let refreshItem = NSMenuItem(title: "  🔄 지금 새로고침", action: #selector(manualRefresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
+
+        let titleFieldsItem = NSMenuItem(title: "  ⌨ 메뉴바 표시 항목", action: nil, keyEquivalent: "")
+        titleFieldsItem.submenu = buildTitleFieldsSubmenu()
+        menu.addItem(titleFieldsItem)
+
+        let separatorItem = NSMenuItem(title: "  ⌇ 표시 항목 구분자", action: nil, keyEquivalent: "")
+        separatorItem.submenu = buildSeparatorSubmenu()
+        menu.addItem(separatorItem)
+
+        let iconItem = NSMenuItem(title: "  ⌨ 메뉴바 아이콘", action: nil, keyEquivalent: "")
+        iconItem.submenu = buildIconSubmenu()
+        menu.addItem(iconItem)
+
+        let refreshIntervalItem = NSMenuItem(title: "  ⏱ 자동 갱신 주기", action: nil, keyEquivalent: "")
+        refreshIntervalItem.submenu = buildRefreshIntervalSubmenu()
+        menu.addItem(refreshIntervalItem)
 
         menu.addItem(.separator())
 
@@ -757,6 +1001,134 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let quitItem = NSMenuItem(title: "종료", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    // ── 메뉴바 표시 항목 서브메뉴 — 커스텀 NSView 행(체크박스 + ▲/▼) ──
+    // 일반 NSMenuItem은 클릭하면 항상 메뉴 트래킹 세션을 끝내고 메뉴 전체를 닫는다.
+    // 커스텀 뷰 안의 NSButton은 자체 target-action으로 클릭을 소비하므로 메뉴가 열린 채 유지된다
+    // (macOS 볼륨/밝기 슬라이더 등에 쓰이는 표준 패턴).
+    func titleFieldRowView(field: TitleField, isFirst: Bool, isLast: Bool) -> NSView {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
+        let idx = TitleField.allCases.firstIndex(of: field)!  // 순서와 무관한 안정적 식별자
+
+        let checkbox = NSButton(checkboxWithTitle: field.label, target: self, action: #selector(toggleTitleFieldCheckbox(_:)))
+        checkbox.frame = NSRect(x: 14, y: 2, width: 160, height: 18)
+        checkbox.state = TitleSettings.isEnabled(field) ? .on : .off
+        checkbox.tag = idx
+        row.addSubview(checkbox)
+
+        let up = NSButton(title: "▲", target: self, action: #selector(moveTitleFieldUpButton(_:)))
+        up.frame = NSRect(x: 176, y: 1, width: 20, height: 20)
+        up.isEnabled = !isFirst
+        up.tag = idx
+        row.addSubview(up)
+
+        let down = NSButton(title: "▼", target: self, action: #selector(moveTitleFieldDownButton(_:)))
+        down.frame = NSRect(x: 198, y: 1, width: 20, height: 20)
+        down.isEnabled = !isLast
+        down.tag = idx
+        row.addSubview(down)
+
+        return row
+    }
+
+    func buildTitleFieldsSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let fields = TitleSettings.order()
+        for (idx, field) in fields.enumerated() {
+            let item = NSMenuItem()
+            item.view = titleFieldRowView(field: field, isFirst: idx == 0, isLast: idx == fields.count - 1)
+            sub.addItem(item)
+        }
+        titleFieldsSubmenu = sub
+        return sub
+    }
+
+    // 메뉴 트리 전체(statusItem.menu)는 건드리지 않고 타이틀과 이 서브메뉴의 행만 갱신 —
+    // 그래야 열려 있는 서브메뉴가 buildMenu()의 통째 교체로 인해 닫히지 않는다.
+    func refreshTitleFieldsSubmenu() {
+        updateStatusBarTitle()
+        guard let sub = titleFieldsSubmenu else { return }
+        let fields = TitleSettings.order()
+        for (idx, item) in sub.items.enumerated() where idx < fields.count {
+            item.view = titleFieldRowView(field: fields[idx], isFirst: idx == 0, isLast: idx == fields.count - 1)
+        }
+    }
+
+    @objc func toggleTitleFieldCheckbox(_ sender: NSButton) {
+        TitleSettings.toggle(TitleField.allCases[sender.tag])
+        refreshTitleFieldsSubmenu()
+    }
+
+    @objc func moveTitleFieldUpButton(_ sender: NSButton) {
+        TitleSettings.move(TitleField.allCases[sender.tag], direction: .up)
+        refreshTitleFieldsSubmenu()
+    }
+
+    @objc func moveTitleFieldDownButton(_ sender: NSButton) {
+        TitleSettings.move(TitleField.allCases[sender.tag], direction: .down)
+        refreshTitleFieldsSubmenu()
+    }
+
+    // ── 표시 항목 구분자 서브메뉴(라디오 스타일 — 하나만 선택) ──
+    func buildSeparatorSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let current = TitleSettings.separator()
+        for sep in TitleSeparator.allCases {
+            let item = NSMenuItem(title: sep.label, action: #selector(setSeparator(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = (sep == current) ? .on : .off
+            item.representedObject = sep
+            sub.addItem(item)
+        }
+        return sub
+    }
+
+    @objc func setSeparator(_ sender: NSMenuItem) {
+        guard let sep = sender.representedObject as? TitleSeparator else { return }
+        TitleSettings.setSeparator(sep)
+        buildMenu()
+    }
+
+    // ── 메뉴바 아이콘 서브메뉴(라디오 스타일 — 하나만 선택, "표시 안 함" 포함) ──
+    func buildIconSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let current = TitleSettings.icon()
+        for icon in TitleIcon.allCases {
+            let item = NSMenuItem(title: icon.label, action: #selector(setIcon(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = (icon == current) ? .on : .off
+            item.representedObject = icon
+            sub.addItem(item)
+        }
+        return sub
+    }
+
+    @objc func setIcon(_ sender: NSMenuItem) {
+        guard let icon = sender.representedObject as? TitleIcon else { return }
+        TitleSettings.setIcon(icon)
+        buildMenu()
+    }
+
+    // ── 자동 갱신 주기 서브메뉴(라디오 스타일 — 하나만 선택) ──
+    func buildRefreshIntervalSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let current = RefreshSettings.interval()
+        for interval in RefreshInterval.allCases {
+            let item = NSMenuItem(title: interval.label, action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = (interval == current) ? .on : .off
+            item.representedObject = interval
+            sub.addItem(item)
+        }
+        return sub
+    }
+
+    @objc func setRefreshInterval(_ sender: NSMenuItem) {
+        guard let interval = sender.representedObject as? RefreshInterval else { return }
+        RefreshSettings.setInterval(interval)
+        rescheduleTimer()
+        buildMenu()
     }
 
     // ── 폴백 경로: stats-cache.json 부재 시 JSONL 직접 파싱(추정 단가) ──
@@ -781,15 +1153,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let warning = (block != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
         let resetText = block.map { formatTime($0.remaining) } ?? ""
 
-        // --- Menu Bar Title ---
-        if noData {
-            renderTitle(normal: "⌨ no data", warning: nil)
-        } else if block == nil {
-            renderTitle(normal: "⌨ idle", warning: nil)
-        } else {
-            renderTitle(normal: "⌨ \(formatTokens(blockStats.outputTokens)) \(formatCost(blockStats.totalCost))",
-                        warning: warning)
-        }
+        updateStatusBarTitleFromEntries()
 
         // --- Build Menu ---
         let menu = NSMenu()
@@ -832,7 +1196,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                         addLabel(menu, "  ⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음")
                     }
                 }
-                addLabel(menu, "  ⌨ 타이틀 = 블록 output 토큰 · 추정 총비용")
             } else {
                 addLabel(menu, "  현재 활성 블록 없음")
                 addLabel(menu, "  다음 메시지부터 새 블록이 시작됩니다.")
@@ -1068,6 +1431,160 @@ func runSelfTests() -> Never {
         check(w.level == .crit, "warn: 토큰95%·비용120% → 더 높은 비율(crit) 채택")
         check(abs(w.ratio - 1.2) < 1e-9, "warn: max ratio = 1.2")
     } else { check(false, "warn: 복합 한도 경고 반환되어야 함") }
+
+    // TitleSettings (전용 UserDefaults suite로 실제 사용자 설정과 격리)
+    let titleSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let td = UserDefaults(suiteName: titleSuite) {
+        check(TitleSettings.enabledFields(defaults: td) == [.totalTokens, .cost, .remainingTime, .model],
+              "title: 기본값 = [전체토큰, 비용, 남은시간, 모델명]")
+
+        TitleSettings.toggle(.outputTokens, defaults: td)  // outputTokens는 기본 비활성
+        check(TitleSettings.isEnabled(.outputTokens, defaults: td), "title: 토글로 항목 켜짐")
+        TitleSettings.toggle(.outputTokens, defaults: td)
+        check(!TitleSettings.isEnabled(.outputTokens, defaults: td), "title: 토글로 항목 꺼짐")
+
+        // 최소 1개 강제: 남은 항목이 1개가 될 때까지 반복해서 끄고, 그 이후로는 해제 불가
+        while TitleSettings.enabledFields(defaults: td).count > 1 {
+            TitleSettings.toggle(TitleSettings.enabledFields(defaults: td).first!, defaults: td)
+        }
+        check(TitleSettings.enabledFields(defaults: td).count == 1, "title: 하나만 남을 때까지 끄기 성공")
+        let lastField = TitleSettings.enabledFields(defaults: td).first!
+        TitleSettings.toggle(lastField, defaults: td)
+        check(TitleSettings.isEnabled(lastField, defaults: td), "title: 마지막 1개는 해제 불가")
+
+        td.removePersistentDomain(forName: titleSuite)
+    } else {
+        check(false, "title: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // buildTitleText (TitleSettings는 .standard를 읽으므로 전역 TitleField/순서/구분자 키를 모두 저장/복원.
+    // 순서·구분자는 이 테스트가 검증하려는 대상이 아니므로 고정값으로 강제해 기본값 변경과 무관하게 만든다.)
+    let savedTitleDefaults = Dictionary(uniqueKeysWithValues: TitleField.allCases.map {
+        ($0, UserDefaults.standard.object(forKey: $0.defaultsKey))
+    })
+    let savedOrder2 = UserDefaults.standard.array(forKey: "titleFieldsOrder")
+    let savedSeparator2 = UserDefaults.standard.string(forKey: "titleSeparator")
+    let savedIcon2 = UserDefaults.standard.string(forKey: "titleIcon")
+    func setEnabled(_ fields: Set<TitleField>) {
+        for f in TitleField.allCases { UserDefaults.standard.set(fields.contains(f), forKey: f.defaultsKey) }
+    }
+    UserDefaults.standard.set(TitleField.allCases.map(\.rawValue), forKey: "titleFieldsOrder")
+    TitleSettings.setSeparator(.space)
+    TitleSettings.setIcon(.keyboard)
+    let titleCtx = TitleContext(outputTokens: 12_300, totalTokens: 50_000, cost: 4.2,
+                                remainingText: nil, model: "claude-sonnet-4-5")
+    setEnabled([.outputTokens, .cost])
+    check(buildTitleText(titleCtx) == "⌨ 12.3K $4.20", "title: outputTokens+cost 조합(기존 기본 포맷과 동일)")
+    setEnabled([.remainingTime])
+    check(buildTitleText(titleCtx) == "⌨", "title: 값 없는 필드만 선택 시 ⌨ 단독으로 축소")
+    setEnabled([.model])
+    check(buildTitleText(titleCtx) == "⌨ Sonnet 4.5", "title: 모델명만 선택")
+    for (field, value) in savedTitleDefaults {
+        if let v = value { UserDefaults.standard.set(v, forKey: field.defaultsKey) }
+        else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
+    }
+    if let so = savedOrder2 { UserDefaults.standard.set(so, forKey: "titleFieldsOrder") }
+    else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
+    if let ss = savedSeparator2 { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
+    else { UserDefaults.standard.removeObject(forKey: "titleSeparator") }
+    if let si = savedIcon2 { UserDefaults.standard.set(si, forKey: "titleIcon") }
+    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
+
+    // TitleSettings.order / move (전용 UserDefaults suite로 격리)
+    let orderSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let od = UserDefaults(suiteName: orderSuite) {
+        check(TitleSettings.order(defaults: od) == [.model, .totalTokens, .cost, .remainingTime, .outputTokens],
+              "order: 기본값 = [모델명,전체토큰,비용,남은시간,출력토큰]")
+
+        TitleSettings.move(.cost, direction: .up, defaults: od)
+        check(TitleSettings.order(defaults: od) == [.model, .cost, .totalTokens, .remainingTime, .outputTokens],
+              "order: cost를 위로 이동 → totalTokens와 스왑")
+
+        // 경계 무시: 맨 위 항목을 위로, 맨 아래 항목을 아래로 이동해도 무변화
+        let before = TitleSettings.order(defaults: od)
+        TitleSettings.move(before.first!, direction: .up, defaults: od)
+        TitleSettings.move(before.last!, direction: .down, defaults: od)
+        check(TitleSettings.order(defaults: od) == before, "order: 경계에서 이동 시도는 무시됨")
+
+        // enabledFieldsInOrder: 기본 활성 항목 하나(remainingTime)를 꺼서 필터링이 순서를 유지한 채 동작하는지 확인
+        TitleSettings.toggle(.remainingTime, defaults: od)
+        check(TitleSettings.enabledFieldsInOrder(defaults: od) == [.model, .cost, .totalTokens],
+              "order: enabledFieldsInOrder는 활성 필드만 현재 순서대로 반환")
+        od.removePersistentDomain(forName: orderSuite)
+    } else {
+        check(false, "order: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // TitleSettings.separator (전용 suite)
+    let sepSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let sd = UserDefaults(suiteName: sepSuite) {
+        check(TitleSettings.separator(defaults: sd) == .dot, "separator: 기본값 = 가운데점")
+        TitleSettings.setSeparator(.pipe, defaults: sd)
+        check(TitleSettings.separator(defaults: sd) == .pipe, "separator: 저장/조회 왕복")
+        sd.removePersistentDomain(forName: sepSuite)
+    } else {
+        check(false, "separator: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // TitleSettings.icon (전용 suite)
+    let iconSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let ic = UserDefaults(suiteName: iconSuite) {
+        check(TitleSettings.icon(defaults: ic) == .keyboard, "icon: 기본값 = 키보드")
+        TitleSettings.setIcon(.robot, defaults: ic)
+        check(TitleSettings.icon(defaults: ic) == .robot, "icon: 저장/조회 왕복")
+        ic.removePersistentDomain(forName: iconSuite)
+    } else {
+        check(false, "icon: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+    let savedIcon3 = UserDefaults.standard.string(forKey: "titleIcon")
+    TitleSettings.setIcon(.keyboard)
+    check(titleIconPrefix() == "⌨ ", "icon: titleIconPrefix 기본 아이콘")
+    TitleSettings.setIcon(.none)
+    check(titleIconPrefix() == "", "icon: titleIconPrefix 표시 안 함")
+    if let si3 = savedIcon3 { UserDefaults.standard.set(si3, forKey: "titleIcon") }
+    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
+
+    // RefreshSettings.interval (전용 suite)
+    let refreshSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let rd = UserDefaults(suiteName: refreshSuite) {
+        check(RefreshSettings.interval(defaults: rd) == .sec30, "refresh: 기본값 = 30초")
+        RefreshSettings.setInterval(.min1, defaults: rd)
+        check(RefreshSettings.interval(defaults: rd) == .min1, "refresh: 저장/조회 왕복")
+        rd.removePersistentDomain(forName: refreshSuite)
+    } else {
+        check(false, "refresh: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // buildTitleText: 커스텀 구분자 + 순서 + 아이콘 조합 (전역 .standard 키를 저장/복원 — enabled 상태도 포함)
+    let savedOrder = UserDefaults.standard.array(forKey: "titleFieldsOrder")
+    let savedSeparator = UserDefaults.standard.string(forKey: "titleSeparator")
+    let savedIcon4 = UserDefaults.standard.string(forKey: "titleIcon")
+    let savedEnabled2 = Dictionary(uniqueKeysWithValues: TitleField.allCases.map {
+        ($0, UserDefaults.standard.object(forKey: $0.defaultsKey))
+    })
+    setEnabled([.outputTokens, .cost, .model])
+    UserDefaults.standard.set(["model", "cost", "outputTokens"], forKey: "titleFieldsOrder")
+    TitleSettings.setIcon(.keyboard)
+    TitleSettings.setSeparator(.pipe)
+    check(buildTitleText(titleCtx) == "⌨ | Sonnet 4.5 | $4.20 | 12.3K",
+          "title: 커스텀 순서(model→cost→outputTokens) + 구분자(|) 조합")
+    TitleSettings.setSeparator(.none)
+    check(buildTitleText(titleCtx) == "⌨Sonnet 4.5$4.2012.3K", "title: 구분자 없음 조합")
+    TitleSettings.setIcon(.robot)
+    TitleSettings.setSeparator(.space)
+    check(buildTitleText(titleCtx) == "🤖 Sonnet 4.5 $4.20 12.3K", "title: 커스텀 아이콘(로봇) 조합")
+    TitleSettings.setIcon(.none)
+    check(buildTitleText(titleCtx) == "Sonnet 4.5 $4.20 12.3K", "title: 아이콘 없음 — 선행 구분자 없이 첫 필드부터 시작")
+    if let so = savedOrder { UserDefaults.standard.set(so, forKey: "titleFieldsOrder") }
+    else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
+    if let ss = savedSeparator { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
+    else { UserDefaults.standard.removeObject(forKey: "titleSeparator") }
+    if let si4 = savedIcon4 { UserDefaults.standard.set(si4, forKey: "titleIcon") }
+    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
+    for (field, value) in savedEnabled2 {
+        if let v = value { UserDefaults.standard.set(v, forKey: field.defaultsKey) }
+        else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
+    }
 
     if failures == 0 {
         print("All tests passed. ✅")
