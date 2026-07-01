@@ -248,6 +248,30 @@ enum RefreshSettings {
     }
 }
 
+// MARK: - Legacy Defaults Migration (ClaudeMonitor → cc-menutor 리브랜딩)
+//
+// 번들 ID가 없는 bare 실행 파일은 UserDefaults.standard가 실행 파일명 기준 도메인에 저장된다.
+// 바이너리명이 ClaudeMonitor → cc-menutor로 바뀌면서 도메인도 함께 바뀌므로, 새 도메인이 비어
+// 있을 때 1회에 한해 구 도메인(~/Library/Preferences/ClaudeMonitor.plist)에서 값을 복사해
+// 기존 사용자의 커스터마이징이 리브랜딩으로 초기화된 것처럼 보이지 않게 한다.
+private let legacyDefaultsDomain = "ClaudeMonitor"
+private let legacyMigrationDoneKey = "legacyDefaultsMigrated"
+
+func migrateLegacyDefaultsIfNeeded(defaults: UserDefaults = .standard,
+                                    legacyDefaults: UserDefaults? = UserDefaults(suiteName: legacyDefaultsDomain)) {
+    guard !defaults.bool(forKey: legacyMigrationDoneKey) else { return }
+    defer { defaults.set(true, forKey: legacyMigrationDoneKey) }
+    guard let legacy = legacyDefaults else { return }
+
+    let keys = TitleField.allCases.map(\.defaultsKey)
+        + TitleField.allCases.map { "titleColor_\($0.rawValue)" }
+        + ["titleFieldsOrder", "titleSeparator", "titleIcon", "refreshIntervalSeconds"]
+    for key in keys {
+        guard defaults.object(forKey: key) == nil, let value = legacy.object(forKey: key) else { continue }
+        defaults.set(value, forKey: key)
+    }
+}
+
 // MARK: - Model Pricing (USD per million tokens)
 
 struct ModelPricing {
@@ -834,6 +858,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        migrateLegacyDefaultsIfNeeded()
         NSApp.setActivationPolicy(.accessory)  // Hide from Dock
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1697,11 +1722,44 @@ func runSelfTests() -> Never {
         else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
     }
 
-    // acquireSingleInstanceLock (실제 ~/.claude-monitor.lock 대신 임시 경로 사용)
+    // acquireSingleInstanceLock (실제 ~/.cc-menutor.lock 대신 임시 경로 사용)
     let lockTestPath = NSTemporaryDirectory() + "ClaudeMonitorSelfTest-\(UUID().uuidString).lock"
     check(acquireSingleInstanceLock(path: lockTestPath), "lock: 첫 획득 성공")
     check(!acquireSingleInstanceLock(path: lockTestPath), "lock: 동일 파일 재획득 실패(중복 인스턴스 차단)")
     try? FileManager.default.removeItem(atPath: lockTestPath)
+
+    // migrateLegacyDefaultsIfNeeded (전용 legacy/new suite 쌍으로 격리 — 실제 ClaudeMonitor 도메인은 건드리지 않음)
+    let legacySuite = "ClaudeMonitorSelfTest.legacy.\(UUID().uuidString)"
+    let newSuite = "ClaudeMonitorSelfTest.new.\(UUID().uuidString)"
+    if let legacy = UserDefaults(suiteName: legacySuite), let new = UserDefaults(suiteName: newSuite) {
+        legacy.set(true, forKey: TitleField.outputTokens.defaultsKey)
+        legacy.set("blue", forKey: "titleColor_cost")
+        legacy.set(["cost", "model"], forKey: "titleFieldsOrder")
+        new.set(false, forKey: TitleField.model.defaultsKey)  // 새 도메인에 이미 있는 값은 보존돼야 함
+
+        migrateLegacyDefaultsIfNeeded(defaults: new, legacyDefaults: legacy)
+        check(new.bool(forKey: TitleField.outputTokens.defaultsKey), "migrate: 구 도메인 값이 새 도메인으로 복사됨")
+        check(new.string(forKey: "titleColor_cost") == "blue", "migrate: 필드별 색상 키도 복사됨")
+        check((new.array(forKey: "titleFieldsOrder") as? [String]) == ["cost", "model"], "migrate: 순서 키도 복사됨")
+        check(new.bool(forKey: TitleField.model.defaultsKey) == false, "migrate: 새 도메인에 이미 있던 값은 덮어쓰지 않음")
+
+        legacy.set(false, forKey: TitleField.outputTokens.defaultsKey)
+        migrateLegacyDefaultsIfNeeded(defaults: new, legacyDefaults: legacy)  // 1회만 동작해야 함
+        check(new.bool(forKey: TitleField.outputTokens.defaultsKey), "migrate: 재호출은 무동작(idempotent)")
+
+        legacy.removePersistentDomain(forName: legacySuite)
+        new.removePersistentDomain(forName: newSuite)
+    } else {
+        check(false, "migrate: 전용 UserDefaults suite 쌍 생성 성공해야 함")
+    }
+    let noLegacySuite = "ClaudeMonitorSelfTest.migrate.noLegacy.\(UUID().uuidString)"
+    if let nl = UserDefaults(suiteName: noLegacySuite) {
+        migrateLegacyDefaultsIfNeeded(defaults: nl, legacyDefaults: nil)
+        check(nl.bool(forKey: legacyMigrationDoneKey), "migrate: legacy 도메인 없어도 완료 플래그는 남겨 재시도 방지")
+        nl.removePersistentDomain(forName: noLegacySuite)
+    } else {
+        check(false, "migrate: no-legacy suite 생성 성공해야 함")
+    }
 
     if failures == 0 {
         print("All tests passed. ✅")
@@ -1721,7 +1779,7 @@ func runSelfTests() -> Never {
 import Darwin
 
 let defaultLockPath = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".claude-monitor.lock").path
+    .appendingPathComponent(".cc-menutor.lock").path
 
 // fd는 의도적으로 닫지 않는다 — 락은 프로세스 생존 동안 유지되어야 하며 종료 시 커널이 자동 해제한다.
 func acquireSingleInstanceLock(path: String = defaultLockPath) -> Bool {

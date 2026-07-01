@@ -9,8 +9,11 @@ if [ -x "$INSTALL_DIR/uninstall.sh" ]; then
   "$INSTALL_DIR/uninstall.sh"
 else
   # 설치 디렉터리가 없거나 손상된 경우 LaunchAgent만 직접 정리
-  launchctl bootout "gui/$(id -u)/io.github.ahngbeom.claude-monitor" 2>/dev/null || true
-  rm -f "${HOME}/Library/LaunchAgents/io.github.ahngbeom.claude-monitor.plist"
+  # (신규 cc-menutor + 리브랜딩 이전 claude-monitor 둘 다 방어적으로 정리)
+  for label in "io.github.ahngbeom.cc-menutor" "io.github.ahngbeom.claude-monitor"; do
+    launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+    rm -f "${HOME}/Library/LaunchAgents/${label}.plist"
+  done
 fi
 
 rm -rf "$INSTALL_DIR"

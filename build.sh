@@ -1,12 +1,12 @@
 #!/bin/bash
-# claude-monitor build script
+# cc-menutor build script
 # Usage: ./build.sh
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$SCRIPT_DIR/ClaudeMonitor.swift"
-OUT="$SCRIPT_DIR/ClaudeMonitor"
+OUT="$SCRIPT_DIR/cc-menutor"
 CACHE="/tmp/swiftmodulecache"
 
 echo "🔨 Claude Monitor 빌드 시작..."
@@ -31,7 +31,7 @@ echo "🧪 셀프테스트 실행..."
 echo ""
 
 echo "실행하려면:"
-echo "  ./ClaudeMonitor"
+echo "  ./cc-menutor"
 echo ""
 echo "로그인 시 자동 시작하려면:"
 echo "  ./install.sh"

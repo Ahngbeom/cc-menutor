@@ -1,4 +1,5 @@
 # Compiled binary (build with ./build.sh)
+/cc-menutor
 /ClaudeMonitor
 
 # Swift build artifacts

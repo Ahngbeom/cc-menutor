@@ -9,15 +9,15 @@ macOS 메뉴바에서 Claude Code의 5시간 블록 사용량(토큰·비용)을
 ## 명령어
 
 ```bash
-./build.sh        # swiftc -O -framework Cocoa 로 단일 파일 컴파일 (캐시: /tmp/swiftmodulecache)
-./ClaudeMonitor   # 포그라운드 실행 (Dock 미표시 accessory 앱) — 동작 확인용
-./install.sh      # LaunchAgent(io.github.ahngbeom.claude-monitor.plist) 생성·로드 → 로그인 시 자동 시작
+./build.sh        # swiftc -O -framework Cocoa 로 단일 파일 컴파일 (캐시: /tmp/swiftmodulecache) → ./cc-menutor
+./cc-menutor      # 포그라운드 실행 (Dock 미표시 accessory 앱) — 동작 확인용
+./install.sh      # LaunchAgent(io.github.ahngbeom.cc-menutor.plist) 생성·로드 → 로그인 시 자동 시작
 ./setup.sh        # build + install 한 번에
 ./uninstall.sh    # LaunchAgent 언로드·제거
-tail -f ~/.claude-monitor.log   # LaunchAgent 실행 시 stdout/stderr 로그
+tail -f ~/.cc-menutor.log   # LaunchAgent 실행 시 stdout/stderr 로그
 ```
 
-테스트 프레임워크·린터·패키지 매니저는 없다. **검증은 `./build.sh` 성공 + `./ClaudeMonitor` 수동 실행으로 메뉴바 동작을 직접 확인**하는 것이 전부다.
+테스트 프레임워크·린터·패키지 매니저는 없다. **검증은 `./build.sh` 성공 + `./cc-menutor` 수동 실행으로 메뉴바 동작을 직접 확인**하는 것이 전부다.
 
 요구사항: macOS 12+, Xcode Command Line Tools(`swiftc`), 데이터 소스를 만드는 Claude Code CLI.
 
@@ -36,5 +36,10 @@ tail -f ~/.claude-monitor.log   # LaunchAgent 실행 시 stdout/stderr 로그
 - `PRICING`/비용은 **추정값**이며 Pro/Max 플랜의 실제 청구액이 아니다. 비용 로직을 바꿔도 이 전제를 유지한다.
 - **비용 소스는 2경로다**: 1차는 `stats-cache.json`(CLI 실측 `costUSD`), 폴백은 JSONL+`PRICING`(추정). 두 숫자는 분기할 수 있으며, 폴백 진입 시 메뉴 상단에 "추정 모드" 헤더로 사용자에게 고지한다(`buildMenuFromEntries`). 단가 로직 수정은 폴백에만 영향, 1차 경로는 CLI가 계산한다.
 - LaunchAgent plist는 `install.sh`가 바이너리 **절대경로를 박아** 생성한다. 바이너리 위치를 옮기면 재설치 필요.
+- **바이너리/프로세스명은 `cc-menutor`** (구버전 `ClaudeMonitor`에서 리브랜딩). 번들 ID 없는 bare 실행 파일이라
+  `UserDefaults.standard` 도메인이 바이너리명에서 자동 파생되므로, 바이너리명을 다시 바꾸면 설정 도메인도 같이
+  바뀐다 — `migrateLegacyDefaultsIfNeeded()`가 앱 시작 시 1회 구 도메인(`~/Library/Preferences/ClaudeMonitor.plist`)에서
+  값을 복사해 기존 사용자 설정이 사라진 것처럼 보이지 않게 한다. `install.sh`도 구버전
+  `io.github.ahngbeom.claude-monitor` LaunchAgent를 자동 정리한다.
 - 사용자 조정 지점은 README "커스터마이징" 섹션 참고: `PRICING` 단가, 30초 `Timer` 간격, `FiveHourBlock.active()` 윈도우 계산.
 - **5시간 사용 블록 ≠ 서버 rate-limit 리셋**: 이 앱의 블록은 메시지 타임스탬프 기반 **부동(첫 활동 기준)** 윈도우다. Claude Code의 "한도 90% 근접, X시 리셋" 경고는 서버 응답 헤더 기반 롤링 윈도우라 기준·리셋 시각이 다르며, 그 값은 로컬에 저장되지 않는다. 두 개념을 혼동하지 말 것.
