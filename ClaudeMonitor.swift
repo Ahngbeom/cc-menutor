@@ -93,6 +93,60 @@ enum TitleSettings {
     }
 }
 
+enum TitleFieldColor: String, CaseIterable {
+    case defaultColor = "default", red, orange, yellow, green, blue, purple, gray
+
+    var swatch: String {  // 순환 버튼에 표시할 스와치
+        switch self {
+        case .defaultColor: return "⚪"
+        case .red:    return "🔴"
+        case .orange: return "🟠"
+        case .yellow: return "🟡"
+        case .green:  return "🟢"
+        case .blue:   return "🔵"
+        case .purple: return "🟣"
+        case .gray:   return "⚫"
+        }
+    }
+
+    // nil이면 렌더링 시 NSColor.labelColor(다크/라이트 자동) 사용
+    var nsColor: NSColor? {
+        switch self {
+        case .defaultColor: return nil
+        case .red:    return .systemRed
+        case .orange: return .systemOrange
+        case .yellow: return .systemYellow
+        case .green:  return .systemGreen
+        case .blue:   return .systemBlue
+        case .purple: return .systemPurple
+        case .gray:   return .systemGray
+        }
+    }
+
+    var next: TitleFieldColor {
+        let all = TitleFieldColor.allCases
+        let idx = all.firstIndex(of: self)!
+        return all[(idx + 1) % all.count]
+    }
+}
+
+extension TitleSettings {
+    private static func colorKey(_ field: TitleField) -> String { "titleColor_\(field.rawValue)" }
+
+    static func color(for field: TitleField, defaults: UserDefaults = .standard) -> TitleFieldColor {
+        guard let raw = defaults.string(forKey: colorKey(field)), let c = TitleFieldColor(rawValue: raw) else { return .defaultColor }
+        return c
+    }
+
+    static func setColor(_ color: TitleFieldColor, for field: TitleField, defaults: UserDefaults = .standard) {
+        defaults.set(color.rawValue, forKey: colorKey(field))
+    }
+
+    static func cycleColor(for field: TitleField, defaults: UserDefaults = .standard) {
+        setColor(color(for: field, defaults: defaults).next, for: field, defaults: defaults)
+    }
+}
+
 enum TitleMoveDirection { case up, down }
 
 extension TitleSettings {
@@ -598,20 +652,26 @@ func titleIconPrefix() -> String {
     return icon.isEmpty ? "" : "\(icon) "
 }
 
-func buildTitleText(_ ctx: TitleContext) -> String {
-    var parts: [String] = []
+struct TitlePart { let text: String; let color: TitleFieldColor }
+
+func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
+    var parts: [TitlePart] = []
     let icon = TitleSettings.icon().rawValue
-    if !icon.isEmpty { parts.append(icon) }
+    if !icon.isEmpty { parts.append(TitlePart(text: icon, color: .defaultColor)) }
     for field in TitleSettings.enabledFieldsInOrder() {
         switch field {
-        case .outputTokens:  parts.append(formatTokens(ctx.outputTokens))
-        case .totalTokens:   parts.append(formatTokens(ctx.totalTokens))
-        case .cost:          parts.append(formatCost(ctx.cost))
-        case .remainingTime: if let r = ctx.remainingText { parts.append(r) }
-        case .model:         if let m = ctx.model { parts.append(shortModelName(m)) }
+        case .outputTokens:  parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
+        case .totalTokens:   parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: TitleSettings.color(for: field)))
+        case .cost:          parts.append(TitlePart(text: formatCost(ctx.cost), color: TitleSettings.color(for: field)))
+        case .remainingTime: if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: TitleSettings.color(for: field))) }
+        case .model:         if let m = ctx.model { parts.append(TitlePart(text: shortModelName(m), color: TitleSettings.color(for: field))) }
         }
     }
-    return parts.joined(separator: TitleSettings.separator().rawValue)
+    return parts
+}
+
+func buildTitleText(_ ctx: TitleContext) -> String {
+    buildTitleParts(ctx).map(\.text).joined(separator: TitleSettings.separator().rawValue)
 }
 
 // MARK: - Stats Cache (Claude Code's own aggregate, ~/.claude/stats-cache.json)
@@ -777,8 +837,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)  // Hide from Dock
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        statusItem.button?.title = "\(titleIconPrefix())…"
+        renderTitle(plain: "\(titleIconPrefix())…", warning: nil)
 
         refresh()
         rescheduleTimer()
@@ -845,9 +904,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                                    cost: b.costUSD,
                                    remainingText: resetText.isEmpty ? nil : resetText,
                                    model: b.models.last)
-            renderTitle(normal: buildTitleText(ctx), warning: warning)
+            renderTitle(parts: buildTitleParts(ctx), warning: warning)
         } else {
-            renderTitle(normal: "\(titleIconPrefix())idle", warning: nil)
+            renderTitle(plain: "\(titleIconPrefix())idle", warning: nil)
         }
     }
 
@@ -864,16 +923,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let warning = (block != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
 
         if noData {
-            renderTitle(normal: "\(titleIconPrefix())no data", warning: nil)
+            renderTitle(plain: "\(titleIconPrefix())no data", warning: nil)
         } else if block == nil {
-            renderTitle(normal: "\(titleIconPrefix())idle", warning: nil)
+            renderTitle(plain: "\(titleIconPrefix())idle", warning: nil)
         } else if let b = block {
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
                                    totalTokens: blockStats.totalTokens,
                                    cost: blockStats.totalCost,
                                    remainingText: b.remaining > 0 ? formatTime(b.remaining) : nil,
                                    model: blockEntries.last?.model)
-            renderTitle(normal: buildTitleText(ctx), warning: warning)
+            renderTitle(parts: buildTitleParts(ctx), warning: warning)
         }
     }
 
@@ -1008,23 +1067,28 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     // 커스텀 뷰 안의 NSButton은 자체 target-action으로 클릭을 소비하므로 메뉴가 열린 채 유지된다
     // (macOS 볼륨/밝기 슬라이더 등에 쓰이는 표준 패턴).
     func titleFieldRowView(field: TitleField, isFirst: Bool, isLast: Bool) -> NSView {
-        let row = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 246, height: 22))
         let idx = TitleField.allCases.firstIndex(of: field)!  // 순서와 무관한 안정적 식별자
 
         let checkbox = NSButton(checkboxWithTitle: field.label, target: self, action: #selector(toggleTitleFieldCheckbox(_:)))
-        checkbox.frame = NSRect(x: 14, y: 2, width: 160, height: 18)
+        checkbox.frame = NSRect(x: 14, y: 2, width: 150, height: 18)
         checkbox.state = TitleSettings.isEnabled(field) ? .on : .off
         checkbox.tag = idx
         row.addSubview(checkbox)
 
+        let colorButton = NSButton(title: TitleSettings.color(for: field).swatch, target: self, action: #selector(cycleTitleFieldColorButton(_:)))
+        colorButton.frame = NSRect(x: 166, y: 1, width: 26, height: 20)
+        colorButton.tag = idx
+        row.addSubview(colorButton)
+
         let up = NSButton(title: "▲", target: self, action: #selector(moveTitleFieldUpButton(_:)))
-        up.frame = NSRect(x: 176, y: 1, width: 20, height: 20)
+        up.frame = NSRect(x: 198, y: 1, width: 20, height: 20)
         up.isEnabled = !isFirst
         up.tag = idx
         row.addSubview(up)
 
         let down = NSButton(title: "▼", target: self, action: #selector(moveTitleFieldDownButton(_:)))
-        down.frame = NSRect(x: 198, y: 1, width: 20, height: 20)
+        down.frame = NSRect(x: 220, y: 1, width: 20, height: 20)
         down.isEnabled = !isLast
         down.tag = idx
         row.addSubview(down)
@@ -1067,6 +1131,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     @objc func moveTitleFieldDownButton(_ sender: NSButton) {
         TitleSettings.move(TitleField.allCases[sender.tag], direction: .down)
+        refreshTitleFieldsSubmenu()
+    }
+
+    @objc func cycleTitleFieldColorButton(_ sender: NSButton) {
+        TitleSettings.cycleColor(for: TitleField.allCases[sender.tag])
         refreshTitleFieldsSubmenu()
     }
 
@@ -1261,20 +1330,39 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         menu.addItem(item)
     }
 
-    // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 색(주황/빨강)만 입힌다.
-    // (남은 시간은 메뉴 안에 표시되므로 타이틀에서는 생략) 평상시엔 플레인 title(메뉴바 자동 색).
-    func renderTitle(normal: String, warning: UsageWarning?) {
+    // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
+    // (남은 시간은 메뉴 안에 표시되므로 타이틀에서는 생략)
+    // 평상시엔 항목별 커스텀 색(TitlePart.color)을 적용하되, 항상 attributedTitle을 써서
+    // 비포커스 화면(다중 디스플레이)에서 plain title이 자동으로 dim되는 것을 방지한다.
+    func renderTitle(parts: [TitlePart], warning: UsageWarning?) {
         guard let button = statusItem.button else { return }
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         if let w = warning, w.level != .none {
             let color: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
-            let text = "\(normal) ⚠\(Int(w.ratio * 100))%"
+            let plain = parts.map(\.text).joined(separator: TitleSettings.separator().rawValue)
+            let text = "\(plain) ⚠\(Int(w.ratio * 100))%"
             button.attributedTitle = NSAttributedString(string: text, attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
+                .font: font,
                 .foregroundColor: color
             ])
-        } else {
-            button.title = normal   // 플레인 → 다크/라이트 자동 색
+            return
         }
+        let sep = TitleSettings.separator().rawValue
+        let result = NSMutableAttributedString()
+        for (idx, part) in parts.enumerated() {
+            if idx > 0 && !sep.isEmpty {
+                result.append(NSAttributedString(string: sep, attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
+            }
+            result.append(NSAttributedString(string: part.text, attributes: [
+                .font: font,
+                .foregroundColor: part.color.nsColor ?? NSColor.labelColor
+            ]))
+        }
+        button.attributedTitle = result
+    }
+
+    func renderTitle(plain text: String, warning: UsageWarning?) {
+        renderTitle(parts: [TitlePart(text: text, color: .defaultColor)], warning: warning)
     }
 
     @objc func manualRefresh() {
@@ -1544,6 +1632,20 @@ func runSelfTests() -> Never {
     if let si3 = savedIcon3 { UserDefaults.standard.set(si3, forKey: "titleIcon") }
     else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
 
+    // TitleSettings.color (전용 suite)
+    let colorSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let cd = UserDefaults(suiteName: colorSuite) {
+        check(TitleSettings.color(for: .cost, defaults: cd) == .defaultColor, "color: 기본값 = defaultColor")
+        TitleSettings.setColor(.red, for: .cost, defaults: cd)
+        check(TitleSettings.color(for: .cost, defaults: cd) == .red, "color: 저장/조회 왕복")
+        TitleSettings.cycleColor(for: .cost, defaults: cd)
+        check(TitleSettings.color(for: .cost, defaults: cd) == .orange, "color: cycleColor는 팔레트의 다음 색으로 이동")
+        check(TitleFieldColor.gray.next == .defaultColor, "color: 팔레트 마지막(gray) 다음은 defaultColor로 순환")
+        cd.removePersistentDomain(forName: colorSuite)
+    } else {
+        check(false, "color: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
     // RefreshSettings.interval (전용 suite)
     let refreshSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
     if let rd = UserDefaults(suiteName: refreshSuite) {
@@ -1562,6 +1664,7 @@ func runSelfTests() -> Never {
     let savedEnabled2 = Dictionary(uniqueKeysWithValues: TitleField.allCases.map {
         ($0, UserDefaults.standard.object(forKey: $0.defaultsKey))
     })
+    let savedCostColor = UserDefaults.standard.string(forKey: "titleColor_cost")
     setEnabled([.outputTokens, .cost, .model])
     UserDefaults.standard.set(["model", "cost", "outputTokens"], forKey: "titleFieldsOrder")
     TitleSettings.setIcon(.keyboard)
@@ -1575,6 +1678,14 @@ func runSelfTests() -> Never {
     check(buildTitleText(titleCtx) == "🤖 Sonnet 4.5 $4.20 12.3K", "title: 커스텀 아이콘(로봇) 조합")
     TitleSettings.setIcon(.none)
     check(buildTitleText(titleCtx) == "Sonnet 4.5 $4.20 12.3K", "title: 아이콘 없음 — 선행 구분자 없이 첫 필드부터 시작")
+    TitleSettings.setColor(.blue, for: .cost)
+    let coloredParts = buildTitleParts(titleCtx)
+    check(coloredParts.first(where: { $0.text == "$4.20" })?.color == .blue,
+          "buildTitleParts: 지정한 필드(cost)에 커스텀 색이 붙는다")
+    check(coloredParts.first(where: { $0.text == "Sonnet 4.5" })?.color == .defaultColor,
+          "buildTitleParts: 색을 지정하지 않은 필드(model)는 defaultColor 유지")
+    if let sc = savedCostColor { UserDefaults.standard.set(sc, forKey: "titleColor_cost") }
+    else { UserDefaults.standard.removeObject(forKey: "titleColor_cost") }
     if let so = savedOrder { UserDefaults.standard.set(so, forKey: "titleFieldsOrder") }
     else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
     if let ss = savedSeparator { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
