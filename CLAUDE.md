@@ -28,13 +28,14 @@ tail -f ~/.cc-menutor.log   # LaunchAgent 실행 시 stdout/stderr 로그
 1. **데이터 소스** — `UsageDataReader.readAll()`이 `~/.claude/projects/`를 재귀 순회하며 `.jsonl`을 읽는다. `type=="assistant"` 라인만 파싱하고, `uuid`로 중복 제거하며, ISO8601(소수초 유무 둘 다) 타임스탬프를 처리한다. 외부 전송 없는 완전 오프라인.
 2. **가격/비용** — `PRICING` 패턴 테이블 + `getPricing(for:)`(부분 문자열 매칭, 미매칭 시 `DEFAULT_PRICING`=Sonnet 단가). `UsageEntry.cost`가 input/output/cacheRead/cacheWrite 4종 토큰으로 비용을 산출한다.
 3. **집계** — `UsageStats`가 entry 배열을 받아 합계·모델별 breakdown을 계산. `FiveHourBlock.active(from:now:)`는 **부동 앵커** 도메인 로직이다: 유휴(>5시간 공백) 후 첫 활동 시각을 UTC 정시로 내림한 지점에서 시작해 5시간 윈도우를 +5h씩 체인한다(고정 00/05/10/15/20 정렬이 **아님**). 1차(stats-cache) 경로에서는 이 계산 대신 CLI가 산출한 `startTime/endTime`을 그대로 쓴다.
-4. **UI** — `ClaudeMonitorApp`(NSApplicationDelegate)이 30초 `Timer`로 `refresh()` → `readAll()` → `buildMenu()`를 반복한다. 메뉴바 타이틀은 현재 블록의 **output-only 토큰 + 비용**.
+4. **UI** — `ClaudeMonitorApp`(NSApplicationDelegate)이 30초 `Timer`로 `refresh()` → `readAll()` → `buildMenu()`를 반복한다. 메뉴바 타이틀은 현재 블록의 **output-only 토큰 + 비용**. `readAll()`은 1차/폴백 경로 여부와 무관하게 매 `refresh()`마다 항상 호출된다(파일별 증분 캐시라 실질 비용은 낮음) — 비용/토큰 집계는 여전히 stats-cache를 쓰지만, 타이틀의 "현재 모델"만은 실제 JSONL 엔트리 타임스탬프로 판별하기 때문이다(아래 참고).
 
 ## 변경 시 주의점
 
 - **새 모델 추가·단가 변경 시 두 곳을 함께 고친다**: `PRICING`(비용)과 `shortModelName()`(표시명). 둘 다 부분 문자열 매칭이므로 더 구체적인 패턴을 앞에 둬야 한다(예: `opus-4`가 `opus`보다 먼저).
 - `PRICING`/비용은 **추정값**이며 Pro/Max 플랜의 실제 청구액이 아니다. 비용 로직을 바꿔도 이 전제를 유지한다.
 - **비용 소스는 2경로다**: 1차는 `stats-cache.json`(CLI 실측 `costUSD`), 폴백은 JSONL+`PRICING`(추정). 두 숫자는 분기할 수 있으며, 폴백 진입 시 메뉴 상단에 "추정 모드" 헤더로 사용자에게 고지한다(`buildMenuFromEntries`). 단가 로직 수정은 폴백에만 영향, 1차 경로는 CLI가 계산한다.
+- **타이틀의 "현재 모델"은 stats-cache의 `models` 배열 순서를 신뢰하지 않는다**: 이 배열은 CLI가 모델을 처음 발견한 순서일 뿐 최근 사용순이 아니다(예: 다른 프로젝트 창에서 먼저 쓴 모델이 배열 끝에 올 수 있음). `updateStatusBarTitle(fromCache:)`는 대신 `cachedAll`(JSONL, 타임스탬프 오름차순)을 블록 구간으로 필터링해 마지막 엔트리의 모델을 쓰고, 매칭 실패 시에만 `b.models.last`로 폴백한다.
 - LaunchAgent plist는 `install.sh`가 바이너리 **절대경로를 박아** 생성한다. 바이너리 위치를 옮기면 재설치 필요.
 - **바이너리/프로세스명은 `cc-menutor`** (구버전 `ClaudeMonitor`에서 리브랜딩). 번들 ID 없는 bare 실행 파일이라
   `UserDefaults.standard` 도메인이 바이너리명에서 자동 파생되므로, 바이너리명을 다시 바꾸면 설정 도메인도 같이

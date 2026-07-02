@@ -877,14 +877,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     }
 
     // 읽기는 백그라운드 큐에서, UI 갱신은 메인 큐에서 수행.
-    // 1차: stats-cache.json(권위 소스). 없으면 JSONL 전량 파싱 폴백.
+    // 1차: stats-cache.json(권위 소스, 비용/토큰). 없으면 JSONL 전량 파싱 폴백.
+    // JSONL은 stats-cache 유무와 무관하게 항상 읽는다 — stats-cache의 블록별 models
+    // 배열 순서는 "최근 사용순"이 아니라서, 현재 모델 표시는 실제 엔트리 타임스탬프가 필요하다.
     func refresh() {
         if isRefreshing { return }
         isRefreshing = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
             let stats = self.statsReader.load()
-            let entries: [UsageEntry] = (stats == nil) ? self.reader.readAll() : []
+            let entries = self.reader.readAll()
             DispatchQueue.main.async {
                 self.cachedStats = stats
                 self.cachedAll = entries
@@ -924,11 +926,19 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             return ""
         }()
         if let b = active {
+            // b.models.last는 CLI가 모델을 처음 발견한 순서라 "최근 사용 모델"이 아닐 수 있다.
+            // 실제 JSONL 엔트리(시간순 정렬됨)에서 블록 구간 내 마지막 모델을 우선 사용.
+            let start = parseISO(b.startTime)
+            let end = parseISO(b.endTime)
+            let lastModel: String? = {
+                guard let s = start, let e = end else { return nil }
+                return cachedAll.filter { $0.timestamp >= s && $0.timestamp < e }.last?.model
+            }()
             let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
                                    totalTokens: b.totalTokens,
                                    cost: b.costUSD,
                                    remainingText: resetText.isEmpty ? nil : resetText,
-                                   model: b.models.last)
+                                   model: lastModel ?? b.models.last)
             renderTitle(parts: buildTitleParts(ctx), warning: warning)
         } else {
             renderTitle(plain: "\(titleIconPrefix())idle", warning: nil)
