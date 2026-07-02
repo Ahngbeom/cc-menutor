@@ -8,7 +8,7 @@
 import Cocoa
 import Foundation
 
-let APP_VERSION = "1.2"
+let APP_VERSION = "1.3"
 
 // MARK: - Usage Warning Config (로컬 임계값 기반 — 서버 실제 %와 무관한 근사)
 //
