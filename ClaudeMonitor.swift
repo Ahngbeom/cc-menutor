@@ -826,6 +826,63 @@ func computeGamification(previous: GamificationRecord, today: String,
     return next
 }
 
+// MARK: - Easter Eggs (재미 모드 — 평생 누적 토큰 / 연속 스트릭 마일스톤 축하)
+//
+// 무겁게 새로 계산하지 않는다 — 이미 매 refresh()마다 계산되는 값(전체 누적 토큰, 스트릭)에 대해
+// "지금까지 알린 최고 마일스톤" 워터마크만 비교한다. 토큰 총합은 stats.cumulative(1차 캐시 경로에만
+// 존재)가 아니라 UsageStats(entries: cachedAll).totalTokens로 계산한다 — Gamification과 동일하게
+// 1차/폴백 경로 어느 쪽이든 항상 채워지는 cachedAll을 신뢰해야 폴백 모드에서도 추적이 끊기지 않는다.
+
+let tokenMilestones: [Int]  = [1_000_000, 10_000_000, 100_000_000, 1_000_000_000]
+let streakMilestones: [Int] = [7, 30, 100]
+
+struct MilestoneCheckResult { let announced: Int; let justCrossed: Int? }
+
+// 순수 함수. currentValue가 이미 넘은 가장 높은 threshold(highestReached)와 이전에 알린 값(prev)을
+// 비교한다.
+//  - prev == nil(최초 실행): 지금까지 넘은 마일스톤을 "알림 없이" 워터마크로만 백필한다. 그렇지
+//    않으면 기존 헤비 유저가 이 기능을 처음 켰을 때 지난 마일스톤이 한꺼번에 쏟아진다
+//    (computeGamification의 lastActiveDay.isEmpty 첫 실행 처리와 동일한 관용구).
+//  - highestReached가 prev보다 클 때만 1회 발화. 한 사이클에 여러 단계를 건너뛰어도(prev=0 →
+//    currentValue가 1M과 10M을 동시에 넘김) .max()가 가장 높은 단계 하나만 골라 한 번만 발화한다.
+//  - currentValue가 감소해도(스트릭 리셋, 또는 극단적으로 JSONL이 정리되어 평생 토큰 총합이
+//    줄어드는 경우) prev는 절대 낮아지지 않는다 — reached > prev가 아니면 이 함수는 항상
+//    announced: prev(그대로)를 반환하므로 워터마크는 스스로 ratchet-up만 한다. "이미 달성한
+//    마일스톤"이 다시 사라지지 않는(게임 업적과 동일한) 영구 기록 시맨틱이며, 별도 max() 래핑이
+//    필요 없다.
+func checkMilestone(currentValue: Int, thresholds: [Int], previouslyAnnounced: Int?) -> MilestoneCheckResult {
+    let highestReached = thresholds.filter { $0 <= currentValue }.max()
+    guard let prev = previouslyAnnounced else {
+        return MilestoneCheckResult(announced: highestReached ?? 0, justCrossed: nil)
+    }
+    guard let reached = highestReached, reached > prev else {
+        return MilestoneCheckResult(announced: prev, justCrossed: nil)
+    }
+    return MilestoneCheckResult(announced: reached, justCrossed: reached)
+}
+
+enum EasterEggSettings {
+    private static let tokenMilestoneKey  = "eggAnnouncedTokenMilestone"
+    private static let streakMilestoneKey = "eggAnnouncedStreakMilestone"
+
+    // object(forKey:) as? Int를 쓴다(GamificationSettings의 integer(forKey:)와 의도적으로 다름) —
+    // "키가 없음"(nil, 최초 실행)과 "워터마크가 정당하게 0"을 구분해야 checkMilestone()의 백필
+    // 분기가 성립한다. integer(forKey:)를 썼다면 항상 0이 반환되어 최초 실행도 이미 확인된 것으로
+    // 오인되고, previouslyAnnounced가 nil로 전달될 일이 없어 백필 분기 자체가 죽은 코드가 된다.
+    static func announcedTokenMilestone(defaults: UserDefaults = .standard) -> Int? {
+        defaults.object(forKey: tokenMilestoneKey) as? Int
+    }
+    static func setAnnouncedTokenMilestone(_ v: Int, defaults: UserDefaults = .standard) {
+        defaults.set(v, forKey: tokenMilestoneKey)
+    }
+    static func announcedStreakMilestone(defaults: UserDefaults = .standard) -> Int? {
+        defaults.object(forKey: streakMilestoneKey) as? Int
+    }
+    static func setAnnouncedStreakMilestone(_ v: Int, defaults: UserDefaults = .standard) {
+        defaults.set(v, forKey: streakMilestoneKey)
+    }
+}
+
 // MARK: - Title Text Rendering (경로 무관 공통 조합)
 
 struct TitleContext {
@@ -1051,6 +1108,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     private(set) var gamificationTodayTokens: Int = 0
     private(set) var gamificationTodayCost: Double = 0
     private(set) var gamificationNewRecordToday: Bool = false
+    private(set) var justCrossedTokenMilestone: Int? = nil
+    private(set) var justCrossedStreakMilestone: Int? = nil
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
 
@@ -1089,6 +1148,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 self.cachedAll = entries
                 self.lastUpdateTime = Date()
                 self.updateGamificationRecord()
+                self.updateEasterEggState()
                 self.buildMenu()
                 self.isRefreshing = false
             }
@@ -1115,6 +1175,39 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         if next != previous {
             GamificationSettings.save(next)
         }
+    }
+
+    // 재미 모드 여부와 무관하게 워터마크는 항상 갱신한다(스트릭/최고기록과 동일한 이유) — 표시가
+    // 꺼져 있어도 "이미 넘긴 마일스톤"은 계속 정확히 추적되어야, 나중에 재미 모드를 켰을 때 과거
+    // 마일스톤이 몰아서 터지지 않는다. 실제 셀러브레이션 노출만 celebrationTitle()에서 게이팅한다.
+    func updateEasterEggState() {
+        let lifetimeTokens = UsageStats(entries: cachedAll).totalTokens
+        let prevToken = EasterEggSettings.announcedTokenMilestone()
+        let tokenResult = checkMilestone(currentValue: lifetimeTokens, thresholds: tokenMilestones,
+                                          previouslyAnnounced: prevToken)
+        if tokenResult.announced != (prevToken ?? -1) {
+            EasterEggSettings.setAnnouncedTokenMilestone(tokenResult.announced)
+        }
+        justCrossedTokenMilestone = tokenResult.justCrossed
+
+        let streakDays = GamificationSettings.load().currentStreakDays
+        let prevStreak = EasterEggSettings.announcedStreakMilestone()
+        let streakResult = checkMilestone(currentValue: streakDays, thresholds: streakMilestones,
+                                           previouslyAnnounced: prevStreak)
+        if streakResult.announced != (prevStreak ?? -1) {
+            EasterEggSettings.setAnnouncedStreakMilestone(streakResult.announced)
+        }
+        justCrossedStreakMilestone = streakResult.justCrossed
+    }
+
+    // 재미 모드 ON이고 이번 refresh 사이클에서 새로 넘은 마일스톤이 있을 때만 non-nil. 다음
+    // 사이클엔 워터마크가 이미 갱신되어 자동으로 사라진다(별도 타이머/정리 코드 불필요). 토큰과
+    // 스트릭이 같은 사이클에 동시에 터지면(극히 드묾) 토큰 쪽을 우선 노출한다.
+    func celebrationTitle() -> String? {
+        guard TitleSettings.isFunModeEnabled() else { return nil }
+        if let t = justCrossedTokenMilestone { return "🎉 누적 \(formatTokens(t)) 토큰 돌파!" }
+        if let s = justCrossedStreakMilestone { return "🔥 \(s)일 연속 사용 달성!" }
+        return nil
     }
 
     func buildMenu() {
@@ -1158,6 +1251,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     }
 
     func updateStatusBarTitle(fromCache stats: StatsCache) {
+        if let msg = celebrationTitle() { renderTitle(plain: msg, warning: nil); return }
         let active = stats.activeBlock()
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
         let resetText: String = {
@@ -1189,6 +1283,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     }
 
     func updateStatusBarTitleFromEntries() {
+        if let msg = celebrationTitle() { renderTitle(plain: msg, warning: nil); return }
         let block = FiveHourBlock.active(from: cachedAll)
         let blockEntries: [UsageEntry]
         if let block = block {
@@ -1327,6 +1422,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         addLabel(menu, "  최고 기록: \(formatTokens(rec.bestDayTokens)) · \(formatCost(rec.bestDayCost))")
         if gamificationNewRecordToday {
             addLabel(menu, "  📈 오늘 최고 기록 경신")
+        }
+        if let t = justCrossedTokenMilestone {
+            addLabel(menu, "  🎉 방금 누적 \(formatTokens(t)) 토큰 돌파!")
+        }
+        if let s = justCrossedStreakMilestone {
+            addLabel(menu, "  🔥 방금 \(s)일 연속 사용 달성!")
         }
         menu.addItem(.separator())
     }
@@ -1927,6 +2028,47 @@ func runSelfTests() -> Never {
         gd.removePersistentDomain(forName: gamSuite)
     } else {
         check(false, "gam: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // checkMilestone (순수 함수 — 마일스톤 발화 판정)
+    let eggBelowAll = checkMilestone(currentValue: 500_000, thresholds: tokenMilestones, previouslyAnnounced: nil)
+    check(eggBelowAll.justCrossed == nil, "egg: 최초 실행 & 모든 threshold 미달 → 무음")
+    check(eggBelowAll.announced == 0, "egg: 최초 실행 & 모든 threshold 미달 → 워터마크 0으로 백필")
+
+    let eggBackfill = checkMilestone(currentValue: 15_000_000, thresholds: tokenMilestones, previouslyAnnounced: nil)
+    check(eggBackfill.justCrossed == nil, "egg: 최초 실행 & 이미 넘은 마일스톤 존재 → 무음 백필(과거분 몰아서 알림 금지)")
+    check(eggBackfill.announced == 10_000_000, "egg: 최초 실행 백필 워터마크 = 가장 높은 이미 넘은 단계")
+
+    let eggSingle = checkMilestone(currentValue: 1_200_000, thresholds: tokenMilestones, previouslyAnnounced: 0)
+    check(eggSingle.justCrossed == 1_000_000, "egg: 단일 단계 크로싱 → 발화")
+    check(eggSingle.announced == 1_000_000, "egg: 발화 시 워터마크 갱신")
+
+    let eggMulti = checkMilestone(currentValue: 15_000_000, thresholds: tokenMilestones, previouslyAnnounced: 0)
+    check(eggMulti.justCrossed == 10_000_000, "egg: 한 사이클에 여러 단계 동시 크로싱 → 최고 단계 1회만 발화(1M 건너뛰고 10M)")
+
+    let eggIdempotent = checkMilestone(currentValue: 15_000_000, thresholds: tokenMilestones, previouslyAnnounced: 10_000_000)
+    check(eggIdempotent.justCrossed == nil, "egg: 같은/다음 사이클 재확인 → 재발화 없음")
+    check(eggIdempotent.announced == 10_000_000, "egg: 워터마크 불변(멱등)")
+
+    let eggRegression = checkMilestone(currentValue: 3, thresholds: streakMilestones, previouslyAnnounced: 7)
+    check(eggRegression.justCrossed == nil, "egg: 스트릭 리셋 등 currentValue 하락 → 재발화 없음")
+    check(eggRegression.announced == 7, "egg: 워터마크는 감소하지 않음(영구 업적 시맨틱)")
+
+    // EasterEggSettings 영속화 (전용 UserDefaults suite로 격리)
+    let eggSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let ed = UserDefaults(suiteName: eggSuite) {
+        check(EasterEggSettings.announcedTokenMilestone(defaults: ed) == nil, "egg: 저장 전 토큰 워터마크 = nil(키 부재)")
+        check(EasterEggSettings.announcedStreakMilestone(defaults: ed) == nil, "egg: 저장 전 스트릭 워터마크 = nil(키 부재)")
+        EasterEggSettings.setAnnouncedTokenMilestone(10_000_000, defaults: ed)
+        EasterEggSettings.setAnnouncedStreakMilestone(7, defaults: ed)
+        check(EasterEggSettings.announcedTokenMilestone(defaults: ed) == 10_000_000, "egg: 토큰 워터마크 저장/조회 왕복")
+        check(EasterEggSettings.announcedStreakMilestone(defaults: ed) == 7, "egg: 스트릭 워터마크 저장/조회 왕복")
+        // 0은 "정당한 워터마크"이지 "키 부재"가 아님 — integer(forKey:)였다면 이 구분이 불가능했을 것
+        EasterEggSettings.setAnnouncedTokenMilestone(0, defaults: ed)
+        check(EasterEggSettings.announcedTokenMilestone(defaults: ed) == 0, "egg: 워터마크 0은 nil과 구분되는 유효값")
+        ed.removePersistentDomain(forName: eggSuite)
+    } else {
+        check(false, "egg: 전용 UserDefaults suite 생성 성공해야 함")
     }
 
     // buildTitleParts: 무드 아이콘이 정적 아이콘 슬롯을 대체/미대체하는 순수 함수 로직 검증
