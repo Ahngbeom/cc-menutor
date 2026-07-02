@@ -748,6 +748,84 @@ func moodTestTierOverride() -> MoodTier? {
     return MoodTier(rawValue: raw)
 }
 
+// MARK: - Gamification (재미 모드 — 일일 사용 스트릭 + 개인 최고 기록)
+//
+// 재미 모드 토글과 무관하게 refresh()마다 항상 갱신한다(§3 참고) — 스트릭은 실제 사용일을
+// 반영해야 하므로, 표시가 꺼져 있다고 갱신을 건너뛰면 나중에 재미 모드를 켰을 때 그 사이의
+// 활동이 반영되지 않은 잘못된 공백/리셋이 발생한다. 드롭다운 노출만 재미 모드로 게이팅한다.
+
+struct GamificationRecord: Equatable {
+    var currentStreakDays: Int
+    var longestStreakDays: Int
+    var lastActiveDay: String   // "yyyy-MM-dd", 로컬 달력 기준
+    var bestDayTokens: Int
+    var bestDayCost: Double
+
+    static let empty = GamificationRecord(currentStreakDays: 0, longestStreakDays: 0,
+                                           lastActiveDay: "", bestDayTokens: 0, bestDayCost: 0)
+}
+
+enum GamificationSettings {
+    private static let currentStreakKey = "gamCurrentStreakDays"
+    private static let longestStreakKey = "gamLongestStreakDays"
+    private static let lastActiveDayKey = "gamLastActiveDay"
+    private static let bestDayTokensKey = "gamBestDayTokens"
+    private static let bestDayCostKey   = "gamBestDayCost"
+
+    static func load(defaults: UserDefaults = .standard) -> GamificationRecord {
+        GamificationRecord(
+            currentStreakDays: defaults.integer(forKey: currentStreakKey),
+            longestStreakDays: defaults.integer(forKey: longestStreakKey),
+            lastActiveDay: defaults.string(forKey: lastActiveDayKey) ?? "",
+            bestDayTokens: defaults.integer(forKey: bestDayTokensKey),
+            bestDayCost: defaults.double(forKey: bestDayCostKey))
+    }
+    static func save(_ r: GamificationRecord, defaults: UserDefaults = .standard) {
+        defaults.set(r.currentStreakDays, forKey: currentStreakKey)
+        defaults.set(r.longestStreakDays, forKey: longestStreakKey)
+        defaults.set(r.lastActiveDay, forKey: lastActiveDayKey)
+        defaults.set(r.bestDayTokens, forKey: bestDayTokensKey)
+        defaults.set(r.bestDayCost, forKey: bestDayCostKey)
+    }
+}
+
+func localDayString(_ date: Date, timeZone: TimeZone = .current) -> String {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.timeZone = timeZone
+    return f.string(from: date)
+}
+
+private func daysBetween(_ a: String, _ b: String) -> Int? {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.timeZone = TimeZone.current
+    guard let da = f.date(from: a), let db = f.date(from: b) else { return nil }
+    return Calendar.current.dateComponents([.day], from: da, to: db).day
+}
+
+// 이전 기록 + 오늘 날짜(yyyy-MM-dd, 로컬) + 오늘 누적 토큰/비용 → 새 기록.
+// 오늘 활동이 0이면 상태를 그대로 반환(감소·리셋 금지 — 단절 판정은 오직 "다음 활동이 있는 날"의
+// 갭 계산에서만). 같은 날 재호출(멱등)은 스트릭을 중복 증가시키지 않고 최고 기록만 ratchet-up.
+func computeGamification(previous: GamificationRecord, today: String,
+                          todayTokens: Int, todayCost: Double) -> GamificationRecord {
+    guard todayTokens > 0 || todayCost > 0 else { return previous }
+
+    var next = previous
+    next.bestDayTokens = max(previous.bestDayTokens, todayTokens)
+    next.bestDayCost = max(previous.bestDayCost, todayCost)
+
+    if previous.lastActiveDay == today {
+        return next   // 같은 날 재호출: 최고 기록만 갱신
+    }
+    if previous.lastActiveDay.isEmpty {
+        next.currentStreakDays = 1
+    } else if daysBetween(previous.lastActiveDay, today) == 1 {
+        next.currentStreakDays = previous.currentStreakDays + 1
+    } else {
+        next.currentStreakDays = 1   // 공백 2일 이상(또는 파싱 실패/시계 역행) → 리셋
+    }
+    next.longestStreakDays = max(previous.longestStreakDays, next.currentStreakDays)
+    next.lastActiveDay = today
+    return next
+}
+
 // MARK: - Title Text Rendering (경로 무관 공통 조합)
 
 struct TitleContext {
@@ -970,6 +1048,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     var lastUpdateTime = Date(timeIntervalSince1970: 0)
     var cachedAll: [UsageEntry] = []
     var cachedStats: StatsCache?
+    private(set) var gamificationTodayTokens: Int = 0
+    private(set) var gamificationTodayCost: Double = 0
+    private(set) var gamificationNewRecordToday: Bool = false
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
 
@@ -1007,9 +1088,32 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 self.cachedStats = stats
                 self.cachedAll = entries
                 self.lastUpdateTime = Date()
+                self.updateGamificationRecord()
                 self.buildMenu()
                 self.isRefreshing = false
             }
+        }
+    }
+
+    // 재미 모드와 무관하게 항상 최신 상태로 갱신한다 — 스트릭은 "실제 사용한 날"을 반영해야 하므로
+    // 화면에 안 보인다고 건너뛰면 나중에 재미 모드를 켰을 때 그 사이의 활동이 반영되지 않은 잘못된
+    // 갭/리셋이 발생한다. 드롭다운 노출만 TitleSettings.isFunModeEnabled()로 게이팅한다.
+    func updateGamificationRecord() {
+        let todayStart = Calendar.current.startOfDay(for: Date())
+        let todayStats = UsageStats(entries: cachedAll.filter { $0.timestamp >= todayStart })
+        let today = localDayString(Date())
+        let previous = GamificationSettings.load()
+        let next = computeGamification(previous: previous, today: today,
+                                        todayTokens: todayStats.totalTokens, todayCost: todayStats.totalCost)
+
+        gamificationTodayTokens = todayStats.totalTokens
+        gamificationTodayCost = todayStats.totalCost
+        gamificationNewRecordToday =
+            (previous.bestDayTokens > 0 && todayStats.totalTokens >= previous.bestDayTokens) ||
+            (previous.bestDayCost   > 0 && todayStats.totalCost   >= previous.bestDayCost)
+
+        if next != previous {
+            GamificationSettings.save(next)
         }
     }
 
@@ -1205,8 +1309,26 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
+        appendGamificationSection(menu)
+
         appendFooter(menu)
         statusItem.menu = menu
+    }
+
+    // ── 재미 모드 게이팅된 "🏆 기록" 섹션 — 1차/폴백 메뉴 빌더 양쪽에서 공유(중복 방지) ──
+    func appendGamificationSection(_ menu: NSMenu) {
+        guard TitleSettings.isFunModeEnabled() else { return }
+        let rec = GamificationSettings.load()
+        addSectionHeader(menu, "🏆  기록")
+        let streakLabel = rec.currentStreakDays > 0
+            ? "\(rec.currentStreakDays)일 연속 (최장 \(rec.longestStreakDays)일)"
+            : "기록 없음"
+        addLabel(menu, "  연속 사용: \(streakLabel)")
+        addLabel(menu, "  최고 기록: \(formatTokens(rec.bestDayTokens)) · \(formatCost(rec.bestDayCost))")
+        if gamificationNewRecordToday {
+            addLabel(menu, "  📈 오늘 최고 기록 경신")
+        }
+        menu.addItem(.separator())
     }
 
     // ── 메뉴 하단 공통(최종 업데이트·새로고침·표시 항목·버전·종료) ──
@@ -1513,6 +1635,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             addLabel(menu, "  예상 비용: \(formatCost(allStats.totalCost))")
 
             menu.addItem(.separator())
+
+            appendGamificationSection(menu)
         }
 
         appendFooter(menu)
@@ -1770,6 +1894,39 @@ func runSelfTests() -> Never {
         fd.removePersistentDomain(forName: funModeSuite)
     } else {
         check(false, "funMode: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // computeGamification (순수 함수 — 스트릭/최고 기록 산출)
+    let gamDay1 = computeGamification(previous: .empty, today: "2026-06-01", todayTokens: 100, todayCost: 1.0)
+    check(gamDay1.currentStreakDays == 1 && gamDay1.longestStreakDays == 1, "gam: 첫 활동 → 스트릭 1")
+    check(gamDay1.bestDayTokens == 100 && gamDay1.bestDayCost == 1.0, "gam: 최초 최고 기록 = 오늘 값")
+
+    let gamDay1Again = computeGamification(previous: gamDay1, today: "2026-06-01", todayTokens: 250, todayCost: 2.5)
+    check(gamDay1Again.currentStreakDays == 1, "gam: 같은 날 재호출 → 스트릭 불변(멱등)")
+    check(gamDay1Again.bestDayTokens == 250, "gam: 같은 날 재호출 → 최고 기록 ratchet")
+
+    let gamDay1Shrink = computeGamification(previous: gamDay1Again, today: "2026-06-01", todayTokens: 10, todayCost: 0.1)
+    check(gamDay1Shrink.bestDayTokens == 250, "gam: 최고 기록은 감소하지 않음")
+
+    let gamDay2 = computeGamification(previous: gamDay1Again, today: "2026-06-02", todayTokens: 50, todayCost: 0.5)
+    check(gamDay2.currentStreakDays == 2 && gamDay2.longestStreakDays == 2, "gam: 1일 공백 → 스트릭 +1")
+
+    let gamDay5 = computeGamification(previous: gamDay2, today: "2026-06-05", todayTokens: 10, todayCost: 0.1)
+    check(gamDay5.currentStreakDays == 1, "gam: 2일 이상 공백 → 스트릭 리셋")
+    check(gamDay5.longestStreakDays == 2, "gam: 리셋되어도 최장 기록 보존")
+
+    let gamNoActivity = computeGamification(previous: gamDay2, today: "2026-06-03", todayTokens: 0, todayCost: 0)
+    check(gamNoActivity == gamDay2, "gam: 활동 없는 날 → 상태 완전 불변")
+
+    // GamificationSettings 영속화 (전용 UserDefaults suite로 격리)
+    let gamSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let gd = UserDefaults(suiteName: gamSuite) {
+        check(GamificationSettings.load(defaults: gd) == .empty, "gam: 기본값 = empty")
+        GamificationSettings.save(gamDay2, defaults: gd)
+        check(GamificationSettings.load(defaults: gd) == gamDay2, "gam: 저장/조회 왕복")
+        gd.removePersistentDomain(forName: gamSuite)
+    } else {
+        check(false, "gam: 전용 UserDefaults suite 생성 성공해야 함")
     }
 
     // buildTitleParts: 무드 아이콘이 정적 아이콘 슬롯을 대체/미대체하는 순수 함수 로직 검증
