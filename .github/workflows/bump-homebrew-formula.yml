@@ -1,0 +1,17 @@
+name: Update Homebrew formula
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  bump-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mislav/bump-homebrew-formula-action@ccf2332299a883f6af50a1d2d41e5df7904dd769 # v4.1
+        with:
+          formula-name: cc-menutor
+          homebrew-tap: Ahngbeom/homebrew-tap
+          tag-name: ${{ github.event.release.tag_name }}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
