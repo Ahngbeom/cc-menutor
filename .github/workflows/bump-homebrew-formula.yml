@@ -1,17 +1,66 @@
 name: Update Homebrew formula
 
+# Inline replacement for mislav/bump-homebrew-formula-action: that action resolves the
+# tarball checksum via an authenticated HEAD request to the GitHub tarball API, which
+# started returning HTTP 303 instead of 302 around 2026-05-16 (upstream bug, still open:
+# https://github.com/mislav/bump-homebrew-formula-action/issues/340). This workflow
+# sidesteps the bug entirely by hashing the same public archive URL the formula's `url`
+# field (and scripts/install.sh) already reference, via a plain `curl -fsSL` that follows
+# redirects natively instead of hand-rolling 302-only redirect handling.
+
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag-name:
+        description: "Tag to bump the formula to (for manual re-runs; defaults to the triggering release's tag)"
+        required: false
+        type: string
 
 jobs:
   bump-formula:
     runs-on: ubuntu-latest
     steps:
-      - uses: mislav/bump-homebrew-formula-action@ccf2332299a883f6af50a1d2d41e5df7904dd769 # v4.1
-        with:
-          formula-name: cc-menutor
-          homebrew-tap: Ahngbeom/homebrew-tap
-          tag-name: ${{ github.event.release.tag_name }}
+      - name: Compute release tarball checksum
+        id: checksum
         env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ inputs.tag-name || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz"
+          curl -fsSL "$URL" -o archive.tar.gz
+          SHA256=$(sha256sum archive.tar.gz | cut -d' ' -f1)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: Ahngbeom/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        working-directory: homebrew-tap
+        env:
+          FORMULA_URL: ${{ steps.checksum.outputs.url }}
+          FORMULA_SHA256: ${{ steps.checksum.outputs.sha256 }}
+          FORMULA_TAG: ${{ steps.checksum.outputs.tag }}
+        run: |
+          set -euo pipefail
+          FORMULA="Formula/cc-menutor.rb"
+          sed -i "s|^  url \".*\"\$|  url \"${FORMULA_URL}\"|" "$FORMULA"
+          sed -i "s|^  sha256 \".*\"\$|  sha256 \"${FORMULA_SHA256}\"|" "$FORMULA"
+
+          if git diff --quiet -- "$FORMULA"; then
+            echo "No changes to commit"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$FORMULA"
+            git commit -m "cc-menutor ${FORMULA_TAG}"
+            git push
+          fi
