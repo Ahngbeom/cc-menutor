@@ -248,6 +248,35 @@ enum RefreshSettings {
     }
 }
 
+// MARK: - Fun Mode (재미 모드 — 무드 아이콘, 기본 OFF)
+//
+// 켜면 정적 TitleIcon 대신 5시간 블록 진행 상태에 따라 모양·색이 바뀌는 무드 글리프를 표시한다.
+// 기본값 OFF — 업그레이드한 기존 사용자의 화면은 변화 없어야 한다.
+
+enum FunMode: String, CaseIterable {
+    case off, on
+    var label: String {
+        switch self {
+        case .off: return "꺼짐 (기본)"
+        case .on:  return "켜짐 — 무드 아이콘"
+        }
+    }
+}
+
+extension TitleSettings {
+    private static let funModeKey = "funMode"
+    static func funMode(defaults: UserDefaults = .standard) -> FunMode {
+        guard let raw = defaults.string(forKey: funModeKey), let m = FunMode(rawValue: raw) else { return .off }
+        return m
+    }
+    static func setFunMode(_ mode: FunMode, defaults: UserDefaults = .standard) {
+        defaults.set(mode.rawValue, forKey: funModeKey)
+    }
+    static func isFunModeEnabled(defaults: UserDefaults = .standard) -> Bool {
+        funMode(defaults: defaults) == .on
+    }
+}
+
 // MARK: - Legacy Defaults Migration (ClaudeMonitor → cc-menutor 리브랜딩)
 //
 // 번들 ID가 없는 bare 실행 파일은 UserDefaults.standard가 실행 파일명 기준 도메인에 저장된다.
@@ -660,6 +689,65 @@ func formatTimeShort(_ date: Date) -> String {
     return formatter.string(from: date)
 }
 
+// MARK: - Mood Tier (재미 모드 — 5시간 블록 진행 상태 기반 무드 글리프)
+//
+// 컬러 프레젠테이션 이모지(🔥😅 등)는 NSAttributedString.foregroundColor가 적용되지 않아
+// 색이 바뀌지 않는다. Geometric Shapes 블록의 텍스트 프레젠테이션 글리프를 사용해야
+// "색상 변화"가 실제로 동작한다.
+
+enum MoodTier: String, CaseIterable {
+    case idle, calm, warm, hot, critical
+
+    var glyph: String {
+        switch self {
+        case .idle:     return "○"
+        case .calm:     return "◔"
+        case .warm:     return "◑"
+        case .hot:      return "◕"
+        case .critical: return "●"
+        }
+    }
+    var color: TitleFieldColor {
+        switch self {
+        case .idle:     return .gray
+        case .calm:     return .green
+        case .warm:     return .yellow
+        case .hot:      return .orange
+        case .critical: return .red
+        }
+    }
+    var label: String {   // 드롭다운 범례용
+        switch self {
+        case .idle:     return "대기"
+        case .calm:     return "여유"
+        case .warm:     return "몰입"
+        case .hot:      return "가속"
+        case .critical: return "한계 근접"
+        }
+    }
+}
+
+// 순수 함수: 활성 블록 여부 + 경과 비율(예산 미설정 시) + usageWarning 비율(예산 설정 시, 우선)로 tier 산출.
+// 임계값은 기존 WARN_RATIO(0.90)/CRIT_RATIO(1.00)와 상단 경계를 맞춰, 예산 기반 경고가 실제로 뜰 때
+// 무드 색(주황/빨강)과 기존 경고 색이 어긋나지 않게 한다.
+func computeMood(hasActiveBlock: Bool, elapsedRatio: Double, warning: UsageWarning?) -> MoodTier {
+    guard hasActiveBlock else { return .idle }
+    let ratio = warning?.ratio ?? elapsedRatio
+    switch ratio {
+    case ..<0.34: return .calm
+    case ..<0.67: return .warm
+    case ..<0.90: return .hot
+    default:      return .critical
+    }
+}
+
+// QA 전용: 수동 검증 시 CLAUDE_MONITOR_MOOD_TEST_TIER=hot 처럼 지정해 tier를 강제로 고정한다.
+// 실제 사용자 경험에는 영향 없음(값이 없으면 nil이라 계산 결과를 그대로 씀).
+func moodTestTierOverride() -> MoodTier? {
+    guard let raw = ProcessInfo.processInfo.environment["CLAUDE_MONITOR_MOOD_TEST_TIER"] else { return nil }
+    return MoodTier(rawValue: raw)
+}
+
 // MARK: - Title Text Rendering (경로 무관 공통 조합)
 
 struct TitleContext {
@@ -668,6 +756,18 @@ struct TitleContext {
     let cost: Double
     let remainingText: String?   // 이미 formatTime()된 문자열, 알 수 없으면 nil
     let model: String?           // shortModelName 적용 전 원본 모델 문자열
+    let moodTier: MoodTier?      // 재미 모드 ON일 때만 non-nil — OFF면 기존 아이콘 로직과 동일 출력 보장
+
+    // moodTier에 기본값을 줘 기존 호출부(재미 모드 무관)가 그대로 컴파일되게 한다.
+    // (Swift 합성 memberwise init은 기본값이 있는 저장 프로퍼티를 파라미터로 노출하지 않으므로 명시.)
+    init(outputTokens: Int, totalTokens: Int, cost: Double, remainingText: String?, model: String?, moodTier: MoodTier? = nil) {
+        self.outputTokens = outputTokens
+        self.totalTokens = totalTokens
+        self.cost = cost
+        self.remainingText = remainingText
+        self.model = model
+        self.moodTier = moodTier
+    }
 }
 
 // idle/no-data 고정 문자열과 launch placeholder도 이 값을 공유해 커스터마이징과 어긋나지 않게 한다.
@@ -680,8 +780,16 @@ struct TitlePart { let text: String; let color: TitleFieldColor }
 
 func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     var parts: [TitlePart] = []
-    let icon = TitleSettings.icon().rawValue
-    if !icon.isEmpty { parts.append(TitlePart(text: icon, color: .defaultColor)) }
+    // ctx.moodTier는 재미 모드 ON일 때만 non-nil — OFF면 기존처럼 정적 TitleIcon을 그대로 사용해
+    // 출력이 이전과 동일함을 보장한다. 사용자가 아이콘을 "표시 안 함"으로 두면 무드도 함께 숨긴다.
+    if TitleSettings.icon() != .none {
+        if let tier = ctx.moodTier {
+            parts.append(TitlePart(text: tier.glyph, color: tier.color))
+        } else {
+            let icon = TitleSettings.icon().rawValue
+            if !icon.isEmpty { parts.append(TitlePart(text: icon, color: .defaultColor)) }
+        }
+    }
     for field in TitleSettings.enabledFieldsInOrder() {
         switch field {
         case .outputTokens:  parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
@@ -755,6 +863,14 @@ struct StatsBlock: Codable {
     func isExpired(now: Date = Date()) -> Bool {
         guard let e = parseISO(endTime) else { return false }
         return now >= e
+    }
+
+    // 5시간 블록 경과 비율(0~1) — FiveHourBlock.progress와 동일 개념을 stats-cache 소스에서 파생.
+    func elapsedRatio(now: Date = Date()) -> Double {
+        guard let s = parseISO(startTime), let e = parseISO(endTime) else { return 0 }
+        let total = e.timeIntervalSince(s)
+        guard total > 0 else { return 0 }
+        return max(0, min(1, now.timeIntervalSince(s) / total))
     }
 }
 struct BlocksWrapper: Codable { let blocks: [StatsBlock] }
@@ -916,6 +1032,27 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    // 재미 모드 OFF면 항상 nil(호출부가 기존 아이콘 로직을 그대로 타게 함). QA 테스트 override는
+    // 재미 모드가 켜져 있을 때만 적용된다(꺼짐 상태에서 강제로 무드가 새어 나오지 않도록).
+    func resolveMood(hasActiveBlock: Bool, elapsedRatio: Double, warning: UsageWarning?) -> MoodTier? {
+        guard TitleSettings.isFunModeEnabled() else { return nil }
+        return moodTestTierOverride() ?? computeMood(hasActiveBlock: hasActiveBlock, elapsedRatio: elapsedRatio, warning: warning)
+    }
+
+    // idle 상태 전용 — 재미 모드 OFF거나 아이콘 표시 안 함이면 기존 titleIconPrefix() 경로 그대로
+    // (바이트 단위 동일), ON이면 MoodTier.idle 글리프+색을 첫 파트로 넣어 renderTitle(parts:)로
+    // 렌더링한다(사용자가 고른 구분자가 적용됨).
+    func renderIdleTitle(_ label: String) {
+        guard TitleSettings.isFunModeEnabled(), TitleSettings.icon() != .none else {
+            renderTitle(plain: "\(titleIconPrefix())\(label)", warning: nil)
+            return
+        }
+        let tier = moodTestTierOverride() ?? .idle
+        renderTitle(parts: [TitlePart(text: tier.glyph, color: tier.color),
+                             TitlePart(text: label, color: .defaultColor)],
+                    warning: nil)
+    }
+
     func updateStatusBarTitle(fromCache stats: StatsCache) {
         let active = stats.activeBlock()
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
@@ -934,14 +1071,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 guard let s = start, let e = end else { return nil }
                 return cachedAll.filter { $0.timestamp >= s && $0.timestamp < e }.last?.model
             }()
+            let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
             let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
                                    totalTokens: b.totalTokens,
                                    cost: b.costUSD,
                                    remainingText: resetText.isEmpty ? nil : resetText,
-                                   model: lastModel ?? b.models.last)
+                                   model: lastModel ?? b.models.last,
+                                   moodTier: moodTier)
             renderTitle(parts: buildTitleParts(ctx), warning: warning)
         } else {
-            renderTitle(plain: "\(titleIconPrefix())idle", warning: nil)
+            renderIdleTitle("idle")
         }
     }
 
@@ -960,13 +1099,15 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         if noData {
             renderTitle(plain: "\(titleIconPrefix())no data", warning: nil)
         } else if block == nil {
-            renderTitle(plain: "\(titleIconPrefix())idle", warning: nil)
+            renderIdleTitle("idle")
         } else if let b = block {
+            let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
                                    totalTokens: blockStats.totalTokens,
                                    cost: blockStats.totalCost,
                                    remainingText: b.remaining > 0 ? formatTime(b.remaining) : nil,
-                                   model: blockEntries.last?.model)
+                                   model: blockEntries.last?.model,
+                                   moodTier: moodTier)
             renderTitle(parts: buildTitleParts(ctx), warning: warning)
         }
     }
@@ -1021,6 +1162,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 if w.level != .none {
                     addLabel(menu, "  ⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음")
                 }
+            }
+            if TitleSettings.isFunModeEnabled() {
+                let tier = moodTestTierOverride() ?? computeMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
+                let ratio = warning?.ratio ?? b.elapsedRatio()
+                addLabel(menu, "  \(tier.glyph) 기분: \(tier.label) (\(Int(ratio * 100))% \(warning != nil ? "사용" : "경과"))")
             }
         } else {
             addLabel(menu, "  현재 활성 블록 없음")
@@ -1083,6 +1229,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let iconItem = NSMenuItem(title: "  ⌨ 메뉴바 아이콘", action: nil, keyEquivalent: "")
         iconItem.submenu = buildIconSubmenu()
         menu.addItem(iconItem)
+
+        let funModeItem = NSMenuItem(title: "  🎭 재미 모드", action: nil, keyEquivalent: "")
+        funModeItem.submenu = buildFunModeSubmenu()
+        menu.addItem(funModeItem)
 
         let refreshIntervalItem = NSMenuItem(title: "  ⏱ 자동 갱신 주기", action: nil, keyEquivalent: "")
         refreshIntervalItem.submenu = buildRefreshIntervalSubmenu()
@@ -1214,6 +1364,26 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
+    // ── 재미 모드 서브메뉴(라디오 스타일 — 하나만 선택) ──
+    func buildFunModeSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let current = TitleSettings.funMode()
+        for mode in FunMode.allCases {
+            let item = NSMenuItem(title: mode.label, action: #selector(setFunMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = (mode == current) ? .on : .off
+            item.representedObject = mode
+            sub.addItem(item)
+        }
+        return sub
+    }
+
+    @objc func setFunMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? FunMode else { return }
+        TitleSettings.setFunMode(mode)
+        buildMenu()
+    }
+
     // ── 자동 갱신 주기 서브메뉴(라디오 스타일 — 하나만 선택) ──
     func buildRefreshIntervalSubmenu() -> NSMenu {
         let sub = NSMenu()
@@ -1300,6 +1470,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                         addLabel(menu, "  ⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음")
                     }
                 }
+                if TitleSettings.isFunModeEnabled() {
+                    let tier = moodTestTierOverride() ?? computeMood(hasActiveBlock: true, elapsedRatio: block.progress, warning: warning)
+                    let ratio = warning?.ratio ?? block.progress
+                    addLabel(menu, "  \(tier.glyph) 기분: \(tier.label) (\(Int(ratio * 100))% \(warning != nil ? "사용" : "경과"))")
+                }
             } else {
                 addLabel(menu, "  현재 활성 블록 없음")
                 addLabel(menu, "  다음 메시지부터 새 블록이 시작됩니다.")
@@ -1344,25 +1519,37 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    // NSMenuItem.isEnabled == false인 표준 아이템은 attributedTitle의 foregroundColor를 무시하고
+    // 시스템이 강제로 회색 틴트를 덧씌운다. item.view에 커스텀 NSTextField를 꽂으면 이 표준
+    // 제목-그리기 경로 자체를 우회해 지정한 색이 그대로 렌더링된다(titleFieldRowView와 동일 패턴).
+    private func infoRowItem(_ title: String, font: NSFont, color: NSColor) -> NSMenuItem {
+        let field = NSTextField(labelWithString: title)
+        field.font = font
+        field.textColor = color
+        field.lineBreakMode = .byClipping
+        field.sizeToFit()
+
+        let leftInset: CGFloat = 14   // titleFieldRowView의 체크박스 x와 맞춰 다른 행과 정렬
+        let rightPad: CGFloat = 6
+        let rowHeight = max(18, field.frame.height + 2)
+        let row = NSView(frame: NSRect(x: 0, y: 0,
+                                        width: leftInset + field.frame.width + rightPad,
+                                        height: rowHeight))
+        field.frame.origin = NSPoint(x: leftInset, y: (rowHeight - field.frame.height) / 2)
+        row.addSubview(field)
+
+        let item = NSMenuItem()
+        item.view = row
+        item.isEnabled = false   // 호버 하이라이트 억제 목적 — 텍스트 색은 field.textColor가 담당
+        return item
+    }
+
     func addSectionHeader(_ menu: NSMenu, _ title: String) {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ]
-        item.attributedTitle = NSAttributedString(string: title, attributes: attrs)
-        menu.addItem(item)
+        menu.addItem(infoRowItem(title, font: NSFont.systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor))
     }
 
     func addLabel(_ menu: NSMenu, _ title: String) {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        ]
-        item.attributedTitle = NSAttributedString(string: title, attributes: attrs)
-        menu.addItem(item)
+        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), color: .labelColor))
     }
 
     // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
@@ -1554,6 +1741,60 @@ func runSelfTests() -> Never {
         check(w.level == .crit, "warn: 토큰95%·비용120% → 더 높은 비율(crit) 채택")
         check(abs(w.ratio - 1.2) < 1e-9, "warn: max ratio = 1.2")
     } else { check(false, "warn: 복합 한도 경고 반환되어야 함") }
+
+    // MoodTier / computeMood (순수 함수 — 재미 모드 무드 아이콘 tier 산출)
+    check(computeMood(hasActiveBlock: false, elapsedRatio: 0.99, warning: nil) == .idle, "mood: 비활성 블록 → idle")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.0, warning: nil) == .calm, "mood: 0% → calm")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.33, warning: nil) == .calm, "mood: 33% → calm")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.339, warning: nil) == .calm, "mood: 33.9% → calm")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.34, warning: nil) == .warm, "mood: 34% → warm")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.66, warning: nil) == .warm, "mood: 66% → warm")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.67, warning: nil) == .hot, "mood: 67% → hot")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.89, warning: nil) == .hot, "mood: 89% → hot")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.90, warning: nil) == .critical, "mood: 90% → critical")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 1.0, warning: nil) == .critical, "mood: 100% → critical")
+    check(computeMood(hasActiveBlock: true, elapsedRatio: 1.5, warning: nil) == .critical, "mood: 150%(예산 초과) → critical")
+    if let w = computeUsageWarning(tokens: 950, cost: 0, tokenBudget: 1000, costBudget: 0, warnAt: 0.9, critAt: 1.0) {
+        check(computeMood(hasActiveBlock: true, elapsedRatio: 0.1, warning: w) == .critical,
+              "mood: 예산 설정 시 warning.ratio(0.95)가 elapsedRatio(0.1) 대신 우선 적용")
+    } else { check(false, "mood: warning override 테스트용 UsageWarning 생성 실패") }
+
+    // TitleSettings.funMode (전용 UserDefaults suite로 실제 사용자 설정과 격리)
+    let funModeSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let fd = UserDefaults(suiteName: funModeSuite) {
+        check(TitleSettings.funMode(defaults: fd) == .off, "funMode: 기본값 = off")
+        check(!TitleSettings.isFunModeEnabled(defaults: fd), "funMode: 기본 비활성")
+        TitleSettings.setFunMode(.on, defaults: fd)
+        check(TitleSettings.funMode(defaults: fd) == .on, "funMode: 저장/조회 왕복")
+        check(TitleSettings.isFunModeEnabled(defaults: fd), "funMode: on이면 활성")
+        fd.removePersistentDomain(forName: funModeSuite)
+    } else {
+        check(false, "funMode: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // buildTitleParts: 무드 아이콘이 정적 아이콘 슬롯을 대체/미대체하는 순수 함수 로직 검증
+    let savedIconMood = UserDefaults.standard.string(forKey: "titleIcon")
+    TitleSettings.setIcon(.keyboard)
+    let moodCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil, moodTier: .critical)
+    if let moodPart = buildTitleParts(moodCtx).first {
+        check(moodPart.text == MoodTier.critical.glyph, "mood: buildTitleParts 첫 파트가 무드 글리프")
+        check(moodPart.color == .red, "mood: buildTitleParts 첫 파트 색이 critical(red)")
+    } else {
+        check(false, "mood: buildTitleParts가 무드 파트를 반환해야 함")
+    }
+    let noMoodCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil)
+    if let staticPart = buildTitleParts(noMoodCtx).first {
+        check(staticPart.text == "⌨", "mood: moodTier nil이면 기존 정적 아이콘 그대로(회귀 가드)")
+        check(staticPart.color == .defaultColor, "mood: moodTier nil이면 기본 색(회귀 가드)")
+    } else {
+        check(false, "mood: buildTitleParts가 아이콘 파트를 반환해야 함")
+    }
+    TitleSettings.setIcon(.none)
+    let hiddenIconCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil, moodTier: .hot)
+    check(!buildTitleParts(hiddenIconCtx).contains(where: { $0.text == MoodTier.hot.glyph }),
+          "mood: 아이콘 '표시 안 함'이면 무드 글리프도 함께 숨김")
+    if let siMood = savedIconMood { UserDefaults.standard.set(siMood, forKey: "titleIcon") }
+    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
 
     // TitleSettings (전용 UserDefaults suite로 실제 사용자 설정과 격리)
     let titleSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
