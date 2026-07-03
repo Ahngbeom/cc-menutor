@@ -1727,32 +1727,40 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             // ── 5-Hour Block Section ──
             addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
             if let b = block {
-                if let windowText = b.windowText {
-                    addLabel(menu, "  \(windowText)")
-                }
-                addLabel(menu, "  " + t("출력 토큰: \(formatTokens(b.outputTokens))", "Output Tokens: \(formatTokens(b.outputTokens))"))
-                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(b.totalTokens))", "Total Tokens: \(formatTokens(b.totalTokens))"))
-                addLabel(menu, "  " + t("예상 비용: \(formatCost(b.cost))", "Estimated Cost: \(formatCost(b.cost))"))
-                addLabel(menu, "  " + t("메시지 수: \(b.messageCount)건", "Messages: \(b.messageCount)"))
+                // 재미 모드(무드 아이콘) on/off와 무관하게 항상 계산되는 색 — 색상 코딩은 가독성
+                // 기능이지, 재미 모드가 게이팅하는 "기분" 표시 기능이 아니다. resolveMood()는
+                // 재미 모드가 꺼져 있으면 항상 nil을 반환하므로 여기서는 쓰지 않고, 그 안에서 쓰는
+                // moodTestTierOverride()/computeMood()를 직접 호출해 QA 오버라이드만 재사용한다.
+                let heroColor = (moodTestTierOverride()
+                    ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)).color.nsColor ?? .labelColor
 
-                if b.showProgressBar {
-                    addLabel(menu, "  " + t("\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% 경과", "\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% elapsed"))
-                }
                 switch b.resetState {
                 case .remaining(let text):
-                    addLabel(menu, "  " + t("리셋까지: \(text) 남음", "Resets in: \(text)"))
+                    addHeroLabel(menu, "  " + t("\(text) 남음", "\(text) remaining"), color: heroColor)
                 case .alreadyReset:
-                    addLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"))
+                    addHeroLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"), color: heroColor)
                 case .none:
                     break
                 }
-                if let cph = b.burnRateText {
-                    addLabel(menu, "  " + t("소모율: \(cph)/시간", "Burn Rate: \(cph)/hr"))
+                if b.showProgressBar {
+                    addColoredLabel(menu, "  " + t("\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% 경과", "\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% elapsed"), color: heroColor)
                 }
+
+                addLabel(menu, "  " + t("\(formatCost(b.cost)) · \(formatTokens(b.outputTokens)) 출력 / \(formatTokens(b.totalTokens)) 전체 · \(b.messageCount)건",
+                                        "\(formatCost(b.cost)) · \(formatTokens(b.outputTokens)) out / \(formatTokens(b.totalTokens)) total · \(b.messageCount) msgs"))
+
+                var windowBurnParts: [String] = []
+                if let windowText = b.windowText { windowBurnParts.append(windowText) }
+                if let cph = b.burnRateText { windowBurnParts.append(t("소모율 \(cph)/시간", "burn \(cph)/hr")) }
+                if !windowBurnParts.isEmpty {
+                    addLabel(menu, "  " + windowBurnParts.joined(separator: " · "))
+                }
+
                 if let w = b.warning {
                     addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
                     if w.level != .none {
-                        addLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(b.warningResetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(b.warningResetText) remaining"))
+                        let warnColor: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
+                        addColoredLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(b.warningResetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(b.warningResetText) remaining"), color: warnColor)
                     }
                 }
                 if let tier = b.moodTier {
@@ -2167,6 +2175,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), color: .labelColor))
     }
 
+    // 5시간 블록 섹션에서 가장 중요한 값(남은 시간/리셋 상태)을 다른 줄보다 크고 굵게 강조한다.
+    func addHeroLabel(_ menu: NSMenu, _ title: String, color: NSColor) {
+        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold), color: color))
+    }
+
+    // addLabel과 폰트는 동일하되 색만 지정 — 진행률 바/경고 배너처럼 상태에 따라 색이 바뀌는 줄용.
+    func addColoredLabel(_ menu: NSMenu, _ title: String, color: NSColor) {
+        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), color: color))
+    }
+
     // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
     // (남은 시간은 메뉴 안에 표시되므로 타이틀에서는 생략)
     // 평상시엔 항목별 커스텀 색(TitlePart.color)을 적용하되, 항상 attributedTitle을 써서
@@ -2180,10 +2198,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let pulseFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         if let w = warning, w.level != .none {
             let color: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
+            // 색만으로는 색맹 등 일부 사용자에게 "지금 경고 상태"가 전달되지 않을 수 있어
+            // 굵기도 함께 올린다(평상시 타이틀은 .regular 그대로 유지).
+            let warnFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
             let plain = parts.map(\.text).joined(separator: TitleSettings.separator().rawValue)
             let text = "\(plain) ⚠\(Int(w.ratio * 100))%"
             button.attributedTitle = NSAttributedString(string: text, attributes: [
-                .font: font,
+                .font: warnFont,
                 .foregroundColor: color
             ])
             return
