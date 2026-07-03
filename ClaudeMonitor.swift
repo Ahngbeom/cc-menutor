@@ -55,6 +55,26 @@ func usageWarning(tokens: Int, cost: Double) -> UsageWarning? {
                         warnAt: WARN_RATIO, critAt: CRIT_RATIO)
 }
 
+// MARK: - ISO8601 Parsing (공유 — JSONL 타임스탬프·stats-cache.json 파싱 양쪽에서 사용)
+
+let iso8601FullFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+let iso8601BasicFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f
+}()
+func parseISO8601(_ s: String) -> Date? {
+    iso8601FullFormatter.date(from: s) ?? iso8601BasicFormatter.date(from: s)
+}
+func parseISO8601(_ s: String?) -> Date? {
+    guard let s = s else { return nil }
+    return parseISO8601(s)
+}
+
 // MARK: - Localization (macOS 시스템 언어 설정에 따른 영어/한국어 UI 전환)
 //
 // 이 프로젝트는 .app 번들이 없는 bare 실행 파일이라(swiftc 단일 파일 컴파일, Xcode 프로젝트 없음)
@@ -412,11 +432,21 @@ let FAMILY_PRICING: [String: ModelPricing] = [
     "haiku":  ModelPricing(input: 0.80, output: 4.0,  cacheRead: 0.08, cacheWrite: 1.0),
 ]
 
+// 원본 모델 문자열의 대괄호 접미사(예: [1m])와 날짜 접미사(6자리 이상 연속 숫자)를 제거한
+// 정규화 문자열. getPricing의 정밀 패턴 매칭과 parseModel의 family/버전 매칭이 모두 이 함수를
+// 거친 동일한 기준으로 판단하게 해, 두 분류 로직이 서로 다른 정규화 기준으로 드리프트하지 않게 한다.
+private func sanitizedModelString(_ model: String) -> String {
+    var s = model.lowercased()
+    s = s.replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression)
+    s = s.replacingOccurrences(of: "[0-9]{6,}", with: "", options: .regularExpression)
+    return s
+}
+
 // 정밀 패턴이 매칭되면 matched=true, family/DEFAULT 폴백이면 matched=false.
 func getPricing(for model: String) -> (pricing: ModelPricing, matched: Bool) {
-    let lower = model.lowercased()
+    let s = sanitizedModelString(model)
     for (pattern, pricing) in PRICING {
-        if lower.contains(pattern) { return (pricing, true) }
+        if s.contains(pattern) { return (pricing, true) }
     }
     let fam = parseModel(model).family
     if let fp = FAMILY_PRICING[fam] { return (fp, false) }
@@ -430,11 +460,7 @@ func getPricing(for model: String) -> (pricing: ModelPricing, matched: Bool) {
 // "claude-opus-4-8[1m]" → ("opus", "Opus 4.8")
 // 미상 family는 ("", 축약명) 반환.
 func parseModel(_ model: String) -> (family: String, display: String) {
-    var s = model.lowercased()
-    // 대괄호 접미사(예: [1m]) 제거
-    s = s.replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression)
-    // 날짜 접미사(6자리 이상 연속 숫자) 제거 → 버전 숫자로 오인 방지
-    s = s.replacingOccurrences(of: "[0-9]{6,}", with: "", options: .regularExpression)
+    let s = sanitizedModelString(model)
 
     let families = ["opus", "sonnet", "haiku"]
     guard let fam = families.first(where: { s.contains($0) }) else {
@@ -518,17 +544,6 @@ class UsageDataReader {
         var entries: [UsageEntry]
     }
     private var fileCache: [String: FileCacheState] = [:]
-
-    private let iso8601Full: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-    private let iso8601Basic: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
 
     init() {
         homeDir = FileManager.default.homeDirectoryForCurrentUser
@@ -649,7 +664,7 @@ class UsageDataReader {
 
     private func parseTimestamp(_ raw: Any?) -> Date? {
         if let s = raw as? String {
-            return iso8601Full.date(from: s) ?? iso8601Basic.date(from: s)
+            return parseISO8601(s)
         }
         if let n = raw as? TimeInterval {
             // > 1e10 이면 밀리초로 간주
@@ -851,16 +866,21 @@ extension TitleSettings {
 }
 
 // 순수 함수: 활성 블록 여부 + 경과 비율(예산 미설정 시) + usageWarning 비율(예산 설정 시, 우선)로 tier 산출.
-// 임계값은 기존 WARN_RATIO(0.90)/CRIT_RATIO(1.00)와 상단 경계를 맞춰, 예산 기반 경고가 실제로 뜰 때
-// 무드 색(주황/빨강)과 기존 경고 색이 어긋나지 않게 한다.
-func computeMood(hasActiveBlock: Bool, elapsedRatio: Double, warning: UsageWarning?) -> MoodTier {
+// 임계값은 warnAt(기본 WARN_RATIO=0.90)에서 파생되어, CLAUDE_MONITOR_WARN으로 임계값을 바꿔도
+// 무드 색(주황/빨강)과 실제 경고 배너가 어긋나지 않는다.
+func computeMood(hasActiveBlock: Bool, elapsedRatio: Double, warning: UsageWarning?,
+                  warnAt: Double = WARN_RATIO) -> MoodTier {
     guard hasActiveBlock else { return .idle }
     let ratio = warning?.ratio ?? elapsedRatio
+    // warnAt이 기본값(0.90)이면 scale은 정확히 1.0(IEEE754 x/x==1.0)이라 기존 0.34/0.67 경계와
+    // 완전히 동일하게 나옴. CLAUDE_MONITOR_WARN로 warnAt이 바뀌면 hot/critical 경계뿐 아니라
+    // calm/warm/hot 경계도 비례해서 따라가 무드 색이 실제 경고 임계값과 어긋나지 않게 한다.
+    let scale = warnAt / 0.90
     switch ratio {
-    case ..<0.34: return .calm
-    case ..<0.67: return .warm
-    case ..<0.90: return .hot
-    default:      return .critical
+    case ..<(0.34 * scale): return .calm
+    case ..<(0.67 * scale): return .warm
+    case ..<warnAt:         return .hot
+    default:                return .critical
     }
 }
 
@@ -1083,20 +1103,6 @@ func buildTitleText(_ ctx: TitleContext) -> String {
 // 스키마는 비공식이라 버전에 따라 바뀔 수 있음 → StatsBlock은 strict,
 // 부차 필드(PeriodStats/ModelBreakdown)는 옵셔널로 느슨하게 두어 부분 드리프트에 견딘다.
 
-private let isoCacheFull: ISO8601DateFormatter = {
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return f
-}()
-private let isoCacheBasic: ISO8601DateFormatter = {
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime]
-    return f
-}()
-func parseISO(_ s: String?) -> Date? {
-    guard let s = s else { return nil }
-    return isoCacheFull.date(from: s) ?? isoCacheBasic.date(from: s)
-}
 
 struct TokenCounts: Codable {
     let inputTokens: Int
@@ -1131,13 +1137,13 @@ struct StatsBlock: Codable {
     // 캐시가 isActive:true로 남아 있어도 윈도우가 이미 지났는지 시각으로 교차검증.
     // endTime 파싱 실패 시(스키마 드리프트) 만료로 단정하지 않음.
     func isExpired(now: Date = Date()) -> Bool {
-        guard let e = parseISO(endTime) else { return false }
+        guard let e = parseISO8601(endTime) else { return false }
         return now >= e
     }
 
     // 5시간 블록 경과 비율(0~1) — FiveHourBlock.progress와 동일 개념을 stats-cache 소스에서 파생.
     func elapsedRatio(now: Date = Date()) -> Double {
-        guard let s = parseISO(startTime), let e = parseISO(endTime) else { return 0 }
+        guard let s = parseISO8601(startTime), let e = parseISO8601(endTime) else { return 0 }
         let total = e.timeIntervalSince(s)
         guard total > 0 else { return 0 }
         return max(0, min(1, now.timeIntervalSince(s) / total))
@@ -1228,6 +1234,72 @@ final class StatsCacheReader {
         lastMTime = mtime
         return decoded
     }
+}
+
+// MARK: - Block Menu Display Model
+//
+// buildMenu(fromCache:)/buildMenuFromEntries() 공유 뷰모델. 두 데이터 소스(StatsCache 1차 경로
+// vs JSONL 폴백)가 실제로 노출하는 필드가 서로 다르므로(예: 캐시 경로는 블록 내 모델별 토큰/비용
+// 분해가 없고 모델명만 있음, 폴백 경로는 오늘 섹션에 모델별 분해가 없음) 각 필드를 옵셔널/열거형
+// 으로 두어 "있는 그대로" 반영한다 — 두 소스를 인위적으로 대칭시키지 않는다(그렇게 하면 기존
+// 표시 내용이 바뀌어 버림).
+
+// StatsBlock 리셋 카운트다운 텍스트 — updateStatusBarTitle(fromCache:)와
+// makeBlockDisplayData(fromCache:) 양쪽에서 공유(기존엔 각자 인라인 클로저로 중복 계산).
+func resetCountdownText(for b: StatsBlock) -> String {
+    if let rm = b.projection?.remainingMinutes { return formatTime(Double(rm) * 60) }
+    if let e = parseISO8601(b.endTime) { return formatTime(max(0, e.timeIntervalSinceNow)) }
+    return ""
+}
+
+struct ModelSectionData {
+    enum Shape {
+        case namesOnly([String])                                                       // 캐시 경로: 이름만
+        case breakdown([(model: String, tokens: Int, cost: Double)], unknownCount: Int) // 폴백 경로: 모델별 분해
+    }
+    let headerKo: String
+    let headerEn: String
+    let shape: Shape
+}
+
+struct TodaySectionData {
+    let totalTokens: Int
+    let totalCost: Double
+    let messageCount: Int?                                          // 캐시: 미표시(nil), 폴백: 표시(Some)
+    let modelBreakdown: [(model: String, tokens: Int, cost: Double)]? // 캐시만 존재
+    let hasUsage: Bool
+}
+
+struct AllTimeSectionData {
+    let totalTokens: Int
+    let totalCost: Double
+}
+
+struct BlockSectionData {
+    let windowText: String?          // "start → end"; nil = 시각 파싱 실패(드문 케이스)
+    let outputTokens: Int
+    let totalTokens: Int
+    let cost: Double
+    let messageCount: Int
+    let showProgressBar: Bool        // 캐시: start/end 모두 있으면 true. 폴백: remaining>0일 때만 true.
+    let progressRatio: Double
+    enum ResetState { case remaining(String); case alreadyReset; case none }
+    let resetState: ResetState        // "리셋까지"/"블록 리셋됨" 표시 줄
+    let warningResetText: String       // "⚠️ 사용량 N% — 남음" 줄 전용(resetState와 별개 — 이미 리셋된
+                                       // 경우에도 원본 코드가 0초 텍스트를 그대로 쓰던 동작을 보존)
+    let burnRateText: String?         // 캐시 경로만
+    let warning: UsageWarning?
+    let moodTier: MoodTier?
+    let moodRatio: Double
+}
+
+struct BlockDisplayData {
+    let isEstimate: Bool              // 폴백 경로에서만 true → "추정 모드" 배너
+    enum State {
+        case noData                   // 폴백 경로 전용
+        case ready(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData, allTime: AllTimeSectionData?)
+    }
+    let state: State
 }
 
 // MARK: - Menu Bar App
@@ -1496,17 +1568,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         // QA 오버라이드가 있으면 실제 활성 블록이 없어도(idle) 펄스를 미리 볼 수 있게 한다.
         updateMoodPulseTimerState(hasActiveMoodTarget: active != nil || moodTestTierOverride() != nil)
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
-        let resetText: String = {
-            guard let b = active else { return "" }
-            if let rm = b.projection?.remainingMinutes { return formatTime(Double(rm) * 60) }
-            if let e = parseISO(b.endTime) { return formatTime(max(0, e.timeIntervalSinceNow)) }
-            return ""
-        }()
+        let resetText: String = active.map(resetCountdownText(for:)) ?? ""
         if let b = active {
             // b.models.last는 CLI가 모델을 처음 발견한 순서라 "최근 사용 모델"이 아닐 수 있다.
             // 실제 JSONL 엔트리(시간순 정렬됨)에서 블록 구간 내 마지막 모델을 우선 사용.
-            let start = parseISO(b.startTime)
-            let end = parseISO(b.endTime)
+            let start = parseISO8601(b.startTime)
+            let end = parseISO8601(b.endTime)
             let lastModel: String? = {
                 guard let s = start, let e = end else { return nil }
                 return cachedAll.filter { $0.timestamp >= s && $0.timestamp < e }.last?.model
@@ -1563,102 +1630,189 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // ── 1차 경로: Claude Code stats-cache.json (권위 비용·실제 5시간 블록) ──
     func buildMenu(fromCache stats: StatsCache) {
-        let active = stats.activeBlock()
-        let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
-        let resetText: String = {
-            guard let b = active else { return "" }
-            if let rm = b.projection?.remainingMinutes { return formatTime(Double(rm) * 60) }
-            if let e = parseISO(b.endTime) { return formatTime(max(0, e.timeIntervalSinceNow)) }
-            return ""
-        }()
-
         updateStatusBarTitle(fromCache: stats)
-
         let menu = NSMenu()
         menu.autoenablesItems = false
-
-        // ── 5-Hour Block Section ──
-        addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
-        if let b = active {
-            let start = parseISO(b.startTime)
-            let end = parseISO(b.endTime)
-            if let s = start, let e = end {
-                addLabel(menu, "  \(formatTimeShort(s)) → \(formatTimeShort(e))")
-            }
-            addLabel(menu, "  " + t("출력 토큰: \(formatTokens(b.tokenCounts.outputTokens))", "Output Tokens: \(formatTokens(b.tokenCounts.outputTokens))"))
-            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(b.totalTokens))", "Total Tokens: \(formatTokens(b.totalTokens))"))
-            addLabel(menu, "  " + t("예상 비용: \(formatCost(b.costUSD))", "Estimated Cost: \(formatCost(b.costUSD))"))
-            addLabel(menu, "  " + t("메시지 수: \(b.entries)건", "Messages: \(b.entries)"))
-
-            if let s = start, let e = end {
-                let total = e.timeIntervalSince(s)
-                let elapsed = max(0, min(total, Date().timeIntervalSince(s)))
-                let ratio = total > 0 ? elapsed / total : 0
-                addLabel(menu, "  " + t("\(progressBar(ratio, width: 12)) \(Int(ratio * 100))% 경과", "\(progressBar(ratio, width: 12)) \(Int(ratio * 100))% elapsed"))
-            }
-            if let rm = b.projection?.remainingMinutes {
-                addLabel(menu, "  " + t("리셋까지: \(formatTime(Double(rm) * 60)) 남음", "Resets in: \(formatTime(Double(rm) * 60))"))
-            } else if let e = end {
-                let rem = e.timeIntervalSinceNow
-                addLabel(menu, rem > 0 ? "  " + t("리셋까지: \(formatTime(rem)) 남음", "Resets in: \(formatTime(rem))")
-                                       : "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"))
-            }
-            if let cph = b.burnRate?.costPerHour {
-                addLabel(menu, "  " + t("소모율: \(formatCost(cph))/시간", "Burn Rate: \(formatCost(cph))/hr"))
-            }
-            if let w = warning {
-                addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
-                if w.level != .none {
-                    addLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(resetText) remaining"))
-                }
-            }
-            if TitleSettings.isFunModeFeatureEnabled(.moodIcon) {
-                let tier = moodTestTierOverride() ?? computeMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
-                let ratio = warning?.ratio ?? b.elapsedRatio()
-                let scopeWord = t(warning != nil ? "사용" : "경과", warning != nil ? "used" : "elapsed")
-                addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))"))
-            }
-        } else {
-            addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
-            addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
-        }
-        menu.addItem(.separator())
-
-        // ── Models (current block; 이름만 — 블록 단위 분해는 캐시에 없음) ──
-        if let b = active, !b.models.isEmpty {
-            addSectionHeader(menu, t("🤖  모델 (현재 블록)", "🤖  Model (Current Block)"))
-            for m in b.models {
-                addLabel(menu, "  \(shortModelName(m))")
-            }
-            menu.addItem(.separator())
-        }
-
-        // ── Today Section (모델별 분해 포함) ──
-        addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
-        if let t2 = stats.todayPeriod() {
-            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(t2.totalTokens ?? 0))", "Total Tokens: \(formatTokens(t2.totalTokens ?? 0))"))
-            addLabel(menu, "  " + t("예상 비용: \(formatCost(t2.totalCost ?? 0))", "Estimated Cost: \(formatCost(t2.totalCost ?? 0))"))
-            for mb in (t2.modelBreakdowns ?? []).sorted(by: { ($0.cost ?? 0) > ($1.cost ?? 0) }) {
-                let name = shortModelName(mb.modelName).padding(toLength: 12, withPad: " ", startingAt: 0)
-                addLabel(menu, "  \(name)  \(formatTokens(mb.tokens))  \(formatCost(mb.cost ?? 0))")
-            }
-        } else {
-            addLabel(menu, "  " + t("사용 없음", "No usage"))
-        }
-        menu.addItem(.separator())
-
-        // ── Cumulative ──
-        if let c = stats.cumulative {
-            addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
-            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(c.totalTokens ?? 0))", "Total Tokens: \(formatTokens(c.totalTokens ?? 0))"))
-            addLabel(menu, "  " + t("예상 비용: \(formatCost(c.totalCost ?? 0))", "Estimated Cost: \(formatCost(c.totalCost ?? 0))"))
-            menu.addItem(.separator())
-        }
-
-        appendGamificationSection(menu)
-
+        renderBlockMenu(makeBlockDisplayData(fromCache: stats), into: menu)
         appendFooter(menu)
         statusItem.menu = menu
+    }
+
+    // ── 1차 경로(stats-cache.json) 뷰모델 어댑터 — 캐시가 노출하지 않는 필드(블록 내 모델별
+    // 토큰/비용 분해)는 fromEntries 쪽과 인위적으로 맞추지 않고 있는 그대로(namesOnly) 반영한다. ──
+    func makeBlockDisplayData(fromCache stats: StatsCache) -> BlockDisplayData {
+        let active = stats.activeBlock()
+        let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
+
+        let block: BlockSectionData?
+        if let b = active {
+            let start = parseISO8601(b.startTime)
+            let end = parseISO8601(b.endTime)
+            let windowText: String? = {
+                guard let s = start, let e = end else { return nil }
+                return "\(formatTimeShort(s)) → \(formatTimeShort(e))"
+            }()
+            let progressRatio: Double = {
+                guard let s = start, let e = end else { return 0 }
+                let total = e.timeIntervalSince(s)
+                let elapsed = max(0, min(total, Date().timeIntervalSince(s)))
+                return total > 0 ? elapsed / total : 0
+            }()
+            let resetState: BlockSectionData.ResetState = {
+                if let rm = b.projection?.remainingMinutes { return .remaining(formatTime(Double(rm) * 60)) }
+                if let e = end {
+                    let rem = e.timeIntervalSinceNow
+                    return rem > 0 ? .remaining(formatTime(rem)) : .alreadyReset
+                }
+                return .none
+            }()
+            block = BlockSectionData(
+                windowText: windowText,
+                outputTokens: b.tokenCounts.outputTokens,
+                totalTokens: b.totalTokens,
+                cost: b.costUSD,
+                messageCount: b.entries,
+                showProgressBar: start != nil && end != nil,
+                progressRatio: progressRatio,
+                resetState: resetState,
+                warningResetText: resetCountdownText(for: b),
+                burnRateText: b.burnRate?.costPerHour.map { formatCost($0) },
+                warning: warning,
+                moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning),
+                moodRatio: warning?.ratio ?? b.elapsedRatio()
+            )
+        } else {
+            block = nil
+        }
+
+        let model: ModelSectionData?
+        if let b = active, !b.models.isEmpty {
+            model = ModelSectionData(headerKo: "🤖  모델 (현재 블록)", headerEn: "🤖  Model (Current Block)",
+                                      shape: .namesOnly(b.models))
+        } else {
+            model = nil
+        }
+
+        let today: TodaySectionData
+        if let t2 = stats.todayPeriod() {
+            let breakdown = (t2.modelBreakdowns ?? [])
+                .sorted { ($0.cost ?? 0) > ($1.cost ?? 0) }
+                .map { (model: shortModelName($0.modelName), tokens: $0.tokens, cost: $0.cost ?? 0) }
+            today = TodaySectionData(totalTokens: t2.totalTokens ?? 0, totalCost: t2.totalCost ?? 0,
+                                      messageCount: nil, modelBreakdown: breakdown, hasUsage: true)
+        } else {
+            today = TodaySectionData(totalTokens: 0, totalCost: 0, messageCount: nil, modelBreakdown: nil, hasUsage: false)
+        }
+
+        let allTime = stats.cumulative.map { AllTimeSectionData(totalTokens: $0.totalTokens ?? 0, totalCost: $0.totalCost ?? 0) }
+
+        return BlockDisplayData(isEstimate: false, state: .ready(block: block, model: model, today: today, allTime: allTime))
+    }
+
+    // ── BlockDisplayData → NSMenu 렌더러. 1차/폴백 경로가 공유하는 유일한 렌더 코드. ──
+    func renderBlockMenu(_ data: BlockDisplayData, into menu: NSMenu) {
+        switch data.state {
+        case .noData:
+            addSectionHeader(menu, t("⚠️  데이터 없음", "⚠️  No Data"))
+            addLabel(menu, "  " + t("Claude Code를 먼저 실행해 주세요.", "Please run Claude Code first."))
+            addLabel(menu, "  " + t("경로: ~/.claude/projects/", "Path: ~/.claude/projects/"))
+            menu.addItem(.separator())
+
+        case .ready(let block, let model, let today, let allTime):
+            if data.isEstimate {
+                addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
+                menu.addItem(.separator())
+            }
+
+            // ── 5-Hour Block Section ──
+            addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
+            if let b = block {
+                if let windowText = b.windowText {
+                    addLabel(menu, "  \(windowText)")
+                }
+                addLabel(menu, "  " + t("출력 토큰: \(formatTokens(b.outputTokens))", "Output Tokens: \(formatTokens(b.outputTokens))"))
+                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(b.totalTokens))", "Total Tokens: \(formatTokens(b.totalTokens))"))
+                addLabel(menu, "  " + t("예상 비용: \(formatCost(b.cost))", "Estimated Cost: \(formatCost(b.cost))"))
+                addLabel(menu, "  " + t("메시지 수: \(b.messageCount)건", "Messages: \(b.messageCount)"))
+
+                if b.showProgressBar {
+                    addLabel(menu, "  " + t("\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% 경과", "\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% elapsed"))
+                }
+                switch b.resetState {
+                case .remaining(let text):
+                    addLabel(menu, "  " + t("리셋까지: \(text) 남음", "Resets in: \(text)"))
+                case .alreadyReset:
+                    addLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"))
+                case .none:
+                    break
+                }
+                if let cph = b.burnRateText {
+                    addLabel(menu, "  " + t("소모율: \(cph)/시간", "Burn Rate: \(cph)/hr"))
+                }
+                if let w = b.warning {
+                    addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
+                    if w.level != .none {
+                        addLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(b.warningResetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(b.warningResetText) remaining"))
+                    }
+                }
+                if let tier = b.moodTier {
+                    let scopeWord = t(b.warning != nil ? "사용" : "경과", b.warning != nil ? "used" : "elapsed")
+                    addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"))
+                }
+            } else {
+                addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
+                addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
+            }
+            menu.addItem(.separator())
+
+            // ── Model Section ──
+            if let model = model {
+                addSectionHeader(menu, t(model.headerKo, model.headerEn))
+                switch model.shape {
+                case .namesOnly(let names):
+                    for m in names { addLabel(menu, "  \(shortModelName(m))") }
+                case .breakdown(let items, let unknownCount):
+                    for item in items {
+                        addLabel(menu, "  \(paddedModelColumn(item.model))  \(formatTokens(item.tokens))  \(formatCost(item.cost))")
+                    }
+                    if unknownCount > 0 {
+                        addLabel(menu, "  " + t("⚠ 미상 모델 \(unknownCount)종 (추정 단가 적용)", "⚠ \(unknownCount) unknown model(s) (estimated pricing applied)"))
+                    }
+                }
+                menu.addItem(.separator())
+            }
+
+            // ── Today Section ──
+            addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
+            if today.hasUsage {
+                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(today.totalTokens))", "Total Tokens: \(formatTokens(today.totalTokens))"))
+                addLabel(menu, "  " + t("예상 비용: \(formatCost(today.totalCost))", "Estimated Cost: \(formatCost(today.totalCost))"))
+                if let mc = today.messageCount {
+                    addLabel(menu, "  " + t("메시지 수: \(mc)건", "Messages: \(mc)"))
+                }
+                for mb in today.modelBreakdown ?? [] {
+                    addLabel(menu, "  \(paddedModelColumn(mb.model))  \(formatTokens(mb.tokens))  \(formatCost(mb.cost))")
+                }
+            } else {
+                addLabel(menu, "  " + t("사용 없음", "No usage"))
+            }
+            menu.addItem(.separator())
+
+            // ── All-Time Section (캐시 경로는 stats.cumulative 없으면 통째로 생략) ──
+            if let allTime = allTime {
+                addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
+                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(allTime.totalTokens))", "Total Tokens: \(formatTokens(allTime.totalTokens))"))
+                addLabel(menu, "  " + t("예상 비용: \(formatCost(allTime.totalCost))", "Estimated Cost: \(formatCost(allTime.totalCost))"))
+                menu.addItem(.separator())
+            }
+
+            appendGamificationSection(menu)
+        }
+    }
+
+    // 모델명 컬럼 정렬(오늘 섹션·모델별 분해 섹션 공용)
+    private func paddedModelColumn(_ name: String) -> String {
+        name.padding(toLength: 12, withPad: " ", startingAt: 0)
     }
 
     // ── 재미 모드 게이팅된 "🏆 기록" 섹션 — 1차/폴백 메뉴 빌더 양쪽에서 공유(중복 방지) ──
@@ -1817,18 +1971,26 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         refreshTitleFieldsSubmenu()
     }
 
-    // ── 표시 항목 구분자 서브메뉴(라디오 스타일 — 하나만 선택) ──
-    func buildSeparatorSubmenu() -> NSMenu {
+    // 라디오 스타일 서브메뉴 공통 빌더 — CaseIterable 값 하나를 "현재 선택"으로 표시하고
+    // 나머지는 off로 둔다. @objc 셀렉터는 concrete 메서드여야 하므로(클로저 불가) 각 서브메뉴의
+    // 개별 setX(_:) 핸들러는 그대로 두고, NSMenu 구성 루프만 이 헬퍼로 흡수한다.
+    private func buildRadioSubmenu<T: CaseIterable & Equatable>(
+        current: T, action: Selector, title: (T) -> String
+    ) -> NSMenu where T.AllCases.Element == T {
         let sub = NSMenu()
-        let current = TitleSettings.separator()
-        for sep in TitleSeparator.allCases {
-            let item = NSMenuItem(title: sep.label, action: #selector(setSeparator(_:)), keyEquivalent: "")
+        for value in T.allCases {
+            let item = NSMenuItem(title: title(value), action: action, keyEquivalent: "")
             item.target = self
-            item.state = (sep == current) ? .on : .off
-            item.representedObject = sep
+            item.state = (value == current) ? .on : .off
+            item.representedObject = value
             sub.addItem(item)
         }
         return sub
+    }
+
+    // ── 표시 항목 구분자 서브메뉴(라디오 스타일 — 하나만 선택) ──
+    func buildSeparatorSubmenu() -> NSMenu {
+        buildRadioSubmenu(current: TitleSettings.separator(), action: #selector(setSeparator(_:))) { $0.label }
     }
 
     @objc func setSeparator(_ sender: NSMenuItem) {
@@ -1839,16 +2001,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // ── 메뉴바 아이콘 서브메뉴(라디오 스타일 — 하나만 선택, "표시 안 함" 포함) ──
     func buildIconSubmenu() -> NSMenu {
-        let sub = NSMenu()
-        let current = TitleSettings.icon()
-        for icon in TitleIcon.allCases {
-            let item = NSMenuItem(title: icon.label, action: #selector(setIcon(_:)), keyEquivalent: "")
-            item.target = self
-            item.state = (icon == current) ? .on : .off
-            item.representedObject = icon
-            sub.addItem(item)
-        }
-        return sub
+        buildRadioSubmenu(current: TitleSettings.icon(), action: #selector(setIcon(_:))) { $0.label }
     }
 
     @objc func setIcon(_ sender: NSMenuItem) {
@@ -1861,16 +2014,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     // 다른 라디오 서브메뉴들과 동일하게 항상 노출한다 — 값을 미리 정해두면 나중에 토글을 켰을 때
     // 그대로 적용된다. ──
     func buildMoodGlyphThemeSubmenu() -> NSMenu {
-        let sub = NSMenu()
-        let current = TitleSettings.moodGlyphTheme()
-        for theme in MoodGlyphTheme.allCases {
-            let item = NSMenuItem(title: theme.label, action: #selector(setMoodGlyphTheme(_:)), keyEquivalent: "")
-            item.target = self
-            item.state = (theme == current) ? .on : .off
-            item.representedObject = theme
-            sub.addItem(item)
-        }
-        return sub
+        buildRadioSubmenu(current: TitleSettings.moodGlyphTheme(), action: #selector(setMoodGlyphTheme(_:))) { $0.label }
     }
 
     @objc func setMoodGlyphTheme(_ sender: NSMenuItem) {
@@ -1879,7 +2023,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
-    // ── 재미 모드 서브메뉴(체크리스트 — 3개 기능 독립 on/off) ──
+    // ── 재미 모드 서브메뉴(체크리스트 — 3개 기능 독립 on/off, 라디오와 구조가 달라 별도 유지) ──
     func buildFunModeSubmenu() -> NSMenu {
         let sub = NSMenu()
         for feature in FunModeFeature.allCases {
@@ -1900,16 +2044,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // ── 자동 갱신 주기 서브메뉴(라디오 스타일 — 하나만 선택) ──
     func buildRefreshIntervalSubmenu() -> NSMenu {
-        let sub = NSMenu()
-        let current = RefreshSettings.interval()
-        for interval in RefreshInterval.allCases {
-            let item = NSMenuItem(title: interval.label, action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
-            item.target = self
-            item.state = (interval == current) ? .on : .off
-            item.representedObject = interval
-            sub.addItem(item)
-        }
-        return sub
+        buildRadioSubmenu(current: RefreshSettings.interval(), action: #selector(setRefreshInterval(_:))) { $0.label }
     }
 
     @objc func setRefreshInterval(_ sender: NSMenuItem) {
@@ -1921,16 +2056,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // ── 표시 언어 서브메뉴(라디오 스타일 — 하나만 선택) ──
     func buildLanguageSubmenu() -> NSMenu {
-        let sub = NSMenu()
-        let current = TitleSettings.languagePreference()
-        for pref in LanguagePreference.allCases {
-            let item = NSMenuItem(title: pref.label, action: #selector(setLanguagePreference(_:)), keyEquivalent: "")
-            item.target = self
-            item.state = (pref == current) ? .on : .off
-            item.representedObject = pref
-            sub.addItem(item)
-        }
-        return sub
+        buildRadioSubmenu(current: TitleSettings.languagePreference(), action: #selector(setLanguagePreference(_:))) { $0.label }
     }
 
     @objc func setLanguagePreference(_ sender: NSMenuItem) {
@@ -1941,119 +2067,71 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // ── 폴백 경로: stats-cache.json 부재 시 JSONL 직접 파싱(추정 단가) ──
     func buildMenuFromEntries() {
-        let block = FiveHourBlock.active(from: cachedAll)
+        updateStatusBarTitleFromEntries()
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        renderBlockMenu(makeBlockDisplayData(fromEntries: cachedAll, reader: reader), into: menu)
+        appendFooter(menu)
+        statusItem.menu = menu
+    }
+
+    // ── 폴백 경로(JSONL 직접 파싱, 추정 단가) 뷰모델 어댑터 ──
+    func makeBlockDisplayData(fromEntries cachedAll: [UsageEntry], reader: UsageDataReader) -> BlockDisplayData {
+        let noData = cachedAll.isEmpty && !FileManager.default.fileExists(atPath: reader.projectsDir.path)
+        if noData {
+            return BlockDisplayData(isEstimate: true, state: .noData)
+        }
+
+        let activeBlock = FiveHourBlock.active(from: cachedAll)
         let blockEntries: [UsageEntry]
-        if let block = block {
-            blockEntries = cachedAll.filter { $0.timestamp >= block.start && $0.timestamp < block.end }
+        if let activeBlock = activeBlock {
+            blockEntries = cachedAll.filter { $0.timestamp >= activeBlock.start && $0.timestamp < activeBlock.end }
         } else {
             blockEntries = []
         }
         let blockStats = UsageStats(entries: blockEntries)
+        let warning = (activeBlock != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
 
-        let todayStart = Calendar.current.startOfDay(for: Date())
-        let todayEntries = cachedAll.filter { $0.timestamp >= todayStart }
-        let todayStats = UsageStats(entries: todayEntries)
-        let allStats = UsageStats(entries: cachedAll)
-
-        let noData = cachedAll.isEmpty && !FileManager.default.fileExists(
-            atPath: reader.projectsDir.path)
-
-        let warning = (block != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
-        let resetText = block.map { formatTime($0.remaining) } ?? ""
-
-        updateStatusBarTitleFromEntries()
-
-        // --- Build Menu ---
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-
-        if noData {
-            addSectionHeader(menu, t("⚠️  데이터 없음", "⚠️  No Data"))
-            addLabel(menu, "  " + t("Claude Code를 먼저 실행해 주세요.", "Please run Claude Code first."))
-            addLabel(menu, "  " + t("경로: ~/.claude/projects/", "Path: ~/.claude/projects/"))
-            menu.addItem(.separator())
+        let block: BlockSectionData?
+        if let activeBlock = activeBlock {
+            let rem = activeBlock.remaining
+            block = BlockSectionData(
+                windowText: "\(formatTimeShort(activeBlock.start)) → \(formatTimeShort(activeBlock.end))",
+                outputTokens: blockStats.outputTokens,
+                totalTokens: blockStats.totalTokens,
+                cost: blockStats.totalCost,
+                messageCount: blockStats.count,
+                showProgressBar: rem > 0,
+                progressRatio: activeBlock.progress,
+                resetState: rem > 0 ? .remaining(formatTime(rem)) : .alreadyReset,
+                warningResetText: formatTime(rem),
+                burnRateText: nil,
+                warning: warning,
+                moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: activeBlock.progress, warning: warning),
+                moodRatio: warning?.ratio ?? activeBlock.progress
+            )
         } else {
-            // 1차 소스(stats-cache.json) 부재 → JSONL 추정 경로임을 사용자에게 명시.
-            addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
-            menu.addItem(.separator())
-
-            // ── 5-Hour Block Section ──
-            addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
-
-            if let block = block {
-                let blockStartStr = formatTimeShort(block.start)
-                let blockEndStr   = formatTimeShort(block.end)
-                addLabel(menu, "  \(blockStartStr) → \(blockEndStr)")
-                addLabel(menu, "  " + t("출력 토큰: \(formatTokens(blockStats.outputTokens))", "Output Tokens: \(formatTokens(blockStats.outputTokens))"))
-                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(blockStats.totalTokens))", "Total Tokens: \(formatTokens(blockStats.totalTokens))"))
-                addLabel(menu, "  " + t("예상 비용: \(formatCost(blockStats.totalCost))", "Estimated Cost: \(formatCost(blockStats.totalCost))"))
-                addLabel(menu, "  " + t("메시지 수: \(blockStats.count)건", "Messages: \(blockStats.count)"))
-
-                let rem = block.remaining
-                if rem > 0 {
-                    let pct = Int(block.progress * 100)
-                    let bar = progressBar(block.progress, width: 12)
-                    addLabel(menu, "  " + t("\(bar) \(pct)% 경과", "\(bar) \(pct)% elapsed"))
-                    addLabel(menu, "  " + t("리셋까지: \(formatTime(rem)) 남음", "Resets in: \(formatTime(rem))"))
-                } else {
-                    addLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"))
-                }
-                if let w = warning {
-                    addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
-                    if w.level != .none {
-                        addLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(resetText) remaining"))
-                    }
-                }
-                if TitleSettings.isFunModeFeatureEnabled(.moodIcon) {
-                    let tier = moodTestTierOverride() ?? computeMood(hasActiveBlock: true, elapsedRatio: block.progress, warning: warning)
-                    let ratio = warning?.ratio ?? block.progress
-                    let scopeWord = t(warning != nil ? "사용" : "경과", warning != nil ? "used" : "elapsed")
-                    addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))"))
-                }
-            } else {
-                addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
-                addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
-            }
-
-            menu.addItem(.separator())
-
-            // ── Model Breakdown (within block) ──
-            if !blockStats.modelBreakdown.isEmpty {
-                addSectionHeader(menu, t("🤖  모델별 (현재 블록)", "🤖  By Model (Current Block)"))
-                for item in blockStats.modelBreakdown {
-                    let line = "  \(item.model.padding(toLength: 12, withPad: " ", startingAt: 0))  \(formatTokens(item.tokens))  \(formatCost(item.cost))"
-                    addLabel(menu, line)
-                }
-                if !blockStats.unknownModels.isEmpty {
-                    addLabel(menu, "  " + t("⚠ 미상 모델 \(blockStats.unknownModels.count)종 (추정 단가 적용)", "⚠ \(blockStats.unknownModels.count) unknown model(s) (estimated pricing applied)"))
-                }
-                menu.addItem(.separator())
-            }
-
-            // ── Today Section ──
-            addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
-            if todayStats.count == 0 {
-                addLabel(menu, "  " + t("사용 없음", "No usage"))
-            } else {
-                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(todayStats.totalTokens))", "Total Tokens: \(formatTokens(todayStats.totalTokens))"))
-                addLabel(menu, "  " + t("예상 비용: \(formatCost(todayStats.totalCost))", "Estimated Cost: \(formatCost(todayStats.totalCost))"))
-                addLabel(menu, "  " + t("메시지 수: \(todayStats.count)건", "Messages: \(todayStats.count)"))
-            }
-
-            menu.addItem(.separator())
-
-            // ── All Time ──
-            addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
-            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(allStats.totalTokens))", "Total Tokens: \(formatTokens(allStats.totalTokens))"))
-            addLabel(menu, "  " + t("예상 비용: \(formatCost(allStats.totalCost))", "Estimated Cost: \(formatCost(allStats.totalCost))"))
-
-            menu.addItem(.separator())
-
-            appendGamificationSection(menu)
+            block = nil
         }
 
-        appendFooter(menu)
-        statusItem.menu = menu
+        let model: ModelSectionData?
+        if !blockStats.modelBreakdown.isEmpty {
+            model = ModelSectionData(headerKo: "🤖  모델별 (현재 블록)", headerEn: "🤖  By Model (Current Block)",
+                                      shape: .breakdown(blockStats.modelBreakdown, unknownCount: blockStats.unknownModels.count))
+        } else {
+            model = nil
+        }
+
+        let todayStart = Calendar.current.startOfDay(for: Date())
+        let todayStats = UsageStats(entries: cachedAll.filter { $0.timestamp >= todayStart })
+        let today = TodaySectionData(totalTokens: todayStats.totalTokens, totalCost: todayStats.totalCost,
+                                      messageCount: todayStats.count == 0 ? nil : todayStats.count,
+                                      modelBreakdown: nil, hasUsage: todayStats.count != 0)
+
+        let allStats = UsageStats(entries: cachedAll)
+        let allTime = AllTimeSectionData(totalTokens: allStats.totalTokens, totalCost: allStats.totalCost)
+
+        return BlockDisplayData(isEstimate: true, state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
     // NSMenuItem.isEnabled == false인 표준 아이템은 attributedTitle의 foregroundColor를 무시하고
@@ -2270,13 +2348,13 @@ func runSelfTests() -> Never {
     }
     """.replacingOccurrences(of: "__TODAY__", with: todayStr)
     // 블록 윈도우(05:00~10:00Z) 내부 시각을 주입해 결정적으로 검증
-    let inBlock = parseISO("2026-06-30T07:00:00.000Z")!
+    let inBlock = parseISO8601("2026-06-30T07:00:00.000Z")!
     if let sc = try? JSONDecoder().decode(StatsCache.self, from: Data(cacheJSON.utf8)) {
         check(sc.activeBlock(now: inBlock)?.costUSD == 84.77, "stats: activeBlock costUSD")
         check(sc.activeBlock(now: inBlock)?.tokenCounts.outputTokens == 594516, "stats: activeBlock outputTokens")
         check(sc.activeBlock(now: inBlock)?.projection?.remainingMinutes == 77, "stats: projection remainingMinutes")
         // isActive:true 이지만 endTime(10:00Z) 이후 시각 → stale 캐시로 보고 배제
-        check(sc.activeBlock(now: parseISO("2026-06-30T11:00:00.000Z")!) == nil, "stats: 만료된 활성 블록 배제(stale)")
+        check(sc.activeBlock(now: parseISO8601("2026-06-30T11:00:00.000Z")!) == nil, "stats: 만료된 활성 블록 배제(stale)")
         check(sc.todayPeriod()?.totalCost == 1.5, "stats: todayPeriod 날짜 매칭")
         check(sc.todayPeriod()?.modelBreakdowns?.first?.tokens == 10, "stats: modelBreakdown 토큰 합")
         check(sc.cumulative?.totalTokens == 12345, "stats: cumulative = monthly.totals")
