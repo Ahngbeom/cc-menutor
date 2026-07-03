@@ -55,18 +55,77 @@ func usageWarning(tokens: Int, cost: Double) -> UsageWarning? {
                         warnAt: WARN_RATIO, critAt: CRIT_RATIO)
 }
 
-// MARK: - Title Field Customization (메뉴바 표시 항목 선택 — UserDefaults 영속화)
+// MARK: - Localization (macOS 시스템 언어 설정에 따른 영어/한국어 UI 전환)
+//
+// 이 프로젝트는 .app 번들이 없는 bare 실행 파일이라(swiftc 단일 파일 컴파일, Xcode 프로젝트 없음)
+// NSLocalizedString + Localizable.strings + .lproj 같은 표준 지역화는 번들 리소스 구조를 전제로
+// 하므로 그대로 쓸 수 없다. 대신 각 문자열이 쓰이는 자리에서 바로 한국어/영어를 나란히 넘기는
+// 인라인 헬퍼(t(ko:en:))를 쓴다 — 이 파일의 기존 스타일(추상화 없이 각 지점에서 직접 처리)과 결이
+// 맞고 리소스 파일·키 관리가 필요 없다.
 
-enum TitleField: String, CaseIterable {
-    case outputTokens, totalTokens, cost, remainingTime, model
+enum ResolvedLanguage { case korean, english }
+
+enum LanguagePreference: String, CaseIterable {
+    case system, korean, english
 
     var label: String {
         switch self {
-        case .outputTokens:  return "출력 토큰"
-        case .totalTokens:   return "전체 토큰"
-        case .cost:          return "비용"
-        case .remainingTime: return "남은 시간"
-        case .model:         return "모델명"
+        case .system:  return t("시스템 설정 따름 (기본)", "Follow System (Default)")
+        case .korean:  return "한국어"
+        case .english: return "English"
+        }
+    }
+}
+
+// 순수 함수: 로케일 코드를 인자로 받아 테스트 용이하게 한다. 한국어가 아닌 모든 로케일은
+// 영어로 폴백(2개 언어만 지원하는 현실적 기본값).
+func resolveLanguage(preference: LanguagePreference, systemLanguageCode: String?) -> ResolvedLanguage {
+    switch preference {
+    case .korean:  return .korean
+    case .english: return .english
+    case .system:  return (systemLanguageCode?.hasPrefix("ko") ?? false) ? .korean : .english
+    }
+}
+
+extension TitleSettings {
+    private static let languageKey = "appLanguage"
+    static func languagePreference(defaults: UserDefaults = .standard) -> LanguagePreference {
+        guard let raw = defaults.string(forKey: languageKey), let p = LanguagePreference(rawValue: raw) else { return .system }
+        return p
+    }
+    static func setLanguagePreference(_ p: LanguagePreference, defaults: UserDefaults = .standard) {
+        defaults.set(p.rawValue, forKey: languageKey)
+    }
+}
+
+// Locale.preferredLanguages는 macOS 시스템 언어 설정(제어판 > 일반 > 언어 및 지역)을 그대로
+// 반영하는 순서 있는 배열이며 캐시하지 않고 매번 새로 읽는다 — 앱 실행 중 시스템 언어가 바뀌어도
+// 다음 refresh()/설정 변경 시 자동 반영된다.
+func currentLanguage(defaults: UserDefaults = .standard) -> ResolvedLanguage {
+    resolveLanguage(preference: TitleSettings.languagePreference(defaults: defaults),
+                    systemLanguageCode: Locale.preferredLanguages.first)
+}
+
+// 모든 사용자 노출 문자열이 거치는 지점.
+func t(_ ko: String, _ en: String, defaults: UserDefaults = .standard) -> String {
+    currentLanguage(defaults: defaults) == .korean ? ko : en
+}
+
+// MARK: - Title Field Customization (메뉴바 표시 항목 선택 — UserDefaults 영속화)
+
+enum TitleField: String, CaseIterable {
+    case outputTokens, totalTokens, cost, remainingTime, model, todayTokens, todayCost, cumulativeTokens
+
+    var label: String {
+        switch self {
+        case .outputTokens:     return t("블록 출력 토큰", "Block Output Tokens")
+        case .totalTokens:      return t("블록 토큰", "Block Tokens")
+        case .cost:             return t("블록 비용", "Block Cost")
+        case .remainingTime:    return t("남은 시간", "Time Remaining")
+        case .model:            return t("모델명", "Model")
+        case .todayTokens:      return t("오늘 토큰", "Today's Tokens")
+        case .todayCost:        return t("오늘 비용", "Today's Cost")
+        case .cumulativeTokens: return t("누적 토큰", "Cumulative Tokens")
         }
     }
 
@@ -151,7 +210,11 @@ enum TitleMoveDirection { case up, down }
 
 extension TitleSettings {
     private static let orderKey = "titleFieldsOrder"
-    private static let defaultOrder: [TitleField] = [.model, .totalTokens, .cost, .remainingTime, .outputTokens]
+    // 신규 필드를 TitleField에 추가할 때는 여기에도 반드시 추가해야 한다 — 이 배열은
+    // TitleField.allCases가 아니라 이 하드코딩된 목록 기준으로 "저장된 순서 + 누락분 자동 보강"을
+    // 하므로(바로 아래 order()), 여기 빠지면 그 필드는 설정 서브메뉴에도 아예 나타나지 않는다.
+    private static let defaultOrder: [TitleField] = [.model, .totalTokens, .cost, .remainingTime, .outputTokens,
+                                                       .todayTokens, .todayCost, .cumulativeTokens]
 
     // 저장된 순서 + 신규/누락 필드는 끝에 자동 보강 (스키마 드리프트 내성 — StatsBlock 옵셔널 필드와 동일한 사고방식)
     static func order(defaults: UserDefaults = .standard) -> [TitleField] {
@@ -180,10 +243,10 @@ enum TitleSeparator: String, CaseIterable {
     case space = " ", dot = " · ", pipe = " | ", none = ""
     var label: String {
         switch self {
-        case .space: return "공백"
-        case .dot:   return "가운데점 (·)"
-        case .pipe:  return "세로막대 (|)"
-        case .none:  return "없음"
+        case .space: return t("공백", "Space")
+        case .dot:   return t("가운데점 (·)", "Middle Dot (·)")
+        case .pipe:  return t("세로막대 (|)", "Vertical Bar (|)")
+        case .none:  return t("없음", "None")
         }
     }
 }
@@ -203,14 +266,14 @@ enum TitleIcon: String, CaseIterable {
     case keyboard = "⌨", robot = "🤖", brain = "🧠", chat = "💬", bolt = "⚡", chart = "📊", diamond = "🔶", none = ""
     var label: String {
         switch self {
-        case .keyboard: return "⌨️ 키보드 (기본)"
-        case .robot:    return "🤖 로봇"
-        case .brain:    return "🧠 두뇌"
-        case .chat:     return "💬 말풍선"
-        case .bolt:     return "⚡ 번개"
-        case .chart:    return "📊 차트"
-        case .diamond:  return "🔶 다이아몬드"
-        case .none:     return "표시 안 함"
+        case .keyboard: return t("⌨️ 키보드 (기본)", "⌨️ Keyboard (Default)")
+        case .robot:    return t("🤖 로봇", "🤖 Robot")
+        case .brain:    return t("🧠 두뇌", "🧠 Brain")
+        case .chat:     return t("💬 말풍선", "💬 Speech Bubble")
+        case .bolt:     return t("⚡ 번개", "⚡ Bolt")
+        case .chart:    return t("📊 차트", "📊 Chart")
+        case .diamond:  return t("🔶 다이아몬드", "🔶 Diamond")
+        case .none:     return t("표시 안 함", "None")
         }
     }
 }
@@ -230,10 +293,10 @@ enum RefreshInterval: TimeInterval, CaseIterable {
     case sec10 = 10, sec30 = 30, min1 = 60, min5 = 300
     var label: String {
         switch self {
-        case .sec10: return "10초"
-        case .sec30: return "30초"
-        case .min1:  return "1분"
-        case .min5:  return "5분"
+        case .sec10: return t("10초", "10 sec")
+        case .sec30: return t("30초", "30 sec")
+        case .min1:  return t("1분", "1 min")
+        case .min5:  return t("5분", "5 min")
         }
     }
 }
@@ -248,32 +311,51 @@ enum RefreshSettings {
     }
 }
 
-// MARK: - Fun Mode (재미 모드 — 무드 아이콘, 기본 OFF)
+// MARK: - Fun Mode (재미 모드 — 무드 아이콘 / 연속 사용 기록 / 마일스톤 축하, 3개 독립 토글)
 //
-// 켜면 정적 TitleIcon 대신 5시간 블록 진행 상태에 따라 모양·색이 바뀌는 무드 글리프를 표시한다.
-// 기본값 OFF — 업그레이드한 기존 사용자의 화면은 변화 없어야 한다.
+// 세 기능은 서로 무관하므로(스트릭 기록은 보고 싶지만 타이틀을 가로채는 축하는 원치 않는 식) 하나의
+// on/off 토글로 묶지 않고 기능별 독립 Bool 플래그로 관리한다. 전부 기본 OFF — 업그레이드한 기존
+// 사용자의 화면은 변화 없어야 한다.
 
-enum FunMode: String, CaseIterable {
-    case off, on
+enum FunModeFeature: String, CaseIterable {
+    case moodIcon, streakSection, celebrations, refreshFlash
+
     var label: String {
         switch self {
-        case .off: return "꺼짐 (기본)"
-        case .on:  return "켜짐 — 무드 아이콘"
+        case .moodIcon:      return t("무드 아이콘", "Mood Icon")
+        case .streakSection: return t("연속 사용 기록", "Streak Record")
+        case .celebrations:  return t("마일스톤 축하", "Milestone Celebrations")
+        case .refreshFlash:  return t("새로고침 반짝임", "Refresh Sparkle")
         }
     }
+
+    var defaultsKey: String { "funMode_\(rawValue)" }
 }
 
 extension TitleSettings {
-    private static let funModeKey = "funMode"
-    static func funMode(defaults: UserDefaults = .standard) -> FunMode {
-        guard let raw = defaults.string(forKey: funModeKey), let m = FunMode(rawValue: raw) else { return .off }
-        return m
+    static func isFunModeFeatureEnabled(_ feature: FunModeFeature, defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: feature.defaultsKey)
     }
-    static func setFunMode(_ mode: FunMode, defaults: UserDefaults = .standard) {
-        defaults.set(mode.rawValue, forKey: funModeKey)
+    static func setFunModeFeatureEnabled(_ feature: FunModeFeature, _ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: feature.defaultsKey)
     }
-    static func isFunModeEnabled(defaults: UserDefaults = .standard) -> Bool {
-        funMode(defaults: defaults) == .on
+    static func toggleFunModeFeature(_ feature: FunModeFeature, defaults: UserDefaults = .standard) {
+        setFunModeFeatureEnabled(feature, !isFunModeFeatureEnabled(feature, defaults: defaults), defaults: defaults)
+    }
+}
+
+// 과거 FunMode(off/on) 단일 토글에서 "on"으로 켜 두었던 사용자는, 새 3-플래그 체계에서도 이전과
+// 동일한 경험(무드 아이콘 + 기록 + 축하 전부 표시)을 유지하도록 1회에 한해 세 플래그를 모두 켠다.
+// migrateLegacyDefaultsIfNeeded()와 동일한 "완료 워터마크 1개 키" 패턴.
+private let legacyFunModeKey = "funMode"
+private let funModeMigrationDoneKey = "funModeMigrated"
+
+func migrateFunModeIfNeeded(defaults: UserDefaults = .standard) {
+    guard !defaults.bool(forKey: funModeMigrationDoneKey) else { return }
+    defer { defaults.set(true, forKey: funModeMigrationDoneKey) }
+    guard defaults.string(forKey: legacyFunModeKey) == "on" else { return }
+    for feature in FunModeFeature.allCases {
+        TitleSettings.setFunModeFeatureEnabled(feature, true, defaults: defaults)
     }
 }
 
@@ -718,12 +800,53 @@ enum MoodTier: String, CaseIterable {
     }
     var label: String {   // 드롭다운 범례용
         switch self {
-        case .idle:     return "대기"
-        case .calm:     return "여유"
-        case .warm:     return "몰입"
-        case .hot:      return "가속"
-        case .critical: return "한계 근접"
+        case .idle:     return t("대기", "Idle")
+        case .calm:     return t("여유", "Calm")
+        case .warm:     return t("몰입", "Focused")
+        case .hot:      return t("가속", "Accelerating")
+        case .critical: return t("한계 근접", "Near Limit")
         }
+    }
+}
+
+// 무드 글리프의 "모양" 테마 — 색(TitleFieldColor)은 테마와 무관하게 MoodTier.color 그대로 쓴다.
+// 자유 텍스트 입력을 허용하지 않는 이유: 컬러 프레젠테이션 이모지를 넣으면 위 색상 틴팅이 조용히
+// 먹히지 않기 때문에(:712 주석 참고), 색 틴팅이 검증된 텍스트 프레젠테이션 글리프로만 구성된
+// 테마 중에서 고르게 한다.
+enum MoodGlyphTheme: String, CaseIterable {
+    case circles, bars
+
+    var label: String {
+        switch self {
+        case .circles: return t("○ 원형 (기본)", "○ Circles (Default)")
+        case .bars:    return t("▁ 막대", "▁ Bars")
+        }
+    }
+
+    func glyph(for tier: MoodTier) -> String {
+        switch self {
+        case .circles:
+            return tier.glyph
+        case .bars:
+            switch tier {
+            case .idle:     return "▁"
+            case .calm:     return "▃"
+            case .warm:     return "▅"
+            case .hot:      return "▇"
+            case .critical: return "█"
+            }
+        }
+    }
+}
+
+extension TitleSettings {
+    private static let moodGlyphThemeKey = "moodGlyphTheme"
+    static func moodGlyphTheme(defaults: UserDefaults = .standard) -> MoodGlyphTheme {
+        guard let raw = defaults.string(forKey: moodGlyphThemeKey), let t = MoodGlyphTheme(rawValue: raw) else { return .circles }
+        return t
+    }
+    static func setMoodGlyphTheme(_ theme: MoodGlyphTheme, defaults: UserDefaults = .standard) {
+        defaults.set(theme.rawValue, forKey: moodGlyphThemeKey)
     }
 }
 
@@ -892,16 +1015,25 @@ struct TitleContext {
     let remainingText: String?   // 이미 formatTime()된 문자열, 알 수 없으면 nil
     let model: String?           // shortModelName 적용 전 원본 모델 문자열
     let moodTier: MoodTier?      // 재미 모드 ON일 때만 non-nil — OFF면 기존 아이콘 로직과 동일 출력 보장
+    let moodPulsePhase: Bool     // 무드 글리프 맥박 애니메이션의 현재 프레임(true = 강조 프레임)
+    let todayTokens: Int
+    let todayCost: Double
+    let cumulativeTokens: Int
 
-    // moodTier에 기본값을 줘 기존 호출부(재미 모드 무관)가 그대로 컴파일되게 한다.
-    // (Swift 합성 memberwise init은 기본값이 있는 저장 프로퍼티를 파라미터로 노출하지 않으므로 명시.)
-    init(outputTokens: Int, totalTokens: Int, cost: Double, remainingText: String?, model: String?, moodTier: MoodTier? = nil) {
+    // moodTier/moodPulsePhase 이후 추가되는 필드는 전부 기본값을 줘 기존 호출부가 그대로 컴파일되게 한다.
+    init(outputTokens: Int, totalTokens: Int, cost: Double, remainingText: String?, model: String?,
+         moodTier: MoodTier? = nil, moodPulsePhase: Bool = false,
+         todayTokens: Int = 0, todayCost: Double = 0, cumulativeTokens: Int = 0) {
         self.outputTokens = outputTokens
         self.totalTokens = totalTokens
         self.cost = cost
         self.remainingText = remainingText
         self.model = model
         self.moodTier = moodTier
+        self.moodPulsePhase = moodPulsePhase
+        self.todayTokens = todayTokens
+        self.todayCost = todayCost
+        self.cumulativeTokens = cumulativeTokens
     }
 }
 
@@ -911,7 +1043,7 @@ func titleIconPrefix() -> String {
     return icon.isEmpty ? "" : "\(icon) "
 }
 
-struct TitlePart { let text: String; let color: TitleFieldColor }
+struct TitlePart { let text: String; let color: TitleFieldColor; var pulsing: Bool = false }
 
 func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     var parts: [TitlePart] = []
@@ -919,7 +1051,7 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     // 출력이 이전과 동일함을 보장한다. 사용자가 아이콘을 "표시 안 함"으로 두면 무드도 함께 숨긴다.
     if TitleSettings.icon() != .none {
         if let tier = ctx.moodTier {
-            parts.append(TitlePart(text: tier.glyph, color: tier.color))
+            parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: ctx.moodPulsePhase))
         } else {
             let icon = TitleSettings.icon().rawValue
             if !icon.isEmpty { parts.append(TitlePart(text: icon, color: .defaultColor)) }
@@ -927,11 +1059,14 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     }
     for field in TitleSettings.enabledFieldsInOrder() {
         switch field {
-        case .outputTokens:  parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
-        case .totalTokens:   parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: TitleSettings.color(for: field)))
-        case .cost:          parts.append(TitlePart(text: formatCost(ctx.cost), color: TitleSettings.color(for: field)))
-        case .remainingTime: if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: TitleSettings.color(for: field))) }
-        case .model:         if let m = ctx.model { parts.append(TitlePart(text: shortModelName(m), color: TitleSettings.color(for: field))) }
+        case .outputTokens:     parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
+        case .totalTokens:      parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: TitleSettings.color(for: field)))
+        case .cost:             parts.append(TitlePart(text: formatCost(ctx.cost), color: TitleSettings.color(for: field)))
+        case .remainingTime:    if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: TitleSettings.color(for: field))) }
+        case .model:            if let m = ctx.model { parts.append(TitlePart(text: shortModelName(m), color: TitleSettings.color(for: field))) }
+        case .todayTokens:      parts.append(TitlePart(text: formatTokens(ctx.todayTokens), color: TitleSettings.color(for: field)))
+        case .todayCost:        parts.append(TitlePart(text: formatCost(ctx.todayCost), color: TitleSettings.color(for: field)))
+        case .cumulativeTokens: parts.append(TitlePart(text: formatTokens(ctx.cumulativeTokens), color: TitleSettings.color(for: field)))
         }
     }
     return parts
@@ -1110,11 +1245,30 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     private(set) var gamificationNewRecordToday: Bool = false
     private(set) var justCrossedTokenMilestone: Int? = nil
     private(set) var justCrossedStreakMilestone: Int? = nil
+    // 메뉴바 타이틀에 얹는 축하 배지 — 텍스트를 발화 시점에 캡처해 두고 celebrationBadgeExpiresAt까지
+    // 만료 여부만 확인한다(justCrossed*는 다음 refresh()에서 워터마크가 갱신되며 nil로 돌아가므로,
+    // 자동 갱신 주기가 배지 지속시간보다 길면 그 사이에 텍스트를 잃어버릴 수 있어 별도 보관 필요).
+    private var celebrationBadgeText: String? = nil
+    private var celebrationBadgeExpiresAt: Date? = nil
+    private var celebrationBadgeTimer: Timer? = nil
+    private let celebrationBadgeDuration: TimeInterval = 15
+    // 무드 아이콘 맥박 애니메이션 — 활성 블록이 있고 무드 아이콘이 켜져 있을 때만 도는 경량 타이머.
+    // moodPulsePhase를 뒤집고 updateStatusBarTitle()만 재호출(전체 refresh()는 아님)해 데이터
+    // 갱신 주기(10초~5분)와 무관하게 짧은 주기로 돈다.
+    private var moodPulseTimer: Timer? = nil
+    private var moodPulsePhase = false
+    private let moodPulseInterval: TimeInterval = 1.0
+    // 자동/수동 새로고침 직후 잠깐 나타났다 사라지는 반짝임 — celebrationBadge와 동일한
+    // "일회성 타이머로 만료 시점에 updateStatusBarTitle()만 재호출" 패턴.
+    private var refreshFlashExpiresAt: Date? = nil
+    private var refreshFlashTimer: Timer? = nil
+    private let refreshFlashDuration: TimeInterval = 1.5
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyDefaultsIfNeeded()
+        migrateFunModeIfNeeded()
         NSApp.setActivationPolicy(.accessory)  // Hide from Dock
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1149,6 +1303,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 self.lastUpdateTime = Date()
                 self.updateGamificationRecord()
                 self.updateEasterEggState()
+                self.scheduleRefreshFlash()
                 self.buildMenu()
                 self.isRefreshing = false
             }
@@ -1157,7 +1312,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // 재미 모드와 무관하게 항상 최신 상태로 갱신한다 — 스트릭은 "실제 사용한 날"을 반영해야 하므로
     // 화면에 안 보인다고 건너뛰면 나중에 재미 모드를 켰을 때 그 사이의 활동이 반영되지 않은 잘못된
-    // 갭/리셋이 발생한다. 드롭다운 노출만 TitleSettings.isFunModeEnabled()로 게이팅한다.
+    // 갭/리셋이 발생한다. 드롭다운 노출만 TitleSettings.isFunModeFeatureEnabled(.streakSection)으로 게이팅한다.
     func updateGamificationRecord() {
         let todayStart = Calendar.current.startOfDay(for: Date())
         let todayStats = UsageStats(entries: cachedAll.filter { $0.timestamp >= todayStart })
@@ -1179,7 +1334,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // 재미 모드 여부와 무관하게 워터마크는 항상 갱신한다(스트릭/최고기록과 동일한 이유) — 표시가
     // 꺼져 있어도 "이미 넘긴 마일스톤"은 계속 정확히 추적되어야, 나중에 재미 모드를 켰을 때 과거
-    // 마일스톤이 몰아서 터지지 않는다. 실제 셀러브레이션 노출만 celebrationTitle()에서 게이팅한다.
+    // 마일스톤이 몰아서 터지지 않는다. 실제 셀러브레이션 노출만 activeCelebrationBadge()에서 게이팅한다.
     func updateEasterEggState() {
         let lifetimeTokens = UsageStats(entries: cachedAll).totalTokens
         let prevToken = EasterEggSettings.announcedTokenMilestone()
@@ -1198,16 +1353,83 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             EasterEggSettings.setAnnouncedStreakMilestone(streakResult.announced)
         }
         justCrossedStreakMilestone = streakResult.justCrossed
+
+        // 토큰과 스트릭이 같은 사이클에 동시에 터지면(극히 드묾) 토큰 쪽을 우선 노출. 배지 텍스트는
+        // 발화 시점에 캡처해 두므로, 자동 갱신 주기가 celebrationBadgeDuration보다 길어 그 사이에
+        // justCrossed*가 nil로 돌아가도(워터마크가 이미 전진했으므로) 배지 표시엔 영향 없다.
+        if let milestone = tokenResult.justCrossed {
+            celebrationBadgeText = t("🎉 \(formatTokens(milestone)) 돌파", "🎉 \(formatTokens(milestone)) reached")
+            scheduleCelebrationBadgeExpiry()
+        } else if let s = streakResult.justCrossed {
+            celebrationBadgeText = t("🔥 \(s)일 연속", "🔥 \(s)-day streak")
+            scheduleCelebrationBadgeExpiry()
+        }
     }
 
-    // 재미 모드 ON이고 이번 refresh 사이클에서 새로 넘은 마일스톤이 있을 때만 non-nil. 다음
-    // 사이클엔 워터마크가 이미 갱신되어 자동으로 사라진다(별도 타이머/정리 코드 불필요). 토큰과
-    // 스트릭이 같은 사이클에 동시에 터지면(극히 드묾) 토큰 쪽을 우선 노출한다.
-    func celebrationTitle() -> String? {
-        guard TitleSettings.isFunModeEnabled() else { return nil }
-        if let t = justCrossedTokenMilestone { return "🎉 누적 \(formatTokens(t)) 토큰 돌파!" }
-        if let s = justCrossedStreakMilestone { return "🔥 \(s)일 연속 사용 달성!" }
-        return nil
+    // 자동 갱신 주기가 celebrationBadgeDuration보다 길면(예: 5분) refresh()만으로는 배지가 제때
+    // 사라지지 않는다 — 만료 시점에 맞춰 짧은 1회성 타이머로 타이틀만 재계산(전체 refresh()는 아님)
+    // 해 갱신 주기와 무관하게 정확히 사라지게 한다.
+    private func scheduleCelebrationBadgeExpiry() {
+        celebrationBadgeExpiresAt = Date().addingTimeInterval(celebrationBadgeDuration)
+        celebrationBadgeTimer?.invalidate()
+        celebrationBadgeTimer = Timer.scheduledTimer(withTimeInterval: celebrationBadgeDuration, repeats: false) { [weak self] _ in
+            self?.updateStatusBarTitle()
+        }
+    }
+
+    // 재미 모드(마일스톤 축하) ON이고 배지가 아직 만료되지 않았을 때만 non-nil. 타이틀 전체를
+    // 대체하지 않고 buildTitleParts() 결과 맨 앞에 얹는 TitlePart라, 실시간 토큰/비용/모델 정보는
+    // 배지 노출 중에도 계속 보인다.
+    func activeCelebrationBadge() -> TitlePart? {
+        guard TitleSettings.isFunModeFeatureEnabled(.celebrations) else { return nil }
+        guard let text = celebrationBadgeText, let expires = celebrationBadgeExpiresAt, expires > Date() else { return nil }
+        return TitlePart(text: text, color: .green)
+    }
+
+    // celebrationBadge와 동일한 구조 — 자동 갱신 주기가 refreshFlashDuration(1.5초)보다 훨씬 길
+    // 수 있으므로(최대 5분), 만료 시점에 맞춰 짧은 1회성 타이머로 타이틀만 재계산해 정확히 사라지게
+    // 한다. refresh()가 다시 일어나 만료 전에 재호출되면 만료 시각을 매번 갱신하므로(재호출 시
+    // 이전 타이머는 invalidate) 연속 갱신 중에도 자연스럽게 이어져 보인다.
+    private func scheduleRefreshFlash() {
+        // 꺼져 있으면 아예 스케줄하지 않는다 — 반짝임은 축하 배지의 마일스톤 워터마크처럼 꺼진
+        // 동안에도 정확히 추적해야 할 장기 상태가 없는 순수 코스메틱이라, 매 refresh()마다 불필요한
+        // 타이머를 만들 이유가 없다.
+        guard TitleSettings.isFunModeFeatureEnabled(.refreshFlash) else { return }
+        refreshFlashExpiresAt = Date().addingTimeInterval(refreshFlashDuration)
+        refreshFlashTimer?.invalidate()
+        refreshFlashTimer = Timer.scheduledTimer(withTimeInterval: refreshFlashDuration, repeats: false) { [weak self] _ in
+            self?.updateStatusBarTitle()
+        }
+    }
+
+    // 재미 모드(새로고침 반짝임) ON이고 아직 만료되지 않았을 때만 non-nil. 타이틀 끝에 덧붙이는
+    // TitlePart라 실데이터(아이콘/무드/필드)는 그대로 보이고 끝에 ✨만 잠깐 얹힌다.
+    func activeRefreshFlash() -> TitlePart? {
+        guard TitleSettings.isFunModeFeatureEnabled(.refreshFlash) else { return nil }
+        guard let expires = refreshFlashExpiresAt, expires > Date() else { return nil }
+        return TitlePart(text: "✨", color: .defaultColor)
+    }
+
+    // 무드 아이콘이 켜져 있고 "볼 대상"(활성 블록, 또는 QA용 CLAUDE_MONITOR_MOOD_TEST_TIER 오버라이드)이
+    // 있을 때만 펄스 타이머를 돌린다. 유휴 상태에서 의미 없이 깜빡이는 걸 피해 배터리·시각적 산만함을
+    // 줄인다. 이미 원하는 상태면 아무 것도 하지 않아(멱등) 매 렌더마다 타이머를 재생성하지 않는다.
+    // 호출부(updateStatusBarTitle(fromCache:)/FromEntries())가 ctx를 만들기 전에 먼저 불러야
+    // moodPulsePhase 리셋이 뒤이은 렌더에 반영된다 — 여기서 직접 updateStatusBarTitle()을 다시
+    // 부르면 그 호출부와 서로를 무한 재귀로 부르게 되므로 재렌더는 호출부에 맡긴다.
+    private func updateMoodPulseTimerState(hasActiveMoodTarget: Bool) {
+        let shouldRun = TitleSettings.isFunModeFeatureEnabled(.moodIcon) && hasActiveMoodTarget
+        if shouldRun {
+            guard moodPulseTimer == nil else { return }
+            moodPulseTimer = Timer.scheduledTimer(withTimeInterval: moodPulseInterval, repeats: true) { [weak self] _ in
+                self?.moodPulsePhase.toggle()
+                self?.updateStatusBarTitle()
+            }
+        } else {
+            guard moodPulseTimer != nil else { return }
+            moodPulseTimer?.invalidate()
+            moodPulseTimer = nil
+            moodPulsePhase = false
+        }
     }
 
     func buildMenu() {
@@ -1232,27 +1454,47 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     // 재미 모드 OFF면 항상 nil(호출부가 기존 아이콘 로직을 그대로 타게 함). QA 테스트 override는
     // 재미 모드가 켜져 있을 때만 적용된다(꺼짐 상태에서 강제로 무드가 새어 나오지 않도록).
     func resolveMood(hasActiveBlock: Bool, elapsedRatio: Double, warning: UsageWarning?) -> MoodTier? {
-        guard TitleSettings.isFunModeEnabled() else { return nil }
+        guard TitleSettings.isFunModeFeatureEnabled(.moodIcon) else { return nil }
         return moodTestTierOverride() ?? computeMood(hasActiveBlock: hasActiveBlock, elapsedRatio: elapsedRatio, warning: warning)
     }
 
-    // idle 상태 전용 — 재미 모드 OFF거나 아이콘 표시 안 함이면 기존 titleIconPrefix() 경로 그대로
-    // (바이트 단위 동일), ON이면 MoodTier.idle 글리프+색을 첫 파트로 넣어 renderTitle(parts:)로
+    // buildTitleParts() 결과 맨 앞에 활성 축하 배지(있으면)를 얹는다 — 타이틀을 대체하지 않고
+    // 실데이터 파트와 공존시키기 위한 공통 헬퍼.
+    private func titlePartsWithBadge(_ ctx: TitleContext) -> [TitlePart] {
+        var parts = buildTitleParts(ctx)
+        if let badge = activeCelebrationBadge() { parts.insert(badge, at: 0) }
+        if let flash = activeRefreshFlash() { parts.append(flash) }
+        return parts
+    }
+
+    // idle 상태 전용 — 축하 배지도 재미 모드도 없으면 기존 titleIconPrefix() 경로 그대로(바이트 단위
+    // 동일), 배지·무드 아이콘 중 하나라도 있으면 TitlePart 배열을 조합해 renderTitle(parts:)로
     // 렌더링한다(사용자가 고른 구분자가 적용됨).
     func renderIdleTitle(_ label: String) {
-        guard TitleSettings.isFunModeEnabled(), TitleSettings.icon() != .none else {
+        let badge = activeCelebrationBadge()
+        let flash = activeRefreshFlash()
+        let moodEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon) && TitleSettings.icon() != .none
+        guard badge != nil || flash != nil || moodEnabled else {
             renderTitle(plain: "\(titleIconPrefix())\(label)", warning: nil)
             return
         }
-        let tier = moodTestTierOverride() ?? .idle
-        renderTitle(parts: [TitlePart(text: tier.glyph, color: tier.color),
-                             TitlePart(text: label, color: .defaultColor)],
-                    warning: nil)
+        var parts: [TitlePart] = []
+        if let badge = badge { parts.append(badge) }
+        if moodEnabled {
+            let tier = moodTestTierOverride() ?? .idle
+            parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: moodPulsePhase))
+            parts.append(TitlePart(text: label, color: .defaultColor))
+        } else {
+            parts.append(TitlePart(text: "\(titleIconPrefix())\(label)".trimmingCharacters(in: .whitespaces), color: .defaultColor))
+        }
+        if let flash = flash { parts.append(flash) }
+        renderTitle(parts: parts, warning: nil)
     }
 
     func updateStatusBarTitle(fromCache stats: StatsCache) {
-        if let msg = celebrationTitle() { renderTitle(plain: msg, warning: nil); return }
         let active = stats.activeBlock()
+        // QA 오버라이드가 있으면 실제 활성 블록이 없어도(idle) 펄스를 미리 볼 수 있게 한다.
+        updateMoodPulseTimerState(hasActiveMoodTarget: active != nil || moodTestTierOverride() != nil)
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
         let resetText: String = {
             guard let b = active else { return "" }
@@ -1275,16 +1517,20 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                                    cost: b.costUSD,
                                    remainingText: resetText.isEmpty ? nil : resetText,
                                    model: lastModel ?? b.models.last,
-                                   moodTier: moodTier)
-            renderTitle(parts: buildTitleParts(ctx), warning: warning)
+                                   moodTier: moodTier,
+                                   moodPulsePhase: moodPulsePhase,
+                                   todayTokens: gamificationTodayTokens,
+                                   todayCost: gamificationTodayCost,
+                                   cumulativeTokens: stats.cumulative?.totalTokens ?? 0)
+            renderTitle(parts: titlePartsWithBadge(ctx), warning: warning)
         } else {
-            renderIdleTitle("idle")
+            renderIdleTitle(t("유휴", "idle"))
         }
     }
 
     func updateStatusBarTitleFromEntries() {
-        if let msg = celebrationTitle() { renderTitle(plain: msg, warning: nil); return }
         let block = FiveHourBlock.active(from: cachedAll)
+        updateMoodPulseTimerState(hasActiveMoodTarget: block != nil || moodTestTierOverride() != nil)
         let blockEntries: [UsageEntry]
         if let block = block {
             blockEntries = cachedAll.filter { $0.timestamp >= block.start && $0.timestamp < block.end }
@@ -1296,9 +1542,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let warning = (block != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
 
         if noData {
-            renderTitle(plain: "\(titleIconPrefix())no data", warning: nil)
+            renderTitle(plain: "\(titleIconPrefix())" + t("데이터 없음", "no data"), warning: nil)
         } else if block == nil {
-            renderIdleTitle("idle")
+            renderIdleTitle(t("유휴", "idle"))
         } else if let b = block {
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
@@ -1306,8 +1552,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                                    cost: blockStats.totalCost,
                                    remainingText: b.remaining > 0 ? formatTime(b.remaining) : nil,
                                    model: blockEntries.last?.model,
-                                   moodTier: moodTier)
-            renderTitle(parts: buildTitleParts(ctx), warning: warning)
+                                   moodTier: moodTier,
+                                   moodPulsePhase: moodPulsePhase,
+                                   todayTokens: gamificationTodayTokens,
+                                   todayCost: gamificationTodayCost,
+                                   cumulativeTokens: UsageStats(entries: cachedAll).totalTokens)
+            renderTitle(parts: titlePartsWithBadge(ctx), warning: warning)
         }
     }
 
@@ -1328,54 +1578,55 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         menu.autoenablesItems = false
 
         // ── 5-Hour Block Section ──
-        addSectionHeader(menu, "⏱  5시간 블록 현황")
+        addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
         if let b = active {
             let start = parseISO(b.startTime)
             let end = parseISO(b.endTime)
             if let s = start, let e = end {
                 addLabel(menu, "  \(formatTimeShort(s)) → \(formatTimeShort(e))")
             }
-            addLabel(menu, "  출력 토큰: \(formatTokens(b.tokenCounts.outputTokens))")
-            addLabel(menu, "  전체 토큰: \(formatTokens(b.totalTokens))")
-            addLabel(menu, "  예상 비용: \(formatCost(b.costUSD))")
-            addLabel(menu, "  메시지 수: \(b.entries)건")
+            addLabel(menu, "  " + t("출력 토큰: \(formatTokens(b.tokenCounts.outputTokens))", "Output Tokens: \(formatTokens(b.tokenCounts.outputTokens))"))
+            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(b.totalTokens))", "Total Tokens: \(formatTokens(b.totalTokens))"))
+            addLabel(menu, "  " + t("예상 비용: \(formatCost(b.costUSD))", "Estimated Cost: \(formatCost(b.costUSD))"))
+            addLabel(menu, "  " + t("메시지 수: \(b.entries)건", "Messages: \(b.entries)"))
 
             if let s = start, let e = end {
                 let total = e.timeIntervalSince(s)
                 let elapsed = max(0, min(total, Date().timeIntervalSince(s)))
                 let ratio = total > 0 ? elapsed / total : 0
-                addLabel(menu, "  \(progressBar(ratio, width: 12)) \(Int(ratio * 100))% 경과")
+                addLabel(menu, "  " + t("\(progressBar(ratio, width: 12)) \(Int(ratio * 100))% 경과", "\(progressBar(ratio, width: 12)) \(Int(ratio * 100))% elapsed"))
             }
             if let rm = b.projection?.remainingMinutes {
-                addLabel(menu, "  리셋까지: \(formatTime(Double(rm) * 60)) 남음")
+                addLabel(menu, "  " + t("리셋까지: \(formatTime(Double(rm) * 60)) 남음", "Resets in: \(formatTime(Double(rm) * 60))"))
             } else if let e = end {
                 let rem = e.timeIntervalSinceNow
-                addLabel(menu, rem > 0 ? "  리셋까지: \(formatTime(rem)) 남음"
-                                       : "  ✅ 블록 리셋됨 — 새 블록 시작 가능")
+                addLabel(menu, rem > 0 ? "  " + t("리셋까지: \(formatTime(rem)) 남음", "Resets in: \(formatTime(rem))")
+                                       : "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"))
             }
             if let cph = b.burnRate?.costPerHour {
-                addLabel(menu, "  소모율: \(formatCost(cph))/시간")
+                addLabel(menu, "  " + t("소모율: \(formatCost(cph))/시간", "Burn Rate: \(formatCost(cph))/hr"))
             }
             if let w = warning {
-                addLabel(menu, "  사용률: \(Int(w.ratio * 100))% (한도 대비)")
+                addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
                 if w.level != .none {
-                    addLabel(menu, "  ⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음")
+                    addLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(resetText) remaining"))
                 }
             }
-            if TitleSettings.isFunModeEnabled() {
+            if TitleSettings.isFunModeFeatureEnabled(.moodIcon) {
                 let tier = moodTestTierOverride() ?? computeMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
                 let ratio = warning?.ratio ?? b.elapsedRatio()
-                addLabel(menu, "  \(tier.glyph) 기분: \(tier.label) (\(Int(ratio * 100))% \(warning != nil ? "사용" : "경과"))")
+                let scopeWord = t(warning != nil ? "사용" : "경과", warning != nil ? "used" : "elapsed")
+                addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))"))
             }
         } else {
-            addLabel(menu, "  현재 활성 블록 없음")
-            addLabel(menu, "  다음 메시지부터 새 블록이 시작됩니다.")
+            addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
+            addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
         }
         menu.addItem(.separator())
 
         // ── Models (current block; 이름만 — 블록 단위 분해는 캐시에 없음) ──
         if let b = active, !b.models.isEmpty {
-            addSectionHeader(menu, "🤖  모델 (현재 블록)")
+            addSectionHeader(menu, t("🤖  모델 (현재 블록)", "🤖  Model (Current Block)"))
             for m in b.models {
                 addLabel(menu, "  \(shortModelName(m))")
             }
@@ -1383,24 +1634,24 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         }
 
         // ── Today Section (모델별 분해 포함) ──
-        addSectionHeader(menu, "📅  오늘 (로컬 기준)")
-        if let t = stats.todayPeriod() {
-            addLabel(menu, "  전체 토큰: \(formatTokens(t.totalTokens ?? 0))")
-            addLabel(menu, "  예상 비용: \(formatCost(t.totalCost ?? 0))")
-            for mb in (t.modelBreakdowns ?? []).sorted(by: { ($0.cost ?? 0) > ($1.cost ?? 0) }) {
+        addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
+        if let t2 = stats.todayPeriod() {
+            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(t2.totalTokens ?? 0))", "Total Tokens: \(formatTokens(t2.totalTokens ?? 0))"))
+            addLabel(menu, "  " + t("예상 비용: \(formatCost(t2.totalCost ?? 0))", "Estimated Cost: \(formatCost(t2.totalCost ?? 0))"))
+            for mb in (t2.modelBreakdowns ?? []).sorted(by: { ($0.cost ?? 0) > ($1.cost ?? 0) }) {
                 let name = shortModelName(mb.modelName).padding(toLength: 12, withPad: " ", startingAt: 0)
                 addLabel(menu, "  \(name)  \(formatTokens(mb.tokens))  \(formatCost(mb.cost ?? 0))")
             }
         } else {
-            addLabel(menu, "  사용 없음")
+            addLabel(menu, "  " + t("사용 없음", "No usage"))
         }
         menu.addItem(.separator())
 
         // ── Cumulative ──
         if let c = stats.cumulative {
-            addSectionHeader(menu, "📊  전체 누적")
-            addLabel(menu, "  전체 토큰: \(formatTokens(c.totalTokens ?? 0))")
-            addLabel(menu, "  예상 비용: \(formatCost(c.totalCost ?? 0))")
+            addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
+            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(c.totalTokens ?? 0))", "Total Tokens: \(formatTokens(c.totalTokens ?? 0))"))
+            addLabel(menu, "  " + t("예상 비용: \(formatCost(c.totalCost ?? 0))", "Estimated Cost: \(formatCost(c.totalCost ?? 0))"))
             menu.addItem(.separator())
         }
 
@@ -1412,22 +1663,24 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     // ── 재미 모드 게이팅된 "🏆 기록" 섹션 — 1차/폴백 메뉴 빌더 양쪽에서 공유(중복 방지) ──
     func appendGamificationSection(_ menu: NSMenu) {
-        guard TitleSettings.isFunModeEnabled() else { return }
+        guard TitleSettings.isFunModeFeatureEnabled(.streakSection) else { return }
         let rec = GamificationSettings.load()
-        addSectionHeader(menu, "🏆  기록")
+        addSectionHeader(menu, t("🏆  기록", "🏆  Record"))
         let streakLabel = rec.currentStreakDays > 0
-            ? "\(rec.currentStreakDays)일 연속 (최장 \(rec.longestStreakDays)일)"
-            : "기록 없음"
-        addLabel(menu, "  연속 사용: \(streakLabel)")
-        addLabel(menu, "  최고 기록: \(formatTokens(rec.bestDayTokens)) · \(formatCost(rec.bestDayCost))")
+            ? t("\(rec.currentStreakDays)일 연속 (최장 \(rec.longestStreakDays)일)",
+                "\(rec.currentStreakDays)-day streak (best \(rec.longestStreakDays) days)")
+            : t("기록 없음", "No record yet")
+        addLabel(menu, "  " + t("연속 사용: \(streakLabel)", "Streak: \(streakLabel)"))
+        addLabel(menu, "  " + t("최고 기록: \(formatTokens(rec.bestDayTokens)) · \(formatCost(rec.bestDayCost))",
+                                "Best Day: \(formatTokens(rec.bestDayTokens)) · \(formatCost(rec.bestDayCost))"))
         if gamificationNewRecordToday {
-            addLabel(menu, "  📈 오늘 최고 기록 경신")
+            addLabel(menu, "  " + t("📈 오늘 최고 기록 경신", "📈 New personal best today"))
         }
-        if let t = justCrossedTokenMilestone {
-            addLabel(menu, "  🎉 방금 누적 \(formatTokens(t)) 토큰 돌파!")
+        if let milestone = justCrossedTokenMilestone {
+            addLabel(menu, "  " + t("🎉 방금 누적 \(formatTokens(milestone)) 토큰 돌파!", "🎉 Just reached \(formatTokens(milestone)) cumulative tokens!"))
         }
         if let s = justCrossedStreakMilestone {
-            addLabel(menu, "  🔥 방금 \(s)일 연속 사용 달성!")
+            addLabel(menu, "  " + t("🔥 방금 \(s)일 연속 사용 달성!", "🔥 Just hit a \(s)-day streak!"))
         }
         menu.addItem(.separator())
     }
@@ -1435,37 +1688,50 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     // ── 메뉴 하단 공통(최종 업데이트·새로고침·표시 항목·버전·종료) ──
     func appendFooter(_ menu: NSMenu) {
         let updateStr = formatTimeShort(lastUpdateTime)
-        addLabel(menu, "  최종 업데이트: \(updateStr) (\(RefreshSettings.interval().label) 자동 갱신)")
+        addLabel(menu, "  " + t("최종 업데이트: \(updateStr) (\(RefreshSettings.interval().label) 자동 갱신)",
+                                "Last Updated: \(updateStr) (auto-refresh every \(RefreshSettings.interval().label))"))
 
-        let refreshItem = NSMenuItem(title: "  🔄 지금 새로고침", action: #selector(manualRefresh), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "  🔄 " + t("지금 새로고침", "Refresh Now"), action: #selector(manualRefresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
-        let titleFieldsItem = NSMenuItem(title: "  ⌨ 메뉴바 표시 항목", action: nil, keyEquivalent: "")
-        titleFieldsItem.submenu = buildTitleFieldsSubmenu()
-        menu.addItem(titleFieldsItem)
-
-        let separatorItem = NSMenuItem(title: "  ⌇ 표시 항목 구분자", action: nil, keyEquivalent: "")
-        separatorItem.submenu = buildSeparatorSubmenu()
-        menu.addItem(separatorItem)
-
-        let iconItem = NSMenuItem(title: "  ⌨ 메뉴바 아이콘", action: nil, keyEquivalent: "")
-        iconItem.submenu = buildIconSubmenu()
-        menu.addItem(iconItem)
-
-        let funModeItem = NSMenuItem(title: "  🎭 재미 모드", action: nil, keyEquivalent: "")
+        // 재미 모드를 표시 항목 계열 서브메뉴보다 먼저 배치 — 가장 최근에 추가된 핵심 기능인데
+        // 5개 서브메뉴 중 4번째에 묻혀 있으면 발견성이 떨어진다.
+        let funModeItem = NSMenuItem(title: "  🎭 " + t("재미 모드", "Fun Mode"), action: nil, keyEquivalent: "")
         funModeItem.submenu = buildFunModeSubmenu()
         menu.addItem(funModeItem)
 
-        let refreshIntervalItem = NSMenuItem(title: "  ⏱ 자동 갱신 주기", action: nil, keyEquivalent: "")
+        // 무드 아이콘의 모양(테마)을 고르는 서브메뉴 — 무드 아이콘과 관련이 깊어 재미 모드 바로 다음에 배치.
+        let moodGlyphThemeItem = NSMenuItem(title: "  🎨 " + t("무드 아이콘 모양", "Mood Icon Style"), action: nil, keyEquivalent: "")
+        moodGlyphThemeItem.submenu = buildMoodGlyphThemeSubmenu()
+        menu.addItem(moodGlyphThemeItem)
+
+        let titleFieldsItem = NSMenuItem(title: "  ⌨ " + t("메뉴바 표시 항목", "Menu Bar Fields"), action: nil, keyEquivalent: "")
+        titleFieldsItem.submenu = buildTitleFieldsSubmenu()
+        menu.addItem(titleFieldsItem)
+
+        let separatorItem = NSMenuItem(title: "  ⌇ " + t("표시 항목 구분자", "Field Separator"), action: nil, keyEquivalent: "")
+        separatorItem.submenu = buildSeparatorSubmenu()
+        menu.addItem(separatorItem)
+
+        // "메뉴바 표시 항목"과 같은 ⌨ 글리프를 쓰면 두 서브메뉴가 구분되지 않아 🖼로 분리.
+        let iconItem = NSMenuItem(title: "  🖼 " + t("메뉴바 아이콘", "Menu Bar Icon"), action: nil, keyEquivalent: "")
+        iconItem.submenu = buildIconSubmenu()
+        menu.addItem(iconItem)
+
+        let refreshIntervalItem = NSMenuItem(title: "  ⏱ " + t("자동 갱신 주기", "Auto-Refresh Interval"), action: nil, keyEquivalent: "")
         refreshIntervalItem.submenu = buildRefreshIntervalSubmenu()
         menu.addItem(refreshIntervalItem)
 
+        let languageItem = NSMenuItem(title: "  🌐 " + t("표시 언어", "Display Language"), action: nil, keyEquivalent: "")
+        languageItem.submenu = buildLanguageSubmenu()
+        menu.addItem(languageItem)
+
         menu.addItem(.separator())
 
-        addLabel(menu, "  Claude Monitor v\(APP_VERSION)")
+        addLabel(menu, "  cc-menutor v\(APP_VERSION)")
 
-        let quitItem = NSMenuItem(title: "종료", action: #selector(quitApp), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: t("종료", "Quit"), action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
@@ -1487,18 +1753,22 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let colorButton = NSButton(title: TitleSettings.color(for: field).swatch, target: self, action: #selector(cycleTitleFieldColorButton(_:)))
         colorButton.frame = NSRect(x: 166, y: 1, width: 26, height: 20)
         colorButton.tag = idx
+        // 아이콘 전용 버튼(스와치 이모지)이라 VoiceOver가 이모지만 읽으면 무슨 기능인지 알 수 없다.
+        colorButton.setAccessibilityLabel(t("\(field.label) 색상 변경", "Change \(field.label) color"))
         row.addSubview(colorButton)
 
         let up = NSButton(title: "▲", target: self, action: #selector(moveTitleFieldUpButton(_:)))
         up.frame = NSRect(x: 198, y: 1, width: 20, height: 20)
         up.isEnabled = !isFirst
         up.tag = idx
+        up.setAccessibilityLabel(t("\(field.label) 위로 이동", "Move \(field.label) up"))
         row.addSubview(up)
 
         let down = NSButton(title: "▼", target: self, action: #selector(moveTitleFieldDownButton(_:)))
         down.frame = NSRect(x: 220, y: 1, width: 20, height: 20)
         down.isEnabled = !isLast
         down.tag = idx
+        down.setAccessibilityLabel(t("\(field.label) 아래로 이동", "Move \(field.label) down"))
         row.addSubview(down)
 
         return row
@@ -1587,23 +1857,44 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
-    // ── 재미 모드 서브메뉴(라디오 스타일 — 하나만 선택) ──
-    func buildFunModeSubmenu() -> NSMenu {
+    // ── 무드 아이콘 모양 서브메뉴(라디오 스타일 — 하나만 선택). 무드 아이콘 토글이 꺼져 있어도
+    // 다른 라디오 서브메뉴들과 동일하게 항상 노출한다 — 값을 미리 정해두면 나중에 토글을 켰을 때
+    // 그대로 적용된다. ──
+    func buildMoodGlyphThemeSubmenu() -> NSMenu {
         let sub = NSMenu()
-        let current = TitleSettings.funMode()
-        for mode in FunMode.allCases {
-            let item = NSMenuItem(title: mode.label, action: #selector(setFunMode(_:)), keyEquivalent: "")
+        let current = TitleSettings.moodGlyphTheme()
+        for theme in MoodGlyphTheme.allCases {
+            let item = NSMenuItem(title: theme.label, action: #selector(setMoodGlyphTheme(_:)), keyEquivalent: "")
             item.target = self
-            item.state = (mode == current) ? .on : .off
-            item.representedObject = mode
+            item.state = (theme == current) ? .on : .off
+            item.representedObject = theme
             sub.addItem(item)
         }
         return sub
     }
 
-    @objc func setFunMode(_ sender: NSMenuItem) {
-        guard let mode = sender.representedObject as? FunMode else { return }
-        TitleSettings.setFunMode(mode)
+    @objc func setMoodGlyphTheme(_ sender: NSMenuItem) {
+        guard let theme = sender.representedObject as? MoodGlyphTheme else { return }
+        TitleSettings.setMoodGlyphTheme(theme)
+        buildMenu()
+    }
+
+    // ── 재미 모드 서브메뉴(체크리스트 — 3개 기능 독립 on/off) ──
+    func buildFunModeSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        for feature in FunModeFeature.allCases {
+            let item = NSMenuItem(title: feature.label, action: #selector(toggleFunModeFeature(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = TitleSettings.isFunModeFeatureEnabled(feature) ? .on : .off
+            item.representedObject = feature
+            sub.addItem(item)
+        }
+        return sub
+    }
+
+    @objc func toggleFunModeFeature(_ sender: NSMenuItem) {
+        guard let feature = sender.representedObject as? FunModeFeature else { return }
+        TitleSettings.toggleFunModeFeature(feature)
         buildMenu()
     }
 
@@ -1625,6 +1916,26 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         guard let interval = sender.representedObject as? RefreshInterval else { return }
         RefreshSettings.setInterval(interval)
         rescheduleTimer()
+        buildMenu()
+    }
+
+    // ── 표시 언어 서브메뉴(라디오 스타일 — 하나만 선택) ──
+    func buildLanguageSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let current = TitleSettings.languagePreference()
+        for pref in LanguagePreference.allCases {
+            let item = NSMenuItem(title: pref.label, action: #selector(setLanguagePreference(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = (pref == current) ? .on : .off
+            item.representedObject = pref
+            sub.addItem(item)
+        }
+        return sub
+    }
+
+    @objc func setLanguagePreference(_ sender: NSMenuItem) {
+        guard let pref = sender.representedObject as? LanguagePreference else { return }
+        TitleSettings.setLanguagePreference(pref)
         buildMenu()
     }
 
@@ -1657,83 +1968,84 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         menu.autoenablesItems = false
 
         if noData {
-            addSectionHeader(menu, "⚠️  데이터 없음")
-            addLabel(menu, "  Claude Code를 먼저 실행해 주세요.")
-            addLabel(menu, "  경로: ~/.claude/projects/")
+            addSectionHeader(menu, t("⚠️  데이터 없음", "⚠️  No Data"))
+            addLabel(menu, "  " + t("Claude Code를 먼저 실행해 주세요.", "Please run Claude Code first."))
+            addLabel(menu, "  " + t("경로: ~/.claude/projects/", "Path: ~/.claude/projects/"))
             menu.addItem(.separator())
         } else {
             // 1차 소스(stats-cache.json) 부재 → JSONL 추정 경로임을 사용자에게 명시.
-            addSectionHeader(menu, "⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)")
+            addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
             menu.addItem(.separator())
 
             // ── 5-Hour Block Section ──
-            addSectionHeader(menu, "⏱  5시간 블록 현황")
+            addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
 
             if let block = block {
                 let blockStartStr = formatTimeShort(block.start)
                 let blockEndStr   = formatTimeShort(block.end)
                 addLabel(menu, "  \(blockStartStr) → \(blockEndStr)")
-                addLabel(menu, "  출력 토큰: \(formatTokens(blockStats.outputTokens))")
-                addLabel(menu, "  전체 토큰: \(formatTokens(blockStats.totalTokens))")
-                addLabel(menu, "  예상 비용: \(formatCost(blockStats.totalCost))")
-                addLabel(menu, "  메시지 수: \(blockStats.count)건")
+                addLabel(menu, "  " + t("출력 토큰: \(formatTokens(blockStats.outputTokens))", "Output Tokens: \(formatTokens(blockStats.outputTokens))"))
+                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(blockStats.totalTokens))", "Total Tokens: \(formatTokens(blockStats.totalTokens))"))
+                addLabel(menu, "  " + t("예상 비용: \(formatCost(blockStats.totalCost))", "Estimated Cost: \(formatCost(blockStats.totalCost))"))
+                addLabel(menu, "  " + t("메시지 수: \(blockStats.count)건", "Messages: \(blockStats.count)"))
 
                 let rem = block.remaining
                 if rem > 0 {
                     let pct = Int(block.progress * 100)
                     let bar = progressBar(block.progress, width: 12)
-                    addLabel(menu, "  \(bar) \(pct)% 경과")
-                    addLabel(menu, "  리셋까지: \(formatTime(rem)) 남음")
+                    addLabel(menu, "  " + t("\(bar) \(pct)% 경과", "\(bar) \(pct)% elapsed"))
+                    addLabel(menu, "  " + t("리셋까지: \(formatTime(rem)) 남음", "Resets in: \(formatTime(rem))"))
                 } else {
-                    addLabel(menu, "  ✅ 블록 리셋됨 — 새 블록 시작 가능")
+                    addLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"))
                 }
                 if let w = warning {
-                    addLabel(menu, "  사용률: \(Int(w.ratio * 100))% (한도 대비)")
+                    addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
                     if w.level != .none {
-                        addLabel(menu, "  ⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음")
+                        addLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(resetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(resetText) remaining"))
                     }
                 }
-                if TitleSettings.isFunModeEnabled() {
+                if TitleSettings.isFunModeFeatureEnabled(.moodIcon) {
                     let tier = moodTestTierOverride() ?? computeMood(hasActiveBlock: true, elapsedRatio: block.progress, warning: warning)
                     let ratio = warning?.ratio ?? block.progress
-                    addLabel(menu, "  \(tier.glyph) 기분: \(tier.label) (\(Int(ratio * 100))% \(warning != nil ? "사용" : "경과"))")
+                    let scopeWord = t(warning != nil ? "사용" : "경과", warning != nil ? "used" : "elapsed")
+                    addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(ratio * 100))% \(scopeWord))"))
                 }
             } else {
-                addLabel(menu, "  현재 활성 블록 없음")
-                addLabel(menu, "  다음 메시지부터 새 블록이 시작됩니다.")
+                addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
+                addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
             }
 
             menu.addItem(.separator())
 
             // ── Model Breakdown (within block) ──
             if !blockStats.modelBreakdown.isEmpty {
-                addSectionHeader(menu, "🤖  모델별 (현재 블록)")
+                addSectionHeader(menu, t("🤖  모델별 (현재 블록)", "🤖  By Model (Current Block)"))
                 for item in blockStats.modelBreakdown {
                     let line = "  \(item.model.padding(toLength: 12, withPad: " ", startingAt: 0))  \(formatTokens(item.tokens))  \(formatCost(item.cost))"
                     addLabel(menu, line)
                 }
                 if !blockStats.unknownModels.isEmpty {
-                    addLabel(menu, "  ⚠ 미상 모델 \(blockStats.unknownModels.count)종 (추정 단가 적용)")
+                    addLabel(menu, "  " + t("⚠ 미상 모델 \(blockStats.unknownModels.count)종 (추정 단가 적용)", "⚠ \(blockStats.unknownModels.count) unknown model(s) (estimated pricing applied)"))
                 }
                 menu.addItem(.separator())
             }
 
             // ── Today Section ──
-            addSectionHeader(menu, "📅  오늘 (로컬 기준)")
+            addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
             if todayStats.count == 0 {
-                addLabel(menu, "  사용 없음")
+                addLabel(menu, "  " + t("사용 없음", "No usage"))
             } else {
-                addLabel(menu, "  전체 토큰: \(formatTokens(todayStats.totalTokens))")
-                addLabel(menu, "  예상 비용: \(formatCost(todayStats.totalCost))")
-                addLabel(menu, "  메시지 수: \(todayStats.count)건")
+                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(todayStats.totalTokens))", "Total Tokens: \(formatTokens(todayStats.totalTokens))"))
+                addLabel(menu, "  " + t("예상 비용: \(formatCost(todayStats.totalCost))", "Estimated Cost: \(formatCost(todayStats.totalCost))"))
+                addLabel(menu, "  " + t("메시지 수: \(todayStats.count)건", "Messages: \(todayStats.count)"))
             }
 
             menu.addItem(.separator())
 
             // ── All Time ──
-            addSectionHeader(menu, "📊  전체 누적")
-            addLabel(menu, "  전체 토큰: \(formatTokens(allStats.totalTokens))")
-            addLabel(menu, "  예상 비용: \(formatCost(allStats.totalCost))")
+            addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
+            addLabel(menu, "  " + t("전체 토큰: \(formatTokens(allStats.totalTokens))", "Total Tokens: \(formatTokens(allStats.totalTokens))"))
+            addLabel(menu, "  " + t("예상 비용: \(formatCost(allStats.totalCost))", "Estimated Cost: \(formatCost(allStats.totalCost))"))
 
             menu.addItem(.separator())
 
@@ -1784,6 +2096,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     func renderTitle(parts: [TitlePart], warning: UsageWarning?) {
         guard let button = statusItem.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        // 무드 아이콘 맥박 애니메이션의 강조 프레임 — 살짝 크고 굵게 해 "숨쉬는" 느낌을 준다.
+        // 모노스페이스를 유지해 폭 흔들림은 최소화하되, 경고 배너 분기(아래)는 이미 색으로 강조되어
+        // 있으므로 펄스를 얹지 않는다.
+        let pulseFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         if let w = warning, w.level != .none {
             let color: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
             let plain = parts.map(\.text).joined(separator: TitleSettings.separator().rawValue)
@@ -1801,7 +2117,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 result.append(NSAttributedString(string: sep, attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
             }
             result.append(NSAttributedString(string: part.text, attributes: [
-                .font: font,
+                .font: part.pulsing ? pulseFont : font,
                 .foregroundColor: part.color.nsColor ?? NSColor.labelColor
             ]))
         }
@@ -1835,6 +2151,34 @@ func runSelfTests() -> Never {
     }
 
     print("Running self-tests...")
+
+    // resolveLanguage (순수 함수)
+    check(resolveLanguage(preference: .system, systemLanguageCode: "ko-KR") == .korean,
+          "resolveLanguage: system + ko-KR → korean")
+    check(resolveLanguage(preference: .system, systemLanguageCode: "en-US") == .english,
+          "resolveLanguage: system + en-US → english")
+    check(resolveLanguage(preference: .system, systemLanguageCode: "ja-JP") == .english,
+          "resolveLanguage: system + 지원 안 하는 로케일(ja-JP) → english 폴백")
+    check(resolveLanguage(preference: .system, systemLanguageCode: nil) == .english,
+          "resolveLanguage: system + 로케일 없음 → english 폴백")
+    check(resolveLanguage(preference: .korean, systemLanguageCode: "en-US") == .korean,
+          "resolveLanguage: 명시적 korean은 시스템 로케일 무시")
+    check(resolveLanguage(preference: .english, systemLanguageCode: "ko-KR") == .english,
+          "resolveLanguage: 명시적 english는 시스템 로케일 무시")
+
+    // TitleSettings.languagePreference (전용 suite)
+    let langSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let ld = UserDefaults(suiteName: langSuite) {
+        check(TitleSettings.languagePreference(defaults: ld) == .system, "language: 기본값 = system")
+        TitleSettings.setLanguagePreference(.english, defaults: ld)
+        check(TitleSettings.languagePreference(defaults: ld) == .english, "language: 저장/조회 왕복")
+        check(t("한국어", "English", defaults: ld) == "English", "t(): english 설정 시 영어 문자열 반환")
+        TitleSettings.setLanguagePreference(.korean, defaults: ld)
+        check(t("한국어", "English", defaults: ld) == "한국어", "t(): korean 설정 시 한국어 문자열 반환")
+        ld.removePersistentDomain(forName: langSuite)
+    } else {
+        check(false, "language: 전용 UserDefaults suite 생성 성공해야 함")
+    }
 
     // parseModel / shortModelName
     check(shortModelName("claude-opus-4-1-20250805") == "Opus 4.1", "opus-4-1 → Opus 4.1")
@@ -1984,17 +2328,51 @@ func runSelfTests() -> Never {
               "mood: 예산 설정 시 warning.ratio(0.95)가 elapsedRatio(0.1) 대신 우선 적용")
     } else { check(false, "mood: warning override 테스트용 UsageWarning 생성 실패") }
 
-    // TitleSettings.funMode (전용 UserDefaults suite로 실제 사용자 설정과 격리)
+    // FunModeFeature: 케이스 목록/라벨 회귀 (activeRefreshFlash() 자체는 실제 Timer/앱 인스턴스
+    // 상태에 의존해 이 순수 함수 테스트 스위트로는 검증하지 않음 — celebrationBadgeTimer와 동일한 관례)
+    check(FunModeFeature.allCases.contains(.refreshFlash), "funMode: refreshFlash 케이스 포함")
+    check(!FunModeFeature.refreshFlash.label.isEmpty, "funMode: refreshFlash 라벨 존재")
+
+    // TitleSettings.isFunModeFeatureEnabled / toggleFunModeFeature (전용 UserDefaults suite로 격리)
     let funModeSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
     if let fd = UserDefaults(suiteName: funModeSuite) {
-        check(TitleSettings.funMode(defaults: fd) == .off, "funMode: 기본값 = off")
-        check(!TitleSettings.isFunModeEnabled(defaults: fd), "funMode: 기본 비활성")
-        TitleSettings.setFunMode(.on, defaults: fd)
-        check(TitleSettings.funMode(defaults: fd) == .on, "funMode: 저장/조회 왕복")
-        check(TitleSettings.isFunModeEnabled(defaults: fd), "funMode: on이면 활성")
+        for feature in FunModeFeature.allCases {
+            check(!TitleSettings.isFunModeFeatureEnabled(feature, defaults: fd), "funMode(\(feature.rawValue)): 기본값 = off")
+        }
+        TitleSettings.setFunModeFeatureEnabled(.moodIcon, true, defaults: fd)
+        check(TitleSettings.isFunModeFeatureEnabled(.moodIcon, defaults: fd), "funMode(moodIcon): 저장/조회 왕복")
+        check(!TitleSettings.isFunModeFeatureEnabled(.streakSection, defaults: fd), "funMode: 한 기능 on이 다른 기능에 영향 없음(독립 토글)")
+        TitleSettings.toggleFunModeFeature(.moodIcon, defaults: fd)
+        check(!TitleSettings.isFunModeFeatureEnabled(.moodIcon, defaults: fd), "funMode: toggle이 on → off 전환")
         fd.removePersistentDomain(forName: funModeSuite)
     } else {
         check(false, "funMode: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // migrateFunModeIfNeeded (구 단일 토글 funMode="on" → 3개 플래그 모두 on으로 1회 백필)
+    let funModeMigrateSuite = "ClaudeMonitorSelfTest.funModeMigrate.\(UUID().uuidString)"
+    if let fmd = UserDefaults(suiteName: funModeMigrateSuite) {
+        fmd.set("on", forKey: "funMode")
+        migrateFunModeIfNeeded(defaults: fmd)
+        for feature in FunModeFeature.allCases {
+            check(TitleSettings.isFunModeFeatureEnabled(feature, defaults: fmd), "funMode 마이그레이션: 구 on → \(feature.rawValue) 활성")
+        }
+        TitleSettings.setFunModeFeatureEnabled(.celebrations, false, defaults: fmd)
+        migrateFunModeIfNeeded(defaults: fmd)  // 완료 워터마크 때문에 재호출은 무동작이어야 함
+        check(!TitleSettings.isFunModeFeatureEnabled(.celebrations, defaults: fmd), "funMode 마이그레이션: 재호출은 무동작(idempotent)")
+        fmd.removePersistentDomain(forName: funModeMigrateSuite)
+    } else {
+        check(false, "funMode 마이그레이션: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+    let funModeNoLegacySuite = "ClaudeMonitorSelfTest.funModeMigrate.noLegacy.\(UUID().uuidString)"
+    if let fnl = UserDefaults(suiteName: funModeNoLegacySuite) {
+        migrateFunModeIfNeeded(defaults: fnl)
+        for feature in FunModeFeature.allCases {
+            check(!TitleSettings.isFunModeFeatureEnabled(feature, defaults: fnl), "funMode 마이그레이션: 구 설정 없으면 그대로 off")
+        }
+        fnl.removePersistentDomain(forName: funModeNoLegacySuite)
+    } else {
+        check(false, "funMode 마이그레이션: no-legacy suite 생성 성공해야 함")
     }
 
     // computeGamification (순수 함수 — 스트릭/최고 기록 산출)
@@ -2072,7 +2450,11 @@ func runSelfTests() -> Never {
     }
 
     // buildTitleParts: 무드 아이콘이 정적 아이콘 슬롯을 대체/미대체하는 순수 함수 로직 검증
+    // MoodTier.critical.glyph(circles 고정값)와 비교하므로, 실제 사용자가 무드 글리프 테마를
+    // bars로 바꿔둔 상태에서도 정확히 통과하도록 강제로 circles로 고정 후 복원한다.
     let savedIconMood = UserDefaults.standard.string(forKey: "titleIcon")
+    let savedMoodGlyphThemeForMoodTest = UserDefaults.standard.string(forKey: "moodGlyphTheme")
+    TitleSettings.setMoodGlyphTheme(.circles)
     TitleSettings.setIcon(.keyboard)
     let moodCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil, moodTier: .critical)
     if let moodPart = buildTitleParts(moodCtx).first {
@@ -2094,12 +2476,35 @@ func runSelfTests() -> Never {
           "mood: 아이콘 '표시 안 함'이면 무드 글리프도 함께 숨김")
     if let siMood = savedIconMood { UserDefaults.standard.set(siMood, forKey: "titleIcon") }
     else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
+    if let smgt = savedMoodGlyphThemeForMoodTest { UserDefaults.standard.set(smgt, forKey: "moodGlyphTheme") }
+    else { UserDefaults.standard.removeObject(forKey: "moodGlyphTheme") }
+
+    // MoodGlyphTheme.glyph(for:) 순수 함수 — 테마 간 구분성 검증
+    check(MoodGlyphTheme.bars.glyph(for: .critical) != MoodGlyphTheme.circles.glyph(for: .critical),
+          "moodGlyphTheme: bars와 circles는 서로 다른 글리프를 준다")
+    check(MoodGlyphTheme.circles.glyph(for: .critical) == MoodTier.critical.glyph,
+          "moodGlyphTheme: circles 테마는 MoodTier.glyph와 동일(기본값 하위호환)")
+
+    // buildTitleParts가 선택된 무드 글리프 테마를 반영하는지 (전역 .standard 키를 저장/복원)
+    let savedMoodGlyphTheme = UserDefaults.standard.string(forKey: "moodGlyphTheme")
+    TitleSettings.setIcon(.keyboard)
+    TitleSettings.setMoodGlyphTheme(.bars)
+    let barsCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil, moodTier: .critical)
+    check(buildTitleParts(barsCtx).first?.text == "█", "moodGlyphTheme: bars 선택 시 buildTitleParts가 █ 반환")
+    TitleSettings.setMoodGlyphTheme(.circles)
+    check(buildTitleParts(barsCtx).first?.text == "●", "moodGlyphTheme: circles로 되돌리면 다시 ● 반환")
+    if let smgt = savedMoodGlyphTheme { UserDefaults.standard.set(smgt, forKey: "moodGlyphTheme") }
+    else { UserDefaults.standard.removeObject(forKey: "moodGlyphTheme") }
 
     // TitleSettings (전용 UserDefaults suite로 실제 사용자 설정과 격리)
     let titleSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
     if let td = UserDefaults(suiteName: titleSuite) {
         check(TitleSettings.enabledFields(defaults: td) == [.totalTokens, .cost, .remainingTime, .model],
-              "title: 기본값 = [전체토큰, 비용, 남은시간, 모델명]")
+              "title: 기본값 = [블록토큰, 블록비용, 남은시간, 모델명]")
+        check(!TitleSettings.isEnabled(.todayTokens, defaults: td)
+              && !TitleSettings.isEnabled(.todayCost, defaults: td)
+              && !TitleSettings.isEnabled(.cumulativeTokens, defaults: td),
+              "title: 오늘/전체 누적 필드는 기본 꺼짐(기존 사용자 화면 불변)")
 
         TitleSettings.toggle(.outputTokens, defaults: td)  // outputTokens는 기본 비활성
         check(TitleSettings.isEnabled(.outputTokens, defaults: td), "title: 토글로 항목 켜짐")
@@ -2142,6 +2547,11 @@ func runSelfTests() -> Never {
     check(buildTitleText(titleCtx) == "⌨", "title: 값 없는 필드만 선택 시 ⌨ 단독으로 축소")
     setEnabled([.model])
     check(buildTitleText(titleCtx) == "⌨ Sonnet 4.5", "title: 모델명만 선택")
+    let todayCumulativeCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil,
+                                          todayTokens: 128_000, todayCost: 2.5, cumulativeTokens: 5_200_000)
+    setEnabled([.todayTokens, .todayCost, .cumulativeTokens])
+    check(buildTitleText(todayCumulativeCtx) == "⌨ 128.0K $2.50 5.20M",
+          "title: 오늘 토큰+오늘 비용+누적 토큰 조합")
     for (field, value) in savedTitleDefaults {
         if let v = value { UserDefaults.standard.set(v, forKey: field.defaultsKey) }
         else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
@@ -2156,11 +2566,19 @@ func runSelfTests() -> Never {
     // TitleSettings.order / move (전용 UserDefaults suite로 격리)
     let orderSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
     if let od = UserDefaults(suiteName: orderSuite) {
-        check(TitleSettings.order(defaults: od) == [.model, .totalTokens, .cost, .remainingTime, .outputTokens],
-              "order: 기본값 = [모델명,전체토큰,비용,남은시간,출력토큰]")
+        let defaultOrderExpected: [TitleField] = [.model, .totalTokens, .cost, .remainingTime, .outputTokens,
+                                                    .todayTokens, .todayCost, .cumulativeTokens]
+        check(TitleSettings.order(defaults: od) == defaultOrderExpected,
+              "order: 기본값 = [모델명,블록토큰,블록비용,남은시간,블록출력토큰,오늘토큰,오늘비용,누적토큰]")
+        // defaultOrder는 TitleField.allCases와 별도로 하드코딩된 목록이라, 새 필드를 추가하고
+        // 여기 반영을 깜빡하면 order()가 그 필드를 영영 반환하지 않는다(설정 서브메뉴에도 안 나타남).
+        // 매번 정확한 순서를 손으로 나열하지 않아도 최소한 "다 포함은 됐는지"는 이 회귀 가드가 잡는다.
+        check(Set(TitleSettings.order(defaults: od)) == Set(TitleField.allCases),
+              "order: 기본 순서가 TitleField.allCases를 전부 포함(신규 필드 defaultOrder 누락 방지)")
 
         TitleSettings.move(.cost, direction: .up, defaults: od)
-        check(TitleSettings.order(defaults: od) == [.model, .cost, .totalTokens, .remainingTime, .outputTokens],
+        check(TitleSettings.order(defaults: od) == [.model, .cost, .totalTokens, .remainingTime, .outputTokens,
+                                                      .todayTokens, .todayCost, .cumulativeTokens],
               "order: cost를 위로 이동 → totalTokens와 스왑")
 
         // 경계 무시: 맨 위 항목을 위로, 맨 아래 항목을 아래로 이동해도 무변화
@@ -2198,6 +2616,17 @@ func runSelfTests() -> Never {
         ic.removePersistentDomain(forName: iconSuite)
     } else {
         check(false, "icon: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // TitleSettings.moodGlyphTheme (전용 suite)
+    let moodGlyphThemeSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let mgt = UserDefaults(suiteName: moodGlyphThemeSuite) {
+        check(TitleSettings.moodGlyphTheme(defaults: mgt) == .circles, "moodGlyphTheme: 기본값 = 원형")
+        TitleSettings.setMoodGlyphTheme(.bars, defaults: mgt)
+        check(TitleSettings.moodGlyphTheme(defaults: mgt) == .bars, "moodGlyphTheme: 저장/조회 왕복")
+        mgt.removePersistentDomain(forName: moodGlyphThemeSuite)
+    } else {
+        check(false, "moodGlyphTheme: 전용 UserDefaults suite 생성 성공해야 함")
     }
     let savedIcon3 = UserDefaults.standard.string(forKey: "titleIcon")
     TitleSettings.setIcon(.keyboard)
@@ -2240,6 +2669,7 @@ func runSelfTests() -> Never {
         ($0, UserDefaults.standard.object(forKey: $0.defaultsKey))
     })
     let savedCostColor = UserDefaults.standard.string(forKey: "titleColor_cost")
+    let savedModelColor = UserDefaults.standard.string(forKey: "titleColor_model")
     setEnabled([.outputTokens, .cost, .model])
     UserDefaults.standard.set(["model", "cost", "outputTokens"], forKey: "titleFieldsOrder")
     TitleSettings.setIcon(.keyboard)
@@ -2254,6 +2684,7 @@ func runSelfTests() -> Never {
     TitleSettings.setIcon(.none)
     check(buildTitleText(titleCtx) == "Sonnet 4.5 $4.20 12.3K", "title: 아이콘 없음 — 선행 구분자 없이 첫 필드부터 시작")
     TitleSettings.setColor(.blue, for: .cost)
+    UserDefaults.standard.removeObject(forKey: "titleColor_model")  // 이 검증은 model이 미지정(defaultColor)임을 전제로 함
     let coloredParts = buildTitleParts(titleCtx)
     check(coloredParts.first(where: { $0.text == "$4.20" })?.color == .blue,
           "buildTitleParts: 지정한 필드(cost)에 커스텀 색이 붙는다")
@@ -2261,6 +2692,8 @@ func runSelfTests() -> Never {
           "buildTitleParts: 색을 지정하지 않은 필드(model)는 defaultColor 유지")
     if let sc = savedCostColor { UserDefaults.standard.set(sc, forKey: "titleColor_cost") }
     else { UserDefaults.standard.removeObject(forKey: "titleColor_cost") }
+    if let smc = savedModelColor { UserDefaults.standard.set(smc, forKey: "titleColor_model") }
+    else { UserDefaults.standard.removeObject(forKey: "titleColor_model") }
     if let so = savedOrder { UserDefaults.standard.set(so, forKey: "titleFieldsOrder") }
     else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
     if let ss = savedSeparator { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
