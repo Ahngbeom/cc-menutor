@@ -829,18 +829,22 @@ enum MoodTier: String, CaseIterable {
 // 먹히지 않기 때문에(:712 주석 참고), 색 틴팅이 검증된 텍스트 프레젠테이션 글리프로만 구성된
 // 테마 중에서 고르게 한다.
 enum MoodGlyphTheme: String, CaseIterable {
-    case circles, bars
+    case circles, bars, signature
 
     var label: String {
         switch self {
-        case .circles: return t("○ 원형 (기본)", "○ Circles (Default)")
-        case .bars:    return t("▁ 막대", "▁ Bars")
+        case .circles:   return t("○ 원형 (기본)", "○ Circles (Default)")
+        case .bars:      return t("▁ 막대", "▁ Bars")
+        case .signature: return t("▮ 시그니쳐 (커서 블록)", "▮ Signature (Cursor Block)")
         }
     }
 
+    // signature 테마는 텍스트 글리프가 아니라 statusItem.button.image로 렌더링되므로(아래
+    // moodSignatureImage 참고) 이 함수는 실제로 호출되지 않는다 — circles와 동일한 값을 반환해
+    // 만에 하나 호출되더라도(예: 향후 새 호출부 추가 실수) 빈 문자열 대신 안전한 폴백을 준다.
     func glyph(for tier: MoodTier) -> String {
         switch self {
-        case .circles:
+        case .circles, .signature:
             return tier.glyph
         case .bars:
             switch tier {
@@ -852,6 +856,53 @@ enum MoodGlyphTheme: String, CaseIterable {
             }
         }
     }
+}
+
+// signature 테마 전용 커스텀 벡터 아이콘 — 유니코드 글리프 대신 Core Graphics로 직접 그린
+// "터미널 커서 블록" 모티프(Claude Code가 CLI 도구라는 정체성과 연결). tier가 올라갈수록 블록
+// 안쪽 채움이 바닥부터 차오르고, pulsing이면 다른 테마의 pulseFont 강조(:renderTitle)와 시각적
+// 강도를 맞추기 위해 캔버스를 살짝 키우고 채움 알파를 올린다.
+func moodSignatureImage(tier: MoodTier, pulsing: Bool) -> NSImage {
+    let baseSize = CGSize(width: 11, height: 14)
+    let size = pulsing ? CGSize(width: baseSize.width + 1, height: baseSize.height + 1) : baseSize
+    let fillRatio: CGFloat
+    switch tier {
+    case .idle:     fillRatio = 0
+    case .calm:     fillRatio = 0.25
+    case .warm:     fillRatio = 0.5
+    case .hot:      fillRatio = 0.75
+    case .critical: fillRatio = 1.0
+    }
+    let color = tier.color.nsColor ?? .labelColor
+    let image = NSImage(size: size, flipped: false) { rect in
+        let outlineRect = rect.insetBy(dx: 1, dy: 1)
+        let outline = NSBezierPath(roundedRect: outlineRect, xRadius: 2, yRadius: 2)
+        color.withAlphaComponent(0.4).setStroke()
+        outline.lineWidth = 1
+        outline.stroke()
+        if fillRatio > 0 {
+            let fillHeight = max(0, outlineRect.height * fillRatio - 2)
+            let fillRect = CGRect(x: outlineRect.minX + 1.5, y: outlineRect.minY + 1.5,
+                                   width: outlineRect.width - 3, height: fillHeight)
+            let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1)
+            color.withAlphaComponent(pulsing ? 1.0 : 0.85).setFill()
+            fillPath.fill()
+        }
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+// statusItem.button.image에 대입할 이미지 — signature 테마가 선택되어 있고 아이콘이 표시
+// 상태(TitleIcon != .none)이며 무드 타이어가 있을 때만 non-nil. 그 외에는 nil을 반환해 호출부가
+// "이전 테마의 잔류 이미지 지우기"에도 그대로 쓸 수 있게 한다(테마를 circles/bars로 되돌렸을 때
+// 이전 프레임 이미지가 남아있지 않도록).
+func moodImageToApply(tier: MoodTier?, pulsing: Bool) -> NSImage? {
+    guard TitleSettings.icon() != .none,
+          TitleSettings.moodGlyphTheme() == .signature,
+          let tier = tier else { return nil }
+    return moodSignatureImage(tier: tier, pulsing: pulsing)
 }
 
 extension TitleSettings {
@@ -1071,7 +1122,11 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     // 출력이 이전과 동일함을 보장한다. 사용자가 아이콘을 "표시 안 함"으로 두면 무드도 함께 숨긴다.
     if TitleSettings.icon() != .none {
         if let tier = ctx.moodTier {
-            parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: ctx.moodPulsePhase))
+            // signature 테마는 텍스트 파트가 아니라 statusItem.button.image로 렌더링된다(호출부의
+            // moodImageToApply(tier:pulsing:) 참고) — 여기서는 글리프 텍스트를 아예 만들지 않는다.
+            if TitleSettings.moodGlyphTheme() != .signature {
+                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: ctx.moodPulsePhase))
+            }
         } else {
             let icon = TitleSettings.icon().rawValue
             if !icon.isEmpty { parts.append(TitlePart(text: icon, color: .defaultColor)) }
@@ -1546,6 +1601,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let badge = activeCelebrationBadge()
         let flash = activeRefreshFlash()
         let moodEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon) && TitleSettings.icon() != .none
+        // signature 테마가 아니거나 무드가 꺼져 있으면 nil을 대입해 이전 프레임 이미지를 지운다.
+        statusItem.button?.image = moodImageToApply(tier: moodEnabled ? (moodTestTierOverride() ?? .idle) : nil,
+                                                      pulsing: moodPulsePhase)
         guard badge != nil || flash != nil || moodEnabled else {
             renderTitle(plain: "\(titleIconPrefix())\(label)", warning: nil)
             return
@@ -1554,7 +1612,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         if let badge = badge { parts.append(badge) }
         if moodEnabled {
             let tier = moodTestTierOverride() ?? .idle
-            parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: moodPulsePhase))
+            if TitleSettings.moodGlyphTheme() != .signature {
+                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: moodPulsePhase))
+            }
             parts.append(TitlePart(text: label, color: .defaultColor))
         } else {
             parts.append(TitlePart(text: "\(titleIconPrefix())\(label)".trimmingCharacters(in: .whitespaces), color: .defaultColor))
@@ -1579,6 +1639,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 return cachedAll.filter { $0.timestamp >= s && $0.timestamp < e }.last?.model
             }()
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
+            statusItem.button?.image = moodImageToApply(tier: moodTier, pulsing: moodPulsePhase)
             let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
                                    totalTokens: b.totalTokens,
                                    cost: b.costUSD,
@@ -1609,11 +1670,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let warning = (block != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
 
         if noData {
+            statusItem.button?.image = nil
             renderTitle(plain: "\(titleIconPrefix())" + t("데이터 없음", "no data"), warning: nil)
         } else if block == nil {
             renderIdleTitle(t("유휴", "idle"))
         } else if let b = block {
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
+            statusItem.button?.image = moodImageToApply(tier: moodTier, pulsing: moodPulsePhase)
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
                                    totalTokens: blockStats.totalTokens,
                                    cost: blockStats.totalCost,
@@ -2592,6 +2655,26 @@ func runSelfTests() -> Never {
     check(buildTitleParts(barsCtx).first?.text == "█", "moodGlyphTheme: bars 선택 시 buildTitleParts가 █ 반환")
     TitleSettings.setMoodGlyphTheme(.circles)
     check(buildTitleParts(barsCtx).first?.text == "●", "moodGlyphTheme: circles로 되돌리면 다시 ● 반환")
+
+    // signature 테마: 텍스트 글리프 대신 statusItem.button.image로 렌더링되므로 buildTitleParts는
+    // 글리프 텍스트를 만들지 않아야 하고, moodImageToApply()는 조건(테마=signature, 아이콘 표시,
+    // tier 존재)이 모두 맞을 때만 이미지를 반환해야 한다.
+    TitleSettings.setMoodGlyphTheme(.signature)
+    check(!buildTitleParts(barsCtx).contains(where: { $0.text == MoodTier.critical.glyph || $0.text == "█" }),
+          "moodGlyphTheme: signature 선택 시 buildTitleParts가 텍스트 글리프를 만들지 않음(이미지로 렌더링)")
+    check(moodImageToApply(tier: .critical, pulsing: false) != nil,
+          "moodImageToApply: signature 테마 + 아이콘 표시 + tier 있음 → 이미지 생성")
+    TitleSettings.setMoodGlyphTheme(.circles)
+    check(moodImageToApply(tier: .critical, pulsing: false) == nil,
+          "moodImageToApply: circles 테마면 이미지 없음(nil)")
+    TitleSettings.setMoodGlyphTheme(.signature)
+    check(moodImageToApply(tier: nil, pulsing: false) == nil,
+          "moodImageToApply: tier가 nil이면(무드 꺼짐) 이미지 없음")
+    TitleSettings.setIcon(.none)
+    check(moodImageToApply(tier: .critical, pulsing: false) == nil,
+          "moodImageToApply: 아이콘 '표시 안 함'이면 signature 테마여도 이미지 없음")
+    TitleSettings.setIcon(.keyboard)
+
     if let smgt = savedMoodGlyphTheme { UserDefaults.standard.set(smgt, forKey: "moodGlyphTheme") }
     else { UserDefaults.standard.removeObject(forKey: "moodGlyphTheme") }
 
