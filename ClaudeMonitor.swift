@@ -860,11 +860,9 @@ enum MoodGlyphTheme: String, CaseIterable {
 
 // signature 테마 전용 커스텀 벡터 아이콘 — 유니코드 글리프 대신 Core Graphics로 직접 그린
 // "터미널 커서 블록" 모티프(Claude Code가 CLI 도구라는 정체성과 연결). tier가 올라갈수록 블록
-// 안쪽 채움이 바닥부터 차오르고, pulsing이면 다른 테마의 pulseFont 강조(:renderTitle)와 시각적
-// 강도를 맞추기 위해 캔버스를 살짝 키우고 채움 알파를 올린다.
-func moodSignatureImage(tier: MoodTier, pulsing: Bool) -> NSImage {
-    let baseSize = CGSize(width: 11, height: 14)
-    let size = pulsing ? CGSize(width: baseSize.width + 1, height: baseSize.height + 1) : baseSize
+// 안쪽 채움이 바닥부터 차오른다.
+func moodSignatureImage(tier: MoodTier) -> NSImage {
+    let size = CGSize(width: 11, height: 14)
     let fillRatio: CGFloat
     switch tier {
     case .idle:     fillRatio = 0
@@ -885,7 +883,7 @@ func moodSignatureImage(tier: MoodTier, pulsing: Bool) -> NSImage {
             let fillRect = CGRect(x: outlineRect.minX + 1.5, y: outlineRect.minY + 1.5,
                                    width: outlineRect.width - 3, height: fillHeight)
             let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1)
-            color.withAlphaComponent(pulsing ? 1.0 : 0.85).setFill()
+            color.withAlphaComponent(0.85).setFill()
             fillPath.fill()
         }
         return true
@@ -898,11 +896,11 @@ func moodSignatureImage(tier: MoodTier, pulsing: Bool) -> NSImage {
 // 상태(TitleIcon != .none)이며 무드 타이어가 있을 때만 non-nil. 그 외에는 nil을 반환해 호출부가
 // "이전 테마의 잔류 이미지 지우기"에도 그대로 쓸 수 있게 한다(테마를 circles/bars로 되돌렸을 때
 // 이전 프레임 이미지가 남아있지 않도록).
-func moodImageToApply(tier: MoodTier?, pulsing: Bool) -> NSImage? {
+func moodImageToApply(tier: MoodTier?) -> NSImage? {
     guard TitleSettings.icon() != .none,
           TitleSettings.moodGlyphTheme() == .signature,
           let tier = tier else { return nil }
-    return moodSignatureImage(tier: tier, pulsing: pulsing)
+    return moodSignatureImage(tier: tier)
 }
 
 extension TitleSettings {
@@ -1086,14 +1084,13 @@ struct TitleContext {
     let remainingText: String?   // 이미 formatTime()된 문자열, 알 수 없으면 nil
     let model: String?           // shortModelName 적용 전 원본 모델 문자열
     let moodTier: MoodTier?      // 재미 모드 ON일 때만 non-nil — OFF면 기존 아이콘 로직과 동일 출력 보장
-    let moodPulsePhase: Bool     // 무드 글리프 맥박 애니메이션의 현재 프레임(true = 강조 프레임)
     let todayTokens: Int
     let todayCost: Double
     let cumulativeTokens: Int
 
-    // moodTier/moodPulsePhase 이후 추가되는 필드는 전부 기본값을 줘 기존 호출부가 그대로 컴파일되게 한다.
+    // moodTier 이후 추가되는 필드는 전부 기본값을 줘 기존 호출부가 그대로 컴파일되게 한다.
     init(outputTokens: Int, totalTokens: Int, cost: Double, remainingText: String?, model: String?,
-         moodTier: MoodTier? = nil, moodPulsePhase: Bool = false,
+         moodTier: MoodTier? = nil,
          todayTokens: Int = 0, todayCost: Double = 0, cumulativeTokens: Int = 0) {
         self.outputTokens = outputTokens
         self.totalTokens = totalTokens
@@ -1101,7 +1098,6 @@ struct TitleContext {
         self.remainingText = remainingText
         self.model = model
         self.moodTier = moodTier
-        self.moodPulsePhase = moodPulsePhase
         self.todayTokens = todayTokens
         self.todayCost = todayCost
         self.cumulativeTokens = cumulativeTokens
@@ -1114,7 +1110,7 @@ func titleIconPrefix() -> String {
     return icon.isEmpty ? "" : "\(icon) "
 }
 
-struct TitlePart { let text: String; let color: TitleFieldColor; var pulsing: Bool = false }
+struct TitlePart { let text: String; let color: TitleFieldColor }
 
 func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     var parts: [TitlePart] = []
@@ -1123,9 +1119,9 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     if TitleSettings.icon() != .none {
         if let tier = ctx.moodTier {
             // signature 테마는 텍스트 파트가 아니라 statusItem.button.image로 렌더링된다(호출부의
-            // moodImageToApply(tier:pulsing:) 참고) — 여기서는 글리프 텍스트를 아예 만들지 않는다.
+            // moodImageToApply(tier:) 참고) — 여기서는 글리프 텍스트를 아예 만들지 않는다.
             if TitleSettings.moodGlyphTheme() != .signature {
-                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: ctx.moodPulsePhase))
+                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color))
             }
         } else {
             let icon = TitleSettings.icon().rawValue
@@ -1379,12 +1375,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     private var celebrationBadgeExpiresAt: Date? = nil
     private var celebrationBadgeTimer: Timer? = nil
     private let celebrationBadgeDuration: TimeInterval = 15
-    // 무드 아이콘 맥박 애니메이션 — 활성 블록이 있고 무드 아이콘이 켜져 있을 때만 도는 경량 타이머.
-    // moodPulsePhase를 뒤집고 updateStatusBarTitle()만 재호출(전체 refresh()는 아님)해 데이터
-    // 갱신 주기(10초~5분)와 무관하게 짧은 주기로 돈다.
-    private var moodPulseTimer: Timer? = nil
-    private var moodPulsePhase = false
-    private let moodPulseInterval: TimeInterval = 1.0
     // 자동/수동 새로고침 직후 잠깐 나타났다 사라지는 반짝임 — celebrationBadge와 동일한
     // "일회성 타이머로 만료 시점에 updateStatusBarTitle()만 재호출" 패턴.
     private var refreshFlashExpiresAt: Date? = nil
@@ -1537,28 +1527,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         return TitlePart(text: "✨", color: .defaultColor)
     }
 
-    // 무드 아이콘이 켜져 있고 "볼 대상"(활성 블록, 또는 QA용 CLAUDE_MONITOR_MOOD_TEST_TIER 오버라이드)이
-    // 있을 때만 펄스 타이머를 돌린다. 유휴 상태에서 의미 없이 깜빡이는 걸 피해 배터리·시각적 산만함을
-    // 줄인다. 이미 원하는 상태면 아무 것도 하지 않아(멱등) 매 렌더마다 타이머를 재생성하지 않는다.
-    // 호출부(updateStatusBarTitle(fromCache:)/FromEntries())가 ctx를 만들기 전에 먼저 불러야
-    // moodPulsePhase 리셋이 뒤이은 렌더에 반영된다 — 여기서 직접 updateStatusBarTitle()을 다시
-    // 부르면 그 호출부와 서로를 무한 재귀로 부르게 되므로 재렌더는 호출부에 맡긴다.
-    private func updateMoodPulseTimerState(hasActiveMoodTarget: Bool) {
-        let shouldRun = TitleSettings.isFunModeFeatureEnabled(.moodIcon) && hasActiveMoodTarget
-        if shouldRun {
-            guard moodPulseTimer == nil else { return }
-            moodPulseTimer = Timer.scheduledTimer(withTimeInterval: moodPulseInterval, repeats: true) { [weak self] _ in
-                self?.moodPulsePhase.toggle()
-                self?.updateStatusBarTitle()
-            }
-        } else {
-            guard moodPulseTimer != nil else { return }
-            moodPulseTimer?.invalidate()
-            moodPulseTimer = nil
-            moodPulsePhase = false
-        }
-    }
-
     func buildMenu() {
         if let stats = cachedStats {
             buildMenu(fromCache: stats)
@@ -1602,8 +1570,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         let flash = activeRefreshFlash()
         let moodEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon) && TitleSettings.icon() != .none
         // signature 테마가 아니거나 무드가 꺼져 있으면 nil을 대입해 이전 프레임 이미지를 지운다.
-        statusItem.button?.image = moodImageToApply(tier: moodEnabled ? (moodTestTierOverride() ?? .idle) : nil,
-                                                      pulsing: moodPulsePhase)
+        statusItem.button?.image = moodImageToApply(tier: moodEnabled ? (moodTestTierOverride() ?? .idle) : nil)
         guard badge != nil || flash != nil || moodEnabled else {
             renderTitle(plain: "\(titleIconPrefix())\(label)", warning: nil)
             return
@@ -1613,7 +1580,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         if moodEnabled {
             let tier = moodTestTierOverride() ?? .idle
             if TitleSettings.moodGlyphTheme() != .signature {
-                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color, pulsing: moodPulsePhase))
+                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color))
             }
             parts.append(TitlePart(text: label, color: .defaultColor))
         } else {
@@ -1625,8 +1592,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     func updateStatusBarTitle(fromCache stats: StatsCache) {
         let active = stats.activeBlock()
-        // QA 오버라이드가 있으면 실제 활성 블록이 없어도(idle) 펄스를 미리 볼 수 있게 한다.
-        updateMoodPulseTimerState(hasActiveMoodTarget: active != nil || moodTestTierOverride() != nil)
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
         let resetText: String = active.map(resetCountdownText(for:)) ?? ""
         if let b = active {
@@ -1639,14 +1604,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 return cachedAll.filter { $0.timestamp >= s && $0.timestamp < e }.last?.model
             }()
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
-            statusItem.button?.image = moodImageToApply(tier: moodTier, pulsing: moodPulsePhase)
+            statusItem.button?.image = moodImageToApply(tier: moodTier)
             let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
                                    totalTokens: b.totalTokens,
                                    cost: b.costUSD,
                                    remainingText: resetText.isEmpty ? nil : resetText,
                                    model: lastModel ?? b.models.last,
                                    moodTier: moodTier,
-                                   moodPulsePhase: moodPulsePhase,
                                    todayTokens: gamificationTodayTokens,
                                    todayCost: gamificationTodayCost,
                                    cumulativeTokens: stats.cumulative?.totalTokens ?? 0)
@@ -1658,7 +1622,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
 
     func updateStatusBarTitleFromEntries() {
         let block = FiveHourBlock.active(from: cachedAll)
-        updateMoodPulseTimerState(hasActiveMoodTarget: block != nil || moodTestTierOverride() != nil)
         let blockEntries: [UsageEntry]
         if let block = block {
             blockEntries = cachedAll.filter { $0.timestamp >= block.start && $0.timestamp < block.end }
@@ -1676,14 +1639,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             renderIdleTitle(t("유휴", "idle"))
         } else if let b = block {
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
-            statusItem.button?.image = moodImageToApply(tier: moodTier, pulsing: moodPulsePhase)
+            statusItem.button?.image = moodImageToApply(tier: moodTier)
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
                                    totalTokens: blockStats.totalTokens,
                                    cost: blockStats.totalCost,
                                    remainingText: b.remaining > 0 ? formatTime(b.remaining) : nil,
                                    model: blockEntries.last?.model,
                                    moodTier: moodTier,
-                                   moodPulsePhase: moodPulsePhase,
                                    todayTokens: gamificationTodayTokens,
                                    todayCost: gamificationTodayCost,
                                    cumulativeTokens: UsageStats(entries: cachedAll).totalTokens)
@@ -2255,10 +2217,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     func renderTitle(parts: [TitlePart], warning: UsageWarning?) {
         guard let button = statusItem.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        // 무드 아이콘 맥박 애니메이션의 강조 프레임 — 살짝 크고 굵게 해 "숨쉬는" 느낌을 준다.
-        // 모노스페이스를 유지해 폭 흔들림은 최소화하되, 경고 배너 분기(아래)는 이미 색으로 강조되어
-        // 있으므로 펄스를 얹지 않는다.
-        let pulseFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         if let w = warning, w.level != .none {
             let color: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
             // 색만으로는 색맹 등 일부 사용자에게 "지금 경고 상태"가 전달되지 않을 수 있어
@@ -2279,7 +2237,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 result.append(NSAttributedString(string: sep, attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
             }
             result.append(NSAttributedString(string: part.text, attributes: [
-                .font: part.pulsing ? pulseFont : font,
+                .font: font,
                 .foregroundColor: part.color.nsColor ?? NSColor.labelColor
             ]))
         }
@@ -2662,16 +2620,16 @@ func runSelfTests() -> Never {
     TitleSettings.setMoodGlyphTheme(.signature)
     check(!buildTitleParts(barsCtx).contains(where: { $0.text == MoodTier.critical.glyph || $0.text == "█" }),
           "moodGlyphTheme: signature 선택 시 buildTitleParts가 텍스트 글리프를 만들지 않음(이미지로 렌더링)")
-    check(moodImageToApply(tier: .critical, pulsing: false) != nil,
+    check(moodImageToApply(tier: .critical) != nil,
           "moodImageToApply: signature 테마 + 아이콘 표시 + tier 있음 → 이미지 생성")
     TitleSettings.setMoodGlyphTheme(.circles)
-    check(moodImageToApply(tier: .critical, pulsing: false) == nil,
+    check(moodImageToApply(tier: .critical) == nil,
           "moodImageToApply: circles 테마면 이미지 없음(nil)")
     TitleSettings.setMoodGlyphTheme(.signature)
-    check(moodImageToApply(tier: nil, pulsing: false) == nil,
+    check(moodImageToApply(tier: nil) == nil,
           "moodImageToApply: tier가 nil이면(무드 꺼짐) 이미지 없음")
     TitleSettings.setIcon(.none)
-    check(moodImageToApply(tier: .critical, pulsing: false) == nil,
+    check(moodImageToApply(tier: .critical) == nil,
           "moodImageToApply: 아이콘 '표시 안 함'이면 signature 테마여도 이미지 없음")
     TitleSettings.setIcon(.keyboard)
 
