@@ -1427,10 +1427,17 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 1차: stats-cache.json(권위 소스, 비용/토큰). 없으면 JSONL 전량 파싱 폴백.
     // JSONL은 stats-cache 유무와 무관하게 항상 읽는다 — stats-cache의 블록별 models
     // 배열 순서는 "최근 사용순"이 아니라서, 현재 모델 표시는 실제 엔트리 타임스탬프가 필요하다.
-    func refresh() {
+    func refresh(manual: Bool = false) {
         if isRefreshing { return }
         isRefreshing = true
         showSkeletonIfMenuOpen()
+        if manual {
+            // 수동 새로고침은 사용자가 직접 트리거한 행위라 즉각적인 피드백이 유용하다. 자동
+            // 백그라운드 틱(10초~5분마다)에는 적용하지 않는다 — 정보량 없이 매번 깜빡이면
+            // 예전에 제거한 무드 펄스처럼 산만함만 재도입하게 된다. 최초 기동 시 쓰던 것과
+            // 동일한 "…" placeholder를 재사용한다(applicationDidFinishLaunching 참고).
+            renderTitle(plain: "\(titleIconPrefix())…", warning: nil)
+        }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
             let stats = self.statsReader.load()
@@ -2343,7 +2350,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func manualRefresh() {
-        refresh()
+        refresh(manual: true)
     }
 
     @objc func quitApp() {
