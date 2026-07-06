@@ -1395,8 +1395,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let refreshFlashDuration: TimeInterval = 1.5
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
-    // 아래 6개도 동일한 이유로 유지 — appendFooter()가 자동 갱신마다(10초~5분 타이머, 수동
-    // 새로고침, 최초 기동) 다시 호출돼도 서브메뉴 NSMenu 인스턴스를 매번 새로 만들지 않고 재사용한다.
+    // 아래 6개도 동일한 이유로 유지 — appendFooter()는 이제 obtainMainMenu()가 메인 메뉴 최초
+    // 생성 시 딱 1회만 호출하므로 이 weak var들은 그 1회 생성된 인스턴스를 계속 가리킨다.
     weak var separatorSubmenu: NSMenu?
     weak var iconSubmenu: NSMenu?
     weak var moodThemeSubmenu: NSMenu?
@@ -1410,6 +1410,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private weak var mainMenu: NSMenu?
     private var mainMenuIsOpen = false  // NSMenuDelegate로 추적 — refresh()가 스켈레톤을 보여줄지 결정
     private var lastBlockDisplayData: BlockDisplayData?  // 스켈레톤 shape의 소스(직전 실제 렌더)
+    private var bodyItemCount = 0  // replaceBody(with:)가 이 개수만큼만 메인 메뉴 맨 앞에서 교체한다
+    private var footerLocalizedItems: [(NSMenuItem, () -> String)] = []  // 언어 전환 시 footer title 패치용
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyDefaultsIfNeeded()
@@ -1468,14 +1470,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // buildMenu()가 실제 값으로 조용히 채운다.
     private func showSkeletonIfMenuOpen() {
         guard mainMenuIsOpen else { return }
-        let menu = obtainMainMenu()
-        menu.removeAllItems()
-        if let skeleton = lastBlockDisplayData?.asLoadingSkeleton() {
-            renderBlockMenu(skeleton, into: menu)
-        } else {
-            addSectionHeader(menu, t("⏳ 불러오는 중…", "⏳ Loading…"))
+        replaceBody { menu in
+            if let skeleton = self.lastBlockDisplayData?.asLoadingSkeleton() {
+                self.renderBlockMenu(skeleton, into: menu)
+            } else {
+                self.addSectionHeader(menu, t("⏳ 불러오는 중…", "⏳ Loading…"))
+            }
+            self.appendLastUpdatedLabel(menu)
         }
-        appendFooter(menu)
     }
 
     // 재미 모드와 무관하게 항상 최신 상태로 갱신한다 — 스트릭은 "실제 사용한 날"을 반영해야 하므로
@@ -1712,7 +1714,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if menu === mainMenu { mainMenuIsOpen = false }
     }
 
-    // 메인 5시간 블록 메뉴 인스턴스를 최초 1회만 만들고 이후로는 재사용한다.
+    // 메인 5시간 블록 메뉴 인스턴스를 최초 1회만 만들고 이후로는 재사용한다. footer(설정
+    // 서브메뉴들의 부모 아이템 포함)도 이 최초 생성 시점에 딱 1회만 붙이고 다시는 만들지
+    // 않는다 — 그래야 열려 있는 설정 서브메뉴의 부모 NSMenuItem이 어떤 refresh에도 재생성되지
+    // 않는다. 이후 모든 갱신은 replaceBody(_:)를 통한 "본문(body)만 교체"로만 이뤄진다.
     private func obtainMainMenu() -> NSMenu {
         if let existing = mainMenu { return existing }
         let menu = NSMenu()
@@ -1720,7 +1725,29 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         mainMenu = menu
         statusItem.menu = menu
+        appendFooter(menu)
         return menu
+    }
+
+    // data를 화면에 붙지 않은 scratch NSMenu에 렌더링한 뒤, 그 안의 NSMenuItem들을 메인 메뉴의
+    // 맨 앞(인덱스 0부터)으로 옮겨 끼운다. footer(bodyItemCount 이후의 고정 항목들)는 절대
+    // 건드리지 않는다. 다른 메뉴에 이미 속한 NSMenuItem을 곧바로 insertItem하면 크래시하므로,
+    // 반드시 scratch.removeItem(item)으로 소유권을 반납한 뒤 삽입해야 한다.
+    private func replaceBody(_ render: (NSMenu) -> Void) {
+        let menu = obtainMainMenu()
+        let scratch = NSMenu()
+        render(scratch)
+
+        for _ in 0..<bodyItemCount {
+            menu.removeItem(at: 0)
+        }
+        var count = 0
+        while let item = scratch.items.first {
+            scratch.removeItem(item)
+            menu.insertItem(item, at: count)
+            count += 1
+        }
+        bodyItemCount = count
     }
 
     // ── 1차 경로: Claude Code stats-cache.json (권위 비용·실제 5시간 블록) ──
@@ -1728,10 +1755,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusBarTitle(fromCache: stats)
         let data = makeBlockDisplayData(fromCache: stats)
         lastBlockDisplayData = data
-        let menu = obtainMainMenu()
-        menu.removeAllItems()
-        renderBlockMenu(data, into: menu)
-        appendFooter(menu)
+        replaceBody { menu in
+            self.renderBlockMenu(data, into: menu)
+            self.appendLastUpdatedLabel(menu)
+        }
     }
 
     // ── 1차 경로(stats-cache.json) 뷰모델 어댑터 — 캐시가 노출하지 않는 필드(블록 내 모델별
@@ -1973,54 +2000,98 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // ── 메뉴 하단 공통(최종 업데이트·새로고침·표시 항목·버전·종료) ──
+    // footer는 obtainMainMenu()가 메인 메뉴 최초 생성 시 딱 1회만 호출한다(이후 재호출 없음) —
+    // 그래야 여기서 만드는 설정 서브메뉴들의 부모 NSMenuItem이 어떤 refresh에도 재생성되지 않아,
+    // 열려 있는 설정 서브메뉴가 자동 갱신 타이머에 영향받지 않는다. 언어처럼 나중에 바뀔 수 있는
+    // 텍스트는 track()으로 기억해 두었다가 refreshFooterLocalizedText()가 직접 patch한다.
     func appendFooter(_ menu: NSMenu) {
-        let updateStr = formatTimeShort(lastUpdateTime)
-        addLabel(menu, "  " + t("최종 업데이트: \(updateStr) (\(RefreshSettings.interval().label) 자동 갱신)",
-                                "Last Updated: \(updateStr) (auto-refresh every \(RefreshSettings.interval().label))"))
+        func track(_ item: NSMenuItem, _ make: @escaping () -> String) {
+            footerLocalizedItems.append((item, make))
+        }
 
-        let refreshItem = NSMenuItem(title: "  🔄 " + t("지금 새로고침", "Refresh Now"), action: #selector(manualRefresh), keyEquivalent: "r")
+        let refreshMake = { "  🔄 " + t("지금 새로고침", "Refresh Now") }
+        let refreshItem = NSMenuItem(title: refreshMake(), action: #selector(manualRefresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
+        track(refreshItem, refreshMake)
 
         // 재미 모드를 표시 항목 계열 서브메뉴보다 먼저 배치 — 가장 최근에 추가된 핵심 기능인데
         // 5개 서브메뉴 중 4번째에 묻혀 있으면 발견성이 떨어진다.
-        let funModeItem = NSMenuItem(title: "  🎭 " + t("재미 모드", "Fun Mode"), action: nil, keyEquivalent: "")
+        let funModeMake = { "  🎭 " + t("재미 모드", "Fun Mode") }
+        let funModeItem = NSMenuItem(title: funModeMake(), action: nil, keyEquivalent: "")
         funModeItem.submenu = obtainFunModeSubmenu()
         menu.addItem(funModeItem)
+        track(funModeItem, funModeMake)
 
         // 무드 아이콘의 모양(테마)을 고르는 서브메뉴 — 무드 아이콘과 관련이 깊어 재미 모드 바로 다음에 배치.
-        let moodGlyphThemeItem = NSMenuItem(title: "  🎨 " + t("무드 아이콘 모양", "Mood Icon Style"), action: nil, keyEquivalent: "")
+        let moodGlyphThemeMake = { "  🎨 " + t("무드 아이콘 모양", "Mood Icon Style") }
+        let moodGlyphThemeItem = NSMenuItem(title: moodGlyphThemeMake(), action: nil, keyEquivalent: "")
         moodGlyphThemeItem.submenu = obtainMoodThemeSubmenu()
         menu.addItem(moodGlyphThemeItem)
+        track(moodGlyphThemeItem, moodGlyphThemeMake)
 
-        let titleFieldsItem = NSMenuItem(title: "  ⌨ " + t("메뉴바 표시 항목", "Menu Bar Fields"), action: nil, keyEquivalent: "")
+        let titleFieldsMake = { "  ⌨ " + t("메뉴바 표시 항목", "Menu Bar Fields") }
+        let titleFieldsItem = NSMenuItem(title: titleFieldsMake(), action: nil, keyEquivalent: "")
         titleFieldsItem.submenu = buildTitleFieldsSubmenu()
         menu.addItem(titleFieldsItem)
+        track(titleFieldsItem, titleFieldsMake)
 
-        let separatorItem = NSMenuItem(title: "  ⌇ " + t("표시 항목 구분자", "Field Separator"), action: nil, keyEquivalent: "")
+        let separatorMake = { "  ⌇ " + t("표시 항목 구분자", "Field Separator") }
+        let separatorItem = NSMenuItem(title: separatorMake(), action: nil, keyEquivalent: "")
         separatorItem.submenu = obtainSeparatorSubmenu()
         menu.addItem(separatorItem)
+        track(separatorItem, separatorMake)
 
         // "메뉴바 표시 항목"과 같은 ⌨ 글리프를 쓰면 두 서브메뉴가 구분되지 않아 🖼로 분리.
-        let iconItem = NSMenuItem(title: "  🖼 " + t("메뉴바 아이콘", "Menu Bar Icon"), action: nil, keyEquivalent: "")
+        let iconMake = { "  🖼 " + t("메뉴바 아이콘", "Menu Bar Icon") }
+        let iconItem = NSMenuItem(title: iconMake(), action: nil, keyEquivalent: "")
         iconItem.submenu = obtainIconSubmenu()
         menu.addItem(iconItem)
+        track(iconItem, iconMake)
 
-        let refreshIntervalItem = NSMenuItem(title: "  ⏱ " + t("자동 갱신 주기", "Auto-Refresh Interval"), action: nil, keyEquivalent: "")
+        let refreshIntervalMake = { "  ⏱ " + t("자동 갱신 주기", "Auto-Refresh Interval") }
+        let refreshIntervalItem = NSMenuItem(title: refreshIntervalMake(), action: nil, keyEquivalent: "")
         refreshIntervalItem.submenu = obtainRefreshIntervalSubmenu()
         menu.addItem(refreshIntervalItem)
+        track(refreshIntervalItem, refreshIntervalMake)
 
-        let languageItem = NSMenuItem(title: "  🌐 " + t("표시 언어", "Display Language"), action: nil, keyEquivalent: "")
+        let languageMake = { "  🌐 " + t("표시 언어", "Display Language") }
+        let languageItem = NSMenuItem(title: languageMake(), action: nil, keyEquivalent: "")
         languageItem.submenu = obtainLanguageSubmenu()
         menu.addItem(languageItem)
+        track(languageItem, languageMake)
 
         menu.addItem(.separator())
 
         addLabel(menu, "  cc-menutor v\(APP_VERSION)")
 
-        let quitItem = NSMenuItem(title: t("종료", "Quit"), action: #selector(quitApp), keyEquivalent: "q")
+        let quitMake = { t("종료", "Quit") }
+        let quitItem = NSMenuItem(title: quitMake(), action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+        track(quitItem, quitMake)
+    }
+
+    // appendFooter에서 분리 — "최종 업데이트" 시각은 매 refresh(스켈레톤 포함)마다 바뀌어야
+    // 하므로 body 렌더의 일부로 취급한다. footer는 이제 최초 1회만 만들어지고 다시 그려지지
+    // 않기 때문이다.
+    private func appendLastUpdatedLabel(_ menu: NSMenu) {
+        let updateStr = formatTimeShort(lastUpdateTime)
+        addLabel(menu, "  " + t("최종 업데이트: \(updateStr) (\(RefreshSettings.interval().label) 자동 갱신)",
+                                "Last Updated: \(updateStr) (auto-refresh every \(RefreshSettings.interval().label))"))
+    }
+
+    // 언어 전환 시 footer가 다시 만들어지지 않으므로, appendFooter가 매 refresh마다 재호출되며
+    // 암묵적으로 갱신해 주던 것을 대신해 명시적으로 patch한다.
+    private func refreshFooterLocalizedText() {
+        for (item, make) in footerLocalizedItems { item.title = make() }
+        refreshTitleFieldsSubmenu()
+        refreshFunModeSubmenu()
+        refreshRadioSubmenu(separatorSubmenu, current: TitleSettings.separator(), action: #selector(setSeparatorButton(_:))) { $0.label }
+        refreshRadioSubmenu(iconSubmenu, current: TitleSettings.icon(), action: #selector(setIconButton(_:))) { $0.label }
+        refreshRadioSubmenu(moodThemeSubmenu, current: TitleSettings.moodGlyphTheme(), action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
+        refreshRadioSubmenu(refreshIntervalSubmenu, current: RefreshSettings.interval(), action: #selector(setRefreshIntervalButton(_:))) { $0.label }
+        refreshRadioSubmenu(languageSubmenu, current: TitleSettings.languagePreference(), action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
     }
 
     // ── 메뉴바 표시 항목 서브메뉴 — 커스텀 NSView 행(체크박스 + ▲/▼) ──
@@ -2244,8 +2315,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleFunModeFeatureCheckbox(_ sender: NSButton) {
         let feature = FunModeFeature.allCases[sender.tag]
         TitleSettings.toggleFunModeFeature(feature)
-        updateStatusBarTitle()
-        refreshFunModeSubmenu()
+        buildMenu()               // 본문 즉시 재렌더 — moodIcon(기분 줄)·streakSection(🏆 섹션) 반영
+        refreshFunModeSubmenu()   // 자기 서브메뉴 체크박스 상태 patch(기존 로직 유지)
     }
 
     // ── 자동 갱신 주기 서브메뉴(라디오 스타일 — 하나만 선택) ──
@@ -2283,8 +2354,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func setLanguagePreferenceButton(_ sender: NSButton) {
         let pref = LanguagePreference.allCases[sender.tag]
         TitleSettings.setLanguagePreference(pref)
-        updateStatusBarTitle()
-        refreshRadioSubmenu(languageSubmenu, current: pref, action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
+        buildMenu()                    // 본문 전체를 새 언어로 즉시 재렌더
+        refreshFooterLocalizedText()   // footer 고정 항목 + 6개 서브메뉴 행 텍스트를 새 언어로 patch
     }
 
     // ── 폴백 경로: stats-cache.json 부재 시 JSONL 직접 파싱(추정 단가) ──
@@ -2292,10 +2363,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusBarTitleFromEntries()
         let data = makeBlockDisplayData(fromEntries: cachedAll, reader: reader)
         lastBlockDisplayData = data
-        let menu = obtainMainMenu()
-        menu.removeAllItems()
-        renderBlockMenu(data, into: menu)
-        appendFooter(menu)
+        replaceBody { menu in
+            self.renderBlockMenu(data, into: menu)
+            self.appendLastUpdatedLabel(menu)
+        }
     }
 
     // ── 폴백 경로(JSONL 직접 파싱, 추정 단가) 뷰모델 어댑터 ──
