@@ -1412,6 +1412,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastBlockDisplayData: BlockDisplayData?  // 스켈레톤 shape의 소스(직전 실제 렌더)
     private var bodyItemCount = 0  // replaceBody(with:)가 이 개수만큼만 메인 메뉴 맨 앞에서 교체한다
     private var footerLocalizedItems: [(NSMenuItem, () -> String)] = []  // 언어 전환 시 footer title 패치용
+    private weak var refreshButtonRow: NSMenuItem?  // "지금 새로고침"의 커스텀 뷰 항목 — 언어 전환 시 버튼 타이틀만 따로 patch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyDefaultsIfNeeded()
@@ -2009,11 +2010,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             footerLocalizedItems.append((item, make))
         }
 
+        // 커스텀 뷰 항목이라 클릭해도 메뉴가 안 닫힌다(다른 설정 행과 동일한 이유). footer의
+        // title 패치 목록(track/footerLocalizedItems)은 NSMenuItem.title을 직접 바꾸는 방식이라
+        // .view 기반 항목엔 안 맞으므로, refreshButtonRow로 별도 추적해 버튼 타이틀만 patch한다.
         let refreshMake = { "  🔄 " + t("지금 새로고침", "Refresh Now") }
-        let refreshItem = NSMenuItem(title: refreshMake(), action: #selector(manualRefresh), keyEquivalent: "r")
-        refreshItem.target = self
+        let refreshItem = NSMenuItem()
+        refreshItem.view = actionRowView(title: refreshMake(), action: #selector(manualRefresh))
         menu.addItem(refreshItem)
-        track(refreshItem, refreshMake)
+        refreshButtonRow = refreshItem
 
         // 재미 모드를 표시 항목 계열 서브메뉴보다 먼저 배치 — 가장 최근에 추가된 핵심 기능인데
         // 5개 서브메뉴 중 4번째에 묻혀 있으면 발견성이 떨어진다.
@@ -2085,6 +2089,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 암묵적으로 갱신해 주던 것을 대신해 명시적으로 patch한다.
     private func refreshFooterLocalizedText() {
         for (item, make) in footerLocalizedItems { item.title = make() }
+        if let button = refreshButtonRow?.view?.subviews.first as? NSButton {
+            button.title = "  🔄 " + t("지금 새로고침", "Refresh Now")
+        }
         refreshTitleFieldsSubmenu()
         refreshFunModeSubmenu()
         refreshRadioSubmenu(separatorSubmenu, current: TitleSettings.separator(), action: #selector(setSeparatorButton(_:))) { $0.label }
@@ -2173,6 +2180,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func cycleTitleFieldColorButton(_ sender: NSButton) {
         TitleSettings.cycleColor(for: TitleField.allCases[sender.tag])
         refreshTitleFieldsSubmenu()
+    }
+
+    // 순수 액션 전용 커스텀 뷰(예: "지금 새로고침") — 다른 설정 행과 동일한 이유로 클릭해도
+    // 메뉴가 안 닫히게 우회한다. 체크박스/라디오와 달리 상태를 표시하지 않는다.
+    private func actionRowView(title: String, action: Selector) -> NSView {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
+        let button = NSButton(title: title, target: self, action: action)
+        button.frame = NSRect(x: 14, y: 1, width: 200, height: 20)
+        row.addSubview(button)
+        return row
     }
 
     // 라디오 스타일 서브메뉴 공용 행 — 표준 NSMenuItem 클릭은 메뉴 트래킹을 끝내버리므로
