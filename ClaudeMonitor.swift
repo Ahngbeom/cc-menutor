@@ -824,27 +824,48 @@ enum MoodTier: String, CaseIterable {
     }
 }
 
+// flame 테마 전용 — MoodTier(5단계)를 아이콘 모양 3단계(불씨/불꽃/화염)로 묶는다. idle+calm을
+// 묶는 이유: 블록이 없거나 막 시작한 시점엔 "아직 불이 크지 않다"는 신호가 맞고, warm+hot을
+// 묶는 이유: 대부분의 작업 시간이 여기 걸쳐 있어 형태 변화보다 색 변화(노랑→주황)로 충분히
+// 구분됨. critical만 별도 화염 형태로 분리해 "한도 근접"을 형태로도 강조한다.
+enum FlameStage: String, CaseIterable {
+    case ember, flame, blaze   // 불씨 / 불꽃 / 화염
+}
+
+func flameStage(for tier: MoodTier) -> FlameStage {
+    switch tier {
+    case .idle, .calm: return .ember
+    case .warm, .hot:  return .flame
+    case .critical:    return .blaze
+    }
+}
+
 // 무드 글리프의 "모양" 테마 — 색(TitleFieldColor)은 테마와 무관하게 MoodTier.color 그대로 쓴다.
 // 자유 텍스트 입력을 허용하지 않는 이유: 컬러 프레젠테이션 이모지를 넣으면 위 색상 틴팅이 조용히
 // 먹히지 않기 때문에(:712 주석 참고), 색 틴팅이 검증된 텍스트 프레젠테이션 글리프로만 구성된
 // 테마 중에서 고르게 한다.
 enum MoodGlyphTheme: String, CaseIterable {
-    case circles, bars, signature
+    case circles, bars, signature, flame
 
     var label: String {
         switch self {
         case .circles:   return t("○ 원형 (기본)", "○ Circles (Default)")
         case .bars:      return t("▁ 막대", "▁ Bars")
         case .signature: return t("▮ 시그니쳐 (커서 블록)", "▮ Signature (Cursor Block)")
+        case .flame:     return t("🔥 불꽃 (불씨 → 화염)", "🔥 Flame (Ember → Blaze)")
         }
     }
 
-    // signature 테마는 텍스트 글리프가 아니라 statusItem.button.image로 렌더링되므로(아래
-    // moodSignatureImage 참고) 이 함수는 실제로 호출되지 않는다 — circles와 동일한 값을 반환해
-    // 만에 하나 호출되더라도(예: 향후 새 호출부 추가 실수) 빈 문자열 대신 안전한 폴백을 준다.
+    // signature/flame 테마는 텍스트 글리프가 아니라 statusItem.button.image로 렌더링되므로(아래
+    // moodSignatureImage/moodFlameImage 참고) 이 값을 참조하는 호출부는 이미지 테마일 때 스킵한다.
+    var isImageBased: Bool { self == .signature || self == .flame }
+
+    // signature/flame은 텍스트 글리프가 아니라 이미지로 렌더링되므로 이 함수는 실제로 호출되지
+    // 않는다 — circles와 동일한 값을 반환해 만에 하나 호출되더라도(예: 향후 새 호출부 추가 실수)
+    // 빈 문자열 대신 안전한 폴백을 준다.
     func glyph(for tier: MoodTier) -> String {
         switch self {
-        case .circles, .signature:
+        case .circles, .signature, .flame:
             return tier.glyph
         case .bars:
             switch tier {
@@ -892,15 +913,79 @@ func moodSignatureImage(tier: MoodTier) -> NSImage {
     return image
 }
 
-// statusItem.button.image에 대입할 이미지 — signature 테마가 선택되어 있고 아이콘이 표시
+// flame 테마 전용 커스텀 벡터 아이콘 — 이모지 🔥 대신 Core Graphics로 직접 그려 색 틴팅이
+// 정상 동작하게 한다(파일 상단 MoodGlyphTheme 주석 참고). FlameStage(3단계: 불씨/불꽃/화염)에
+// 따라 실루엣 자체가 커지고 복잡해진다 — 불씨는 화염 모양이 아니라 둥근 점, 불꽃은 표준 화염
+// 한 덩이, 화염은 메인 화염 옆에 곁불꽃이 하나 더 붙는다. 색은 tier.color를 그대로 써서(5단계)
+// 형태(3단계) 위에 세밀한 색 피드백을 얹는다.
+func moodFlameImage(tier: MoodTier) -> NSImage {
+    let size = CGSize(width: 11, height: 14)
+    let color = tier.color.nsColor ?? .labelColor
+    let image = NSImage(size: size, flipped: false) { rect in
+        let path = flameBezierPath(stage: flameStage(for: tier), in: rect)
+        color.setFill()
+        path.fill()
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+// 단일 화염 실루엣 — 정규화 좌표(밑변 중앙이 원점)로 정의한 뒤 rect에 맞춰 스케일한다.
+// lean이 클수록 끝이 오른쪽으로(음수면 왼쪽으로) 기울어 "일렁이는" 인상을 준다.
+private func singleFlamePath(in rect: CGRect, lean: CGFloat) -> NSBezierPath {
+    func pt(_ u: CGFloat, _ v: CGFloat) -> CGPoint {
+        CGPoint(x: rect.minX + u * rect.width, y: rect.minY + v * rect.height)
+    }
+    let path = NSBezierPath()
+    path.move(to: pt(0.5, 0.0))
+    path.curve(to: pt(0.08, 0.42), controlPoint1: pt(0.30, 0.05), controlPoint2: pt(0.02, 0.20))
+    path.curve(to: pt(0.30, 0.68), controlPoint1: pt(0.14, 0.60), controlPoint2: pt(0.18, 0.72))
+    path.curve(to: pt(0.5 + lean, 1.0), controlPoint1: pt(0.38, 0.82), controlPoint2: pt(0.46 + lean * 0.5, 0.94))
+    path.curve(to: pt(0.68, 0.66), controlPoint1: pt(0.58 + lean * 0.5, 0.90), controlPoint2: pt(0.80, 0.74))
+    path.curve(to: pt(0.90, 0.38), controlPoint1: pt(0.62, 0.58), controlPoint2: pt(0.96, 0.50))
+    path.curve(to: pt(0.5, 0.0), controlPoint1: pt(0.98, 0.22), controlPoint2: pt(0.68, 0.02))
+    path.close()
+    return path
+}
+
+private func flameBezierPath(stage: FlameStage, in rect: CGRect) -> NSBezierPath {
+    switch stage {
+    case .ember:
+        // 화염 실루엣이 아니라 바닥에 깔린 작고 둥근 불씨 — 높이 canvas의 ~42%
+        let height = rect.height * 0.42
+        let width = rect.width * 0.62
+        let emberRect = CGRect(x: rect.midX - width / 2, y: rect.minY, width: width, height: height)
+        return NSBezierPath(ovalIn: emberRect)
+    case .flame:
+        // 표준 물방울형 화염 실루엣 — 높이 ~78%, 살짝 기울어진 단일 불꽃
+        let height = rect.height * 0.78
+        let flameRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: height)
+        return singleFlamePath(in: flameRect, lean: 0.12)
+    case .blaze:
+        // 메인 화염(높이 ~98%) + 옆에 작은 곁불꽃 — 가장 크고 밝은 단계
+        let mainHeight = rect.height * 0.98
+        let mainRect = CGRect(x: rect.minX + rect.width * 0.12, y: rect.minY,
+                               width: rect.width * 0.75, height: mainHeight)
+        let main = singleFlamePath(in: mainRect, lean: 0.08)
+        let sideHeight = rect.height * 0.55
+        let sideRect = CGRect(x: rect.minX - rect.width * 0.05, y: rect.minY,
+                               width: rect.width * 0.5, height: sideHeight)
+        main.append(singleFlamePath(in: sideRect, lean: -0.15))
+        return main
+    }
+}
+
+// statusItem.button.image에 대입할 이미지 — signature/flame 테마가 선택되어 있고 아이콘이 표시
 // 상태(TitleIcon != .none)이며 무드 타이어가 있을 때만 non-nil. 그 외에는 nil을 반환해 호출부가
 // "이전 테마의 잔류 이미지 지우기"에도 그대로 쓸 수 있게 한다(테마를 circles/bars로 되돌렸을 때
 // 이전 프레임 이미지가 남아있지 않도록).
 func moodImageToApply(tier: MoodTier?) -> NSImage? {
+    let theme = TitleSettings.moodGlyphTheme()
     guard TitleSettings.icon() != .none,
-          TitleSettings.moodGlyphTheme() == .signature,
+          theme.isImageBased,
           let tier = tier else { return nil }
-    return moodSignatureImage(tier: tier)
+    return theme == .signature ? moodSignatureImage(tier: tier) : moodFlameImage(tier: tier)
 }
 
 extension TitleSettings {
@@ -1118,9 +1203,9 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     // 출력이 이전과 동일함을 보장한다. 사용자가 아이콘을 "표시 안 함"으로 두면 무드도 함께 숨긴다.
     if TitleSettings.icon() != .none {
         if let tier = ctx.moodTier {
-            // signature 테마는 텍스트 파트가 아니라 statusItem.button.image로 렌더링된다(호출부의
-            // moodImageToApply(tier:) 참고) — 여기서는 글리프 텍스트를 아예 만들지 않는다.
-            if TitleSettings.moodGlyphTheme() != .signature {
+            // signature/flame 테마는 텍스트 파트가 아니라 statusItem.button.image로 렌더링된다
+            // (호출부의 moodImageToApply(tier:) 참고) — 여기서는 글리프 텍스트를 아예 만들지 않는다.
+            if !TitleSettings.moodGlyphTheme().isImageBased {
                 parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color))
             }
         } else {
@@ -1633,7 +1718,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let badge = badge { parts.append(badge) }
         if moodEnabled {
             let tier = moodTestTierOverride() ?? .idle
-            if TitleSettings.moodGlyphTheme() != .signature {
+            if !TitleSettings.moodGlyphTheme().isImageBased {
                 parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color))
             }
             parts.append(TitlePart(text: label, color: .defaultColor))
@@ -1912,8 +1997,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if let tier = b.moodTier {
                 let scopeWord = t(b.warning != nil ? "사용" : "경과", b.warning != nil ? "used" : "elapsed")
+                let flameIcon = TitleSettings.moodGlyphTheme() == .flame ? moodFlameImage(tier: tier) : nil
                 skeleton ? addSkeletonLabel(menu)
-                         : addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"))
+                         : addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: flameIcon)
             }
         } else {
             addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
@@ -2448,19 +2534,28 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // NSMenuItem.isEnabled == false인 표준 아이템은 attributedTitle의 foregroundColor를 무시하고
     // 시스템이 강제로 회색 틴트를 덧씌운다. item.view에 커스텀 NSTextField를 꽂으면 이 표준
     // 제목-그리기 경로 자체를 우회해 지정한 색이 그대로 렌더링된다(titleFieldRowView와 동일 패턴).
-    private func infoRowItem(_ title: String, font: NSFont, color: NSColor) -> NSMenuItem {
+    // 행은 NSMenuItem.image가 아니라 커스텀 NSView(row)를 쓰므로, 표준 image 프로퍼티는 AppKit이
+    // 무시한다 — image가 있으면 텍스트 필드 앞에 NSImageView를 직접 심어 인셋을 넓힌다.
+    private func infoRowItem(_ title: String, font: NSFont, color: NSColor, image: NSImage? = nil) -> NSMenuItem {
         let field = NSTextField(labelWithString: title)
         field.font = font
         field.textColor = color
         field.lineBreakMode = .byClipping
         field.sizeToFit()
 
-        let leftInset: CGFloat = 14   // titleFieldRowView의 체크박스 x와 맞춰 다른 행과 정렬
+        var leftInset: CGFloat = 14   // titleFieldRowView의 체크박스 x와 맞춰 다른 행과 정렬
         let rightPad: CGFloat = 6
         let rowHeight = max(18, field.frame.height + 2)
+        let iconSize: CGFloat = 12
         let row = NSView(frame: NSRect(x: 0, y: 0,
-                                        width: leftInset + field.frame.width + rightPad,
+                                        width: leftInset + (image != nil ? iconSize + 4 : 0) + field.frame.width + rightPad,
                                         height: rowHeight))
+        if let image = image {
+            let iconView = NSImageView(frame: NSRect(x: leftInset, y: (rowHeight - iconSize) / 2, width: iconSize, height: iconSize))
+            iconView.image = image
+            row.addSubview(iconView)
+            leftInset += iconSize + 4
+        }
         field.frame.origin = NSPoint(x: leftInset, y: (rowHeight - field.frame.height) / 2)
         row.addSubview(field)
 
@@ -2474,8 +2569,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(infoRowItem(title, font: NSFont.systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor))
     }
 
-    func addLabel(_ menu: NSMenu, _ title: String) {
-        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), color: .labelColor))
+    func addLabel(_ menu: NSMenu, _ title: String, image: NSImage? = nil) {
+        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), color: .labelColor, image: image))
     }
 
     // 5시간 블록 섹션에서 가장 중요한 값(남은 시간/리셋 상태)을 다른 줄보다 크고 굵게 강조한다.
@@ -2918,6 +3013,27 @@ func runSelfTests() -> Never {
     check(moodImageToApply(tier: .critical) == nil,
           "moodImageToApply: 아이콘 '표시 안 함'이면 signature 테마여도 이미지 없음")
     TitleSettings.setIcon(.keyboard)
+
+    // flame 테마: signature와 동일한 이미지 기반 렌더링 규약을 따라야 한다.
+    TitleSettings.setMoodGlyphTheme(.flame)
+    check(!buildTitleParts(barsCtx).contains(where: { $0.text == MoodTier.critical.glyph || $0.text == "█" }),
+          "moodGlyphTheme: flame 선택 시 buildTitleParts가 텍스트 글리프를 만들지 않음(이미지로 렌더링)")
+    check(moodImageToApply(tier: .critical) != nil,
+          "moodImageToApply: flame 테마 + 아이콘 표시 + tier 있음 → 이미지 생성")
+    check(moodImageToApply(tier: nil) == nil,
+          "moodImageToApply: flame 테마여도 tier가 nil이면(무드 꺼짐) 이미지 없음")
+    TitleSettings.setIcon(.none)
+    check(moodImageToApply(tier: .critical) == nil,
+          "moodImageToApply: 아이콘 '표시 안 함'이면 flame 테마여도 이미지 없음")
+    TitleSettings.setIcon(.keyboard)
+
+    // FlameStage 그룹핑 불변식 — MoodTier 5단계를 정확히 3개의 아이콘 형태로 묶는지 검증
+    check(flameStage(for: .idle) == flameStage(for: .calm), "flameStage: idle과 calm은 같은 불씨 단계")
+    check(flameStage(for: .warm) == flameStage(for: .hot), "flameStage: warm과 hot은 같은 불꽃 단계")
+    check(flameStage(for: .critical) != flameStage(for: .warm) && flameStage(for: .critical) != flameStage(for: .idle),
+          "flameStage: critical은 화염 단계로 별도 분리")
+    check(Set(MoodTier.allCases.map(flameStage(for:))).count == 3,
+          "flameStage: MoodTier 5단계가 정확히 3개의 아이콘 형태로 묶임")
 
     if let smgt = savedMoodGlyphTheme { UserDefaults.standard.set(smgt, forKey: "moodGlyphTheme") }
     else { UserDefaults.standard.removeObject(forKey: "moodGlyphTheme") }
