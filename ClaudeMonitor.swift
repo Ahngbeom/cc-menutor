@@ -1395,6 +1395,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let refreshFlashDuration: TimeInterval = 1.5
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
+    // 아래 6개도 동일한 이유로 유지 — appendFooter()가 자동 갱신마다(10초~5분 타이머, 수동
+    // 새로고침, 최초 기동) 다시 호출돼도 서브메뉴 NSMenu 인스턴스를 매번 새로 만들지 않고 재사용한다.
+    weak var separatorSubmenu: NSMenu?
+    weak var iconSubmenu: NSMenu?
+    weak var moodThemeSubmenu: NSMenu?
+    weak var refreshIntervalSubmenu: NSMenu?
+    weak var languageSubmenu: NSMenu?
+    weak var funModeSubmenu: NSMenu?
     // 메인 5시간 블록 메뉴 — refresh마다 새 NSMenu()로 교체하지 않고 재사용한다. 매번 새 인스턴스를
     // 만들어 statusItem.menu에 재대입하면, 이미 열려(트래킹) 있는 메뉴 인스턴스는 그 재대입의
     // 영향을 받지 않아 사용자가 보는 중엔 갱신되지 않던 문제가 있었다 — 인스턴스를 재사용하고
@@ -1977,12 +1985,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 재미 모드를 표시 항목 계열 서브메뉴보다 먼저 배치 — 가장 최근에 추가된 핵심 기능인데
         // 5개 서브메뉴 중 4번째에 묻혀 있으면 발견성이 떨어진다.
         let funModeItem = NSMenuItem(title: "  🎭 " + t("재미 모드", "Fun Mode"), action: nil, keyEquivalent: "")
-        funModeItem.submenu = buildFunModeSubmenu()
+        funModeItem.submenu = obtainFunModeSubmenu()
         menu.addItem(funModeItem)
 
         // 무드 아이콘의 모양(테마)을 고르는 서브메뉴 — 무드 아이콘과 관련이 깊어 재미 모드 바로 다음에 배치.
         let moodGlyphThemeItem = NSMenuItem(title: "  🎨 " + t("무드 아이콘 모양", "Mood Icon Style"), action: nil, keyEquivalent: "")
-        moodGlyphThemeItem.submenu = buildMoodGlyphThemeSubmenu()
+        moodGlyphThemeItem.submenu = obtainMoodThemeSubmenu()
         menu.addItem(moodGlyphThemeItem)
 
         let titleFieldsItem = NSMenuItem(title: "  ⌨ " + t("메뉴바 표시 항목", "Menu Bar Fields"), action: nil, keyEquivalent: "")
@@ -1990,20 +1998,20 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(titleFieldsItem)
 
         let separatorItem = NSMenuItem(title: "  ⌇ " + t("표시 항목 구분자", "Field Separator"), action: nil, keyEquivalent: "")
-        separatorItem.submenu = buildSeparatorSubmenu()
+        separatorItem.submenu = obtainSeparatorSubmenu()
         menu.addItem(separatorItem)
 
         // "메뉴바 표시 항목"과 같은 ⌨ 글리프를 쓰면 두 서브메뉴가 구분되지 않아 🖼로 분리.
         let iconItem = NSMenuItem(title: "  🖼 " + t("메뉴바 아이콘", "Menu Bar Icon"), action: nil, keyEquivalent: "")
-        iconItem.submenu = buildIconSubmenu()
+        iconItem.submenu = obtainIconSubmenu()
         menu.addItem(iconItem)
 
         let refreshIntervalItem = NSMenuItem(title: "  ⏱ " + t("자동 갱신 주기", "Auto-Refresh Interval"), action: nil, keyEquivalent: "")
-        refreshIntervalItem.submenu = buildRefreshIntervalSubmenu()
+        refreshIntervalItem.submenu = obtainRefreshIntervalSubmenu()
         menu.addItem(refreshIntervalItem)
 
         let languageItem = NSMenuItem(title: "  🌐 " + t("표시 언어", "Display Language"), action: nil, keyEquivalent: "")
-        languageItem.submenu = buildLanguageSubmenu()
+        languageItem.submenu = obtainLanguageSubmenu()
         menu.addItem(languageItem)
 
         menu.addItem(.separator())
@@ -2096,98 +2104,187 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTitleFieldsSubmenu()
     }
 
-    // 라디오 스타일 서브메뉴 공통 빌더 — CaseIterable 값 하나를 "현재 선택"으로 표시하고
-    // 나머지는 off로 둔다. @objc 셀렉터는 concrete 메서드여야 하므로(클로저 불가) 각 서브메뉴의
-    // 개별 setX(_:) 핸들러는 그대로 두고, NSMenu 구성 루프만 이 헬퍼로 흡수한다.
-    private func buildRadioSubmenu<T: CaseIterable & Equatable>(
+    // 라디오 스타일 서브메뉴 공용 행 — 표준 NSMenuItem 클릭은 메뉴 트래킹을 끝내버리므로
+    // (titleFieldRowView와 동일한 이유), radioButtonWithTitle 하나만 있는 단순 행으로 우회한다.
+    private func radioRowView(title: String, isSelected: Bool, tag: Int, action: Selector) -> NSView {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
+        let radio = NSButton(radioButtonWithTitle: title, target: self, action: action)
+        radio.frame = NSRect(x: 14, y: 2, width: 200, height: 18)
+        radio.state = isSelected ? .on : .off
+        radio.tag = tag
+        row.addSubview(radio)
+        return row
+    }
+
+    // 기존 buildRadioSubmenu<T>의 커스텀 뷰 버전 — T.allCases를 순회하며 행을 만든다.
+    private func buildRadioSubmenuView<T: CaseIterable & Equatable>(
         current: T, action: Selector, title: (T) -> String
     ) -> NSMenu where T.AllCases.Element == T {
         let sub = NSMenu()
-        for value in T.allCases {
-            let item = NSMenuItem(title: title(value), action: action, keyEquivalent: "")
-            item.target = self
-            item.state = (value == current) ? .on : .off
-            item.representedObject = value
+        for (idx, value) in T.allCases.enumerated() {
+            let item = NSMenuItem()
+            item.view = radioRowView(title: title(value), isSelected: value == current, tag: idx, action: action)
             sub.addItem(item)
         }
         return sub
     }
 
-    // ── 표시 항목 구분자 서브메뉴(라디오 스타일 — 하나만 선택) ──
-    func buildSeparatorSubmenu() -> NSMenu {
-        buildRadioSubmenu(current: TitleSettings.separator(), action: #selector(setSeparator(_:))) { $0.label }
+    // refreshTitleFieldsSubmenu()와 동일한 패턴 — 서브메뉴 인스턴스는 그대로 두고 행(item.view)만
+    // 다시 그린다. buildMenu()를 호출하지 않으므로 열려 있는 서브메뉴의 트래킹이 깨지지 않는다.
+    private func refreshRadioSubmenu<T: CaseIterable & Equatable>(
+        _ submenu: NSMenu?, current: T, action: Selector, title: (T) -> String
+    ) where T.AllCases.Element == T {
+        guard let sub = submenu else { return }
+        let values = Array(T.allCases)
+        for (idx, item) in sub.items.enumerated() where idx < values.count {
+            item.view = radioRowView(title: title(values[idx]), isSelected: values[idx] == current, tag: idx, action: action)
+        }
     }
 
-    @objc func setSeparator(_ sender: NSMenuItem) {
-        guard let sep = sender.representedObject as? TitleSeparator else { return }
+    // ── 표시 항목 구분자 서브메뉴(라디오 스타일 — 하나만 선택) ──
+    private func obtainSeparatorSubmenu() -> NSMenu {
+        let current = TitleSettings.separator()
+        if let existing = separatorSubmenu {
+            refreshRadioSubmenu(existing, current: current, action: #selector(setSeparatorButton(_:))) { $0.label }
+            return existing
+        }
+        let sub = buildRadioSubmenuView(current: current, action: #selector(setSeparatorButton(_:))) { $0.label }
+        separatorSubmenu = sub
+        return sub
+    }
+
+    @objc func setSeparatorButton(_ sender: NSButton) {
+        let sep = TitleSeparator.allCases[sender.tag]
         TitleSettings.setSeparator(sep)
-        buildMenu()
+        updateStatusBarTitle()
+        refreshRadioSubmenu(separatorSubmenu, current: sep, action: #selector(setSeparatorButton(_:))) { $0.label }
     }
 
     // ── 메뉴바 아이콘 서브메뉴(라디오 스타일 — 하나만 선택, "표시 안 함" 포함) ──
-    func buildIconSubmenu() -> NSMenu {
-        buildRadioSubmenu(current: TitleSettings.icon(), action: #selector(setIcon(_:))) { $0.label }
+    private func obtainIconSubmenu() -> NSMenu {
+        let current = TitleSettings.icon()
+        if let existing = iconSubmenu {
+            refreshRadioSubmenu(existing, current: current, action: #selector(setIconButton(_:))) { $0.label }
+            return existing
+        }
+        let sub = buildRadioSubmenuView(current: current, action: #selector(setIconButton(_:))) { $0.label }
+        iconSubmenu = sub
+        return sub
     }
 
-    @objc func setIcon(_ sender: NSMenuItem) {
-        guard let icon = sender.representedObject as? TitleIcon else { return }
+    @objc func setIconButton(_ sender: NSButton) {
+        let icon = TitleIcon.allCases[sender.tag]
         TitleSettings.setIcon(icon)
-        buildMenu()
+        updateStatusBarTitle()
+        refreshRadioSubmenu(iconSubmenu, current: icon, action: #selector(setIconButton(_:))) { $0.label }
     }
 
     // ── 무드 아이콘 모양 서브메뉴(라디오 스타일 — 하나만 선택). 무드 아이콘 토글이 꺼져 있어도
     // 다른 라디오 서브메뉴들과 동일하게 항상 노출한다 — 값을 미리 정해두면 나중에 토글을 켰을 때
     // 그대로 적용된다. ──
-    func buildMoodGlyphThemeSubmenu() -> NSMenu {
-        buildRadioSubmenu(current: TitleSettings.moodGlyphTheme(), action: #selector(setMoodGlyphTheme(_:))) { $0.label }
+    private func obtainMoodThemeSubmenu() -> NSMenu {
+        let current = TitleSettings.moodGlyphTheme()
+        if let existing = moodThemeSubmenu {
+            refreshRadioSubmenu(existing, current: current, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
+            return existing
+        }
+        let sub = buildRadioSubmenuView(current: current, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
+        moodThemeSubmenu = sub
+        return sub
     }
 
-    @objc func setMoodGlyphTheme(_ sender: NSMenuItem) {
-        guard let theme = sender.representedObject as? MoodGlyphTheme else { return }
+    @objc func setMoodGlyphThemeButton(_ sender: NSButton) {
+        let theme = MoodGlyphTheme.allCases[sender.tag]
         TitleSettings.setMoodGlyphTheme(theme)
-        buildMenu()
+        updateStatusBarTitle()
+        refreshRadioSubmenu(moodThemeSubmenu, current: theme, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
     }
 
-    // ── 재미 모드 서브메뉴(체크리스트 — 3개 기능 독립 on/off, 라디오와 구조가 달라 별도 유지) ──
-    func buildFunModeSubmenu() -> NSMenu {
+    // ── 재미 모드 서브메뉴 행 — titleFieldRowView에서 이동/색상 버튼만 제거한 축소판. 라디오와
+    // 달리 각 행이 자신의 on/off만 독립적으로 토글한다(하나를 켠다고 다른 게 꺼지지 않음). ──
+    private func funModeRowView(feature: FunModeFeature, tag: Int) -> NSView {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
+        let checkbox = NSButton(checkboxWithTitle: feature.label, target: self,
+                                action: #selector(toggleFunModeFeatureCheckbox(_:)))
+        checkbox.frame = NSRect(x: 14, y: 2, width: 200, height: 18)
+        checkbox.state = TitleSettings.isFunModeFeatureEnabled(feature) ? .on : .off
+        checkbox.tag = tag
+        row.addSubview(checkbox)
+        return row
+    }
+
+    private func buildFunModeSubmenuView() -> NSMenu {
         let sub = NSMenu()
-        for feature in FunModeFeature.allCases {
-            let item = NSMenuItem(title: feature.label, action: #selector(toggleFunModeFeature(_:)), keyEquivalent: "")
-            item.target = self
-            item.state = TitleSettings.isFunModeFeatureEnabled(feature) ? .on : .off
-            item.representedObject = feature
+        for (idx, feature) in FunModeFeature.allCases.enumerated() {
+            let item = NSMenuItem()
+            item.view = funModeRowView(feature: feature, tag: idx)
             sub.addItem(item)
         }
         return sub
     }
 
-    @objc func toggleFunModeFeature(_ sender: NSMenuItem) {
-        guard let feature = sender.representedObject as? FunModeFeature else { return }
+    private func refreshFunModeSubmenu() {
+        guard let sub = funModeSubmenu else { return }
+        let features = Array(FunModeFeature.allCases)
+        for (idx, item) in sub.items.enumerated() where idx < features.count {
+            item.view = funModeRowView(feature: features[idx], tag: idx)
+        }
+    }
+
+    private func obtainFunModeSubmenu() -> NSMenu {
+        if let existing = funModeSubmenu {
+            refreshFunModeSubmenu()
+            return existing
+        }
+        let sub = buildFunModeSubmenuView()
+        funModeSubmenu = sub
+        return sub
+    }
+
+    @objc func toggleFunModeFeatureCheckbox(_ sender: NSButton) {
+        let feature = FunModeFeature.allCases[sender.tag]
         TitleSettings.toggleFunModeFeature(feature)
-        buildMenu()
+        updateStatusBarTitle()
+        refreshFunModeSubmenu()
     }
 
     // ── 자동 갱신 주기 서브메뉴(라디오 스타일 — 하나만 선택) ──
-    func buildRefreshIntervalSubmenu() -> NSMenu {
-        buildRadioSubmenu(current: RefreshSettings.interval(), action: #selector(setRefreshInterval(_:))) { $0.label }
+    private func obtainRefreshIntervalSubmenu() -> NSMenu {
+        let current = RefreshSettings.interval()
+        if let existing = refreshIntervalSubmenu {
+            refreshRadioSubmenu(existing, current: current, action: #selector(setRefreshIntervalButton(_:))) { $0.label }
+            return existing
+        }
+        let sub = buildRadioSubmenuView(current: current, action: #selector(setRefreshIntervalButton(_:))) { $0.label }
+        refreshIntervalSubmenu = sub
+        return sub
     }
 
-    @objc func setRefreshInterval(_ sender: NSMenuItem) {
-        guard let interval = sender.representedObject as? RefreshInterval else { return }
+    @objc func setRefreshIntervalButton(_ sender: NSButton) {
+        let interval = RefreshInterval.allCases[sender.tag]
         RefreshSettings.setInterval(interval)
         rescheduleTimer()
-        buildMenu()
+        updateStatusBarTitle()
+        refreshRadioSubmenu(refreshIntervalSubmenu, current: interval, action: #selector(setRefreshIntervalButton(_:))) { $0.label }
     }
 
     // ── 표시 언어 서브메뉴(라디오 스타일 — 하나만 선택) ──
-    func buildLanguageSubmenu() -> NSMenu {
-        buildRadioSubmenu(current: TitleSettings.languagePreference(), action: #selector(setLanguagePreference(_:))) { $0.label }
+    private func obtainLanguageSubmenu() -> NSMenu {
+        let current = TitleSettings.languagePreference()
+        if let existing = languageSubmenu {
+            refreshRadioSubmenu(existing, current: current, action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
+            return existing
+        }
+        let sub = buildRadioSubmenuView(current: current, action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
+        languageSubmenu = sub
+        return sub
     }
 
-    @objc func setLanguagePreference(_ sender: NSMenuItem) {
-        guard let pref = sender.representedObject as? LanguagePreference else { return }
+    @objc func setLanguagePreferenceButton(_ sender: NSButton) {
+        let pref = LanguagePreference.allCases[sender.tag]
         TitleSettings.setLanguagePreference(pref)
-        buildMenu()
+        updateStatusBarTitle()
+        refreshRadioSubmenu(languageSubmenu, current: pref, action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
     }
 
     // ── 폴백 경로: stats-cache.json 부재 시 JSONL 직접 파싱(추정 단가) ──
