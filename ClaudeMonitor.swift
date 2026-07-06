@@ -1348,14 +1348,27 @@ struct BlockDisplayData {
     let isEstimate: Bool              // 폴백 경로에서만 true → "추정 모드" 배너
     enum State {
         case noData                   // 폴백 경로 전용
+        // 메뉴가 열려 있는 동안 refresh가 진행 중일 때만 쓰는 스켈레톤 상태 — 연관값은 .ready와
+        // 완전히 같은 타입이다: 직전 실제 렌더의 값을 그대로 담아두면, 섹션 존재 여부/행 개수 같은
+        // "shape"이 이미 그 값들 안에 인코딩되어 있으므로 별도의 shape 전용 구조체가 필요 없다.
+        case loading(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData, allTime: AllTimeSectionData?)
         case ready(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData, allTime: AllTimeSectionData?)
     }
     let state: State
 }
 
+extension BlockDisplayData {
+    // 직전 .ready 데이터를 .loading으로 재포장 — 노데이터/로딩 중이던 상태에서는 본뜰 shape이
+    // 없으므로 nil을 반환한다(호출부가 이 경우 단순 "로딩 중" placeholder로 대체).
+    func asLoadingSkeleton() -> BlockDisplayData? {
+        guard case .ready(let block, let model, let today, let allTime) = state else { return nil }
+        return BlockDisplayData(isEstimate: isEstimate, state: .loading(block: block, model: model, today: today, allTime: allTime))
+    }
+}
+
 // MARK: - Menu Bar App
 
-class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
+class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
     let reader = UsageDataReader()
@@ -1382,6 +1395,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     private let refreshFlashDuration: TimeInterval = 1.5
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
+    // 메인 5시간 블록 메뉴 — refresh마다 새 NSMenu()로 교체하지 않고 재사용한다. 매번 새 인스턴스를
+    // 만들어 statusItem.menu에 재대입하면, 이미 열려(트래킹) 있는 메뉴 인스턴스는 그 재대입의
+    // 영향을 받지 않아 사용자가 보는 중엔 갱신되지 않던 문제가 있었다 — 인스턴스를 재사용하고
+    // removeAllItems()+재렌더로 항목만 바꿔야 열려 있는 동안에도 반영된다.
+    private weak var mainMenu: NSMenu?
+    private var mainMenuIsOpen = false  // NSMenuDelegate로 추적 — refresh()가 스켈레톤을 보여줄지 결정
+    private var lastBlockDisplayData: BlockDisplayData?  // 스켈레톤 shape의 소스(직전 실제 렌더)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyDefaultsIfNeeded()
@@ -1410,6 +1430,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     func refresh() {
         if isRefreshing { return }
         isRefreshing = true
+        showSkeletonIfMenuOpen()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
             let stats = self.statsReader.load()
@@ -1425,6 +1446,21 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
                 self.isRefreshing = false
             }
         }
+    }
+
+    // 메뉴가 열려 있는 동안 새 refresh 사이클이 시작되면 직전 shape을 본떠 스켈레톤을 1회
+    // 그린다. 닫혀 있으면(보는 사람이 없으므로) 아무 것도 하지 않고, 백그라운드 로드가 끝난 뒤
+    // buildMenu()가 실제 값으로 조용히 채운다.
+    private func showSkeletonIfMenuOpen() {
+        guard mainMenuIsOpen else { return }
+        let menu = obtainMainMenu()
+        menu.removeAllItems()
+        if let skeleton = lastBlockDisplayData?.asLoadingSkeleton() {
+            renderBlockMenu(skeleton, into: menu)
+        } else {
+            addSectionHeader(menu, t("⏳ 불러오는 중…", "⏳ Loading…"))
+        }
+        appendFooter(menu)
     }
 
     // 재미 모드와 무관하게 항상 최신 상태로 갱신한다 — 스트릭은 "실제 사용한 날"을 반영해야 하므로
@@ -1653,14 +1689,34 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    // 메인 메뉴가 열리고 닫히는 시점을 추적 — refresh()가 그 사이에 스켈레톤을 보여줄지 판단한다.
+    func menuWillOpen(_ menu: NSMenu) {
+        if menu === mainMenu { mainMenuIsOpen = true }
+    }
+    func menuDidClose(_ menu: NSMenu) {
+        if menu === mainMenu { mainMenuIsOpen = false }
+    }
+
+    // 메인 5시간 블록 메뉴 인스턴스를 최초 1회만 만들고 이후로는 재사용한다.
+    private func obtainMainMenu() -> NSMenu {
+        if let existing = mainMenu { return existing }
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        mainMenu = menu
+        statusItem.menu = menu
+        return menu
+    }
+
     // ── 1차 경로: Claude Code stats-cache.json (권위 비용·실제 5시간 블록) ──
     func buildMenu(fromCache stats: StatsCache) {
         updateStatusBarTitle(fromCache: stats)
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        renderBlockMenu(makeBlockDisplayData(fromCache: stats), into: menu)
+        let data = makeBlockDisplayData(fromCache: stats)
+        lastBlockDisplayData = data
+        let menu = obtainMainMenu()
+        menu.removeAllItems()
+        renderBlockMenu(data, into: menu)
         appendFooter(menu)
-        statusItem.menu = menu
     }
 
     // ── 1차 경로(stats-cache.json) 뷰모델 어댑터 — 캐시가 노출하지 않는 필드(블록 내 모델별
@@ -1743,102 +1799,131 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
             addLabel(menu, "  " + t("경로: ~/.claude/projects/", "Path: ~/.claude/projects/"))
             menu.addItem(.separator())
 
+        case .loading(let block, let model, let today, let allTime):
+            renderBlockSections(block: block, model: model, today: today, allTime: allTime,
+                                 isEstimate: data.isEstimate, skeleton: true, into: menu)
+
         case .ready(let block, let model, let today, let allTime):
-            if data.isEstimate {
-                addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
-                menu.addItem(.separator())
+            renderBlockSections(block: block, model: model, today: today, allTime: allTime,
+                                 isEstimate: data.isEstimate, skeleton: false, into: menu)
+        }
+    }
+
+    // ── .loading/.ready가 공유하는 렌더러 — skeleton이면 실제 값 대신 회색 placeholder 행을
+    // 그린다. 섹션 헤더와 "데이터 없음"류 정적 안내문은 skeleton 여부와 무관하게 항상 실제
+    // 텍스트를 쓴다(refresh마다 안 바뀌는 텍스트를 흐리게 하면 레이아웃 점프만 커짐). ──
+    private func renderBlockSections(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData,
+                                      allTime: AllTimeSectionData?, isEstimate: Bool, skeleton: Bool, into menu: NSMenu) {
+        if isEstimate {
+            addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
+            menu.addItem(.separator())
+        }
+
+        // ── 5-Hour Block Section ──
+        addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
+        if let b = block {
+            // 재미 모드(무드 아이콘) on/off와 무관하게 항상 계산되는 색 — 색상 코딩은 가독성
+            // 기능이지, 재미 모드가 게이팅하는 "기분" 표시 기능이 아니다. resolveMood()는
+            // 재미 모드가 꺼져 있으면 항상 nil을 반환하므로 여기서는 쓰지 않고, 그 안에서 쓰는
+            // moodTestTierOverride()/computeMood()를 직접 호출해 QA 오버라이드만 재사용한다.
+            let heroColor = (moodTestTierOverride()
+                ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)).color.nsColor ?? .labelColor
+
+            switch b.resetState {
+            case .remaining(let text):
+                skeleton ? addSkeletonLabel(menu, big: true)
+                         : addHeroLabel(menu, "  " + t("\(text) 남음", "\(text) remaining"), color: heroColor)
+            case .alreadyReset:
+                skeleton ? addSkeletonLabel(menu, big: true)
+                         : addHeroLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"), color: heroColor)
+            case .none:
+                break
+            }
+            if b.showProgressBar {
+                skeleton ? addSkeletonLabel(menu)
+                         : addColoredLabel(menu, "  " + t("\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% 경과", "\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% elapsed"), color: heroColor)
             }
 
-            // ── 5-Hour Block Section ──
-            addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
-            if let b = block {
-                // 재미 모드(무드 아이콘) on/off와 무관하게 항상 계산되는 색 — 색상 코딩은 가독성
-                // 기능이지, 재미 모드가 게이팅하는 "기분" 표시 기능이 아니다. resolveMood()는
-                // 재미 모드가 꺼져 있으면 항상 nil을 반환하므로 여기서는 쓰지 않고, 그 안에서 쓰는
-                // moodTestTierOverride()/computeMood()를 직접 호출해 QA 오버라이드만 재사용한다.
-                let heroColor = (moodTestTierOverride()
-                    ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)).color.nsColor ?? .labelColor
-
-                switch b.resetState {
-                case .remaining(let text):
-                    addHeroLabel(menu, "  " + t("\(text) 남음", "\(text) remaining"), color: heroColor)
-                case .alreadyReset:
-                    addHeroLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"), color: heroColor)
-                case .none:
-                    break
-                }
-                if b.showProgressBar {
-                    addColoredLabel(menu, "  " + t("\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% 경과", "\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% elapsed"), color: heroColor)
-                }
-
+            if skeleton {
+                addSkeletonLabel(menu)
+            } else {
                 addLabel(menu, "  " + t("\(formatCost(b.cost)) · \(formatTokens(b.outputTokens)) 출력 / \(formatTokens(b.totalTokens)) 전체 · \(b.messageCount)건",
                                         "\(formatCost(b.cost)) · \(formatTokens(b.outputTokens)) out / \(formatTokens(b.totalTokens)) total · \(b.messageCount) msgs"))
+            }
 
-                var windowBurnParts: [String] = []
-                if let windowText = b.windowText { windowBurnParts.append(windowText) }
-                if let cph = b.burnRateText { windowBurnParts.append(t("소모율 \(cph)/시간", "burn \(cph)/hr")) }
-                if !windowBurnParts.isEmpty {
-                    addLabel(menu, "  " + windowBurnParts.joined(separator: " · "))
-                }
+            var windowBurnParts: [String] = []
+            if let windowText = b.windowText { windowBurnParts.append(windowText) }
+            if let cph = b.burnRateText { windowBurnParts.append(t("소모율 \(cph)/시간", "burn \(cph)/hr")) }
+            if !windowBurnParts.isEmpty {
+                skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + windowBurnParts.joined(separator: " · "))
+            }
 
-                if let w = b.warning {
-                    addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
-                    if w.level != .none {
-                        let warnColor: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
-                        addColoredLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(b.warningResetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(b.warningResetText) remaining"), color: warnColor)
-                    }
+            if let w = b.warning {
+                skeleton ? addSkeletonLabel(menu)
+                         : addLabel(menu, "  " + t("사용률: \(Int(w.ratio * 100))% (한도 대비)", "Usage: \(Int(w.ratio * 100))% (of limit)"))
+                if w.level != .none {
+                    let warnColor: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
+                    skeleton ? addSkeletonLabel(menu)
+                             : addColoredLabel(menu, "  " + t("⚠️ 사용량 \(Int(w.ratio * 100))% — \(b.warningResetText) 남음", "⚠️ Usage \(Int(w.ratio * 100))% — \(b.warningResetText) remaining"), color: warnColor)
                 }
-                if let tier = b.moodTier {
-                    let scopeWord = t(b.warning != nil ? "사용" : "경과", b.warning != nil ? "used" : "elapsed")
-                    addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"))
+            }
+            if let tier = b.moodTier {
+                let scopeWord = t(b.warning != nil ? "사용" : "경과", b.warning != nil ? "used" : "elapsed")
+                skeleton ? addSkeletonLabel(menu)
+                         : addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"))
+            }
+        } else {
+            addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
+            addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
+        }
+        menu.addItem(.separator())
+
+        // ── Model Section ──
+        if let model = model {
+            addSectionHeader(menu, t(model.headerKo, model.headerEn))
+            switch model.shape {
+            case .namesOnly(let names):
+                for m in names {
+                    skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  \(shortModelName(m))")
                 }
-            } else {
-                addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
-                addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
+            case .breakdown(let items, let unknownCount):
+                for item in items {
+                    skeleton ? addSkeletonLabel(menu)
+                             : addLabel(menu, "  \(paddedModelColumn(item.model))  \(formatTokens(item.tokens))  \(formatCost(item.cost))")
+                }
+                if unknownCount > 0 {
+                    skeleton ? addSkeletonLabel(menu)
+                             : addLabel(menu, "  " + t("⚠ 미상 모델 \(unknownCount)종 (추정 단가 적용)", "⚠ \(unknownCount) unknown model(s) (estimated pricing applied)"))
+                }
             }
             menu.addItem(.separator())
+        }
 
-            // ── Model Section ──
-            if let model = model {
-                addSectionHeader(menu, t(model.headerKo, model.headerEn))
-                switch model.shape {
-                case .namesOnly(let names):
-                    for m in names { addLabel(menu, "  \(shortModelName(m))") }
-                case .breakdown(let items, let unknownCount):
-                    for item in items {
-                        addLabel(menu, "  \(paddedModelColumn(item.model))  \(formatTokens(item.tokens))  \(formatCost(item.cost))")
-                    }
-                    if unknownCount > 0 {
-                        addLabel(menu, "  " + t("⚠ 미상 모델 \(unknownCount)종 (추정 단가 적용)", "⚠ \(unknownCount) unknown model(s) (estimated pricing applied)"))
-                    }
-                }
-                menu.addItem(.separator())
+        // ── Today Section ──
+        addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
+        if today.hasUsage {
+            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("전체 토큰: \(formatTokens(today.totalTokens))", "Total Tokens: \(formatTokens(today.totalTokens))"))
+            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("예상 비용: \(formatCost(today.totalCost))", "Estimated Cost: \(formatCost(today.totalCost))"))
+            if let mc = today.messageCount {
+                skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("메시지 수: \(mc)건", "Messages: \(mc)"))
             }
+            for mb in today.modelBreakdown ?? [] {
+                skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  \(paddedModelColumn(mb.model))  \(formatTokens(mb.tokens))  \(formatCost(mb.cost))")
+            }
+        } else {
+            addLabel(menu, "  " + t("사용 없음", "No usage"))
+        }
+        menu.addItem(.separator())
 
-            // ── Today Section ──
-            addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
-            if today.hasUsage {
-                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(today.totalTokens))", "Total Tokens: \(formatTokens(today.totalTokens))"))
-                addLabel(menu, "  " + t("예상 비용: \(formatCost(today.totalCost))", "Estimated Cost: \(formatCost(today.totalCost))"))
-                if let mc = today.messageCount {
-                    addLabel(menu, "  " + t("메시지 수: \(mc)건", "Messages: \(mc)"))
-                }
-                for mb in today.modelBreakdown ?? [] {
-                    addLabel(menu, "  \(paddedModelColumn(mb.model))  \(formatTokens(mb.tokens))  \(formatCost(mb.cost))")
-                }
-            } else {
-                addLabel(menu, "  " + t("사용 없음", "No usage"))
-            }
+        // ── All-Time Section (캐시 경로는 stats.cumulative 없으면 통째로 생략) ──
+        if let allTime = allTime {
+            addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
+            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("전체 토큰: \(formatTokens(allTime.totalTokens))", "Total Tokens: \(formatTokens(allTime.totalTokens))"))
+            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("예상 비용: \(formatCost(allTime.totalCost))", "Estimated Cost: \(formatCost(allTime.totalCost))"))
             menu.addItem(.separator())
+        }
 
-            // ── All-Time Section (캐시 경로는 stats.cumulative 없으면 통째로 생략) ──
-            if let allTime = allTime {
-                addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
-                addLabel(menu, "  " + t("전체 토큰: \(formatTokens(allTime.totalTokens))", "Total Tokens: \(formatTokens(allTime.totalTokens))"))
-                addLabel(menu, "  " + t("예상 비용: \(formatCost(allTime.totalCost))", "Estimated Cost: \(formatCost(allTime.totalCost))"))
-                menu.addItem(.separator())
-            }
-
+        if !skeleton {
             appendGamificationSection(menu)
         }
     }
@@ -2101,11 +2186,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     // ── 폴백 경로: stats-cache.json 부재 시 JSONL 직접 파싱(추정 단가) ──
     func buildMenuFromEntries() {
         updateStatusBarTitleFromEntries()
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        renderBlockMenu(makeBlockDisplayData(fromEntries: cachedAll, reader: reader), into: menu)
+        let data = makeBlockDisplayData(fromEntries: cachedAll, reader: reader)
+        lastBlockDisplayData = data
+        let menu = obtainMainMenu()
+        menu.removeAllItems()
+        renderBlockMenu(data, into: menu)
         appendFooter(menu)
-        statusItem.menu = menu
     }
 
     // ── 폴백 경로(JSONL 직접 파싱, 추정 단가) 뷰모델 어댑터 ──
@@ -2208,6 +2294,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate {
     // addLabel과 폰트는 동일하되 색만 지정 — 진행률 바/경고 배너처럼 상태에 따라 색이 바뀌는 줄용.
     func addColoredLabel(_ menu: NSMenu, _ title: String, color: NSColor) {
         menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), color: color))
+    }
+
+    // 로딩 스켈레톤 전용 — 실제 값 대신 회색 placeholder 막대 하나. addLabel/addHeroLabel과 동일한
+    // 폰트 크기를 골라 쓸 수 있게 해(big:) 실제 값이 도착했을 때 행 높이가 흔들리지 않게 한다.
+    private func addSkeletonLabel(_ menu: NSMenu, big: Bool = false) {
+        let font = big ? NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold)
+                       : NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        menu.addItem(infoRowItem("  ░░░░░░░░░░░░", font: font, color: .tertiaryLabelColor))
     }
 
     // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
