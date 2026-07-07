@@ -338,14 +338,13 @@ enum RefreshSettings {
 // 사용자의 화면은 변화 없어야 한다.
 
 enum FunModeFeature: String, CaseIterable {
-    case moodIcon, streakSection, celebrations, refreshFlash
+    case moodIcon, streakSection, celebrations
 
     var label: String {
         switch self {
         case .moodIcon:      return t("무드 아이콘", "Mood Icon")
         case .streakSection: return t("연속 사용 기록", "Streak Record")
         case .celebrations:  return t("마일스톤 축하", "Milestone Celebrations")
-        case .refreshFlash:  return t("새로고침 반짝임", "Refresh Sparkle")
         }
     }
 
@@ -545,8 +544,13 @@ class UsageDataReader {
     }
     private var fileCache: [String: FileCacheState] = [:]
 
-    init() {
-        homeDir = FileManager.default.homeDirectoryForCurrentUser
+    // 이번 readAll() 호출에서 파일이 하나라도 바뀌었는지 — false면 cachedEntries가 직전 호출과
+    // 완전히 동일하다는 뜻이므로, 호출부(refresh())가 cachedAll 기반 전체 재계산(스트릭/마일스톤)을
+    // 스킵할 근거로 쓴다.
+    private(set) var lastReadChanged: Bool = true
+
+    init(homeDir: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        self.homeDir = homeDir
     }
 
     var projectsDir: URL { homeDir.appendingPathComponent(".claude/projects") }
@@ -557,6 +561,7 @@ class UsageDataReader {
         guard fm.fileExists(atPath: projectsDir.path) else {
             fileCache.removeAll()
             cachedEntries = []
+            lastReadChanged = true
             return []
         }
 
@@ -564,9 +569,16 @@ class UsageDataReader {
             at: projectsDir,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
-        ) else { return [] }
+        ) else {
+            // enumerator(at:)가 nil을 반환하는 경우 이 호출은 아무 것도 관찰하지 못한 것이지 "변경
+            // 없음을 확인함"이 아니므로, 직전 호출의 lastReadChanged를 그대로 흘려보내지 않게
+            // 명시적으로 되돌린다.
+            lastReadChanged = false
+            return cachedEntries
+        }
 
         var present = Set<String>()
+        var didChange = false
 
         for case let fileURL as URL in enumerator {
             guard fileURL.pathExtension == "jsonl" else { continue }
@@ -578,6 +590,7 @@ class UsageDataReader {
             // 크기 동일 → 변경 없음, 캐시 재사용 (파일 미오픈)
             if let cached = fileCache[path], cached.size == size { continue }
 
+            didChange = true
             let sessionId = fileURL.deletingPathExtension().lastPathComponent
 
             if let cached = fileCache[path], size > cached.size {
@@ -594,7 +607,15 @@ class UsageDataReader {
         // 사라진 파일 캐시 제거
         for key in Array(fileCache.keys) where !present.contains(key) {
             fileCache.removeValue(forKey: key)
+            didChange = true
         }
+
+        lastReadChanged = didChange
+        // 변경된 파일이 하나도 없으면 이번 사이클의 전역 병합+dedupe+정렬(라이프타임 엔트리 수 N에
+        // 비례하는 O(N log N))만 스킵하고 직전 병합 결과를 재사용한다 — 단, 위 FileManager.enumerator
+        // 순회 + 파일별 fileSizeKey stat(파일 수 F에 비례하는 O(F))는 이 스킵과 무관하게 매
+        // readAll() 호출마다 항상 실행된다.
+        guard didChange else { return cachedEntries }
 
         // 전역 병합 + UUID 중복 제거 (빈 uuid는 dedupe 대상 아님)
         var seen = Set<String>()
@@ -751,6 +772,28 @@ struct UsageStats {
     }
 }
 
+// 블록 내 엔트리들 중 "토큰 수(총합) 기준"으로 가장 많이 쓴 모델의 원본 모델 문자열을 반환한다.
+// UsageStats.modelBreakdown과 달리 shortModelName()으로 그룹핑하지 않는다 — 표시명 축약은
+// 렌더링 시점(buildTitleParts)에서만 한 번 적용한다는 TitleContext.model 계약을 지키기 위함이다
+// (원본을 여기서 미리 축약하면 buildTitleParts가 다시 shortModelName()을 적용해 이중 축약이 되고,
+// family-버전 사이 구분자가 하이픈→공백으로 바뀌어 버전 정보가 유실될 수 있다).
+// 동점 시 모델 문자열 알파벳순으로 결정론적으로 선택한다(Dictionary 순회 순서는 비결정적이므로
+// 순서에 의존하면 실행마다 다른 결과가 나올 수 있다). 빈 배열이면 nil.
+func mostUsedModel(in entries: [UsageEntry]) -> String? {
+    var totals: [String: Int] = [:]
+    for e in entries {
+        totals[e.model, default: 0] += e.totalTokens
+    }
+    var best: (model: String, tokens: Int)?
+    for (model, tokens) in totals {
+        if let b = best, !(tokens > b.tokens || (tokens == b.tokens && model < b.model)) {
+            continue
+        }
+        best = (model, tokens)
+    }
+    return best?.model
+}
+
 // MARK: - Formatters
 
 func formatTokens(_ n: Int) -> String {
@@ -758,6 +801,43 @@ func formatTokens(_ n: Int) -> String {
     case 0..<1_000:     return "\(n)"
     case 0..<1_000_000: return String(format: "%.1fK", Double(n) / 1_000)
     default:            return String(format: "%.2fM", Double(n) / 1_000_000)
+    }
+}
+
+extension String {
+    // padding(toLength:withPad:startingAt:)는 오른쪽 패딩만 지원해 왼쪽 패딩용으로 직접 추가.
+    func leftPad(to width: Int, with pad: String) -> String {
+        let deficit = width - count
+        guard deficit > 0 else { return self }
+        return String(repeating: pad, count: deficit) + self
+    }
+}
+
+// 타이틀 전용 — 각 자릿수 구간(정수/K/M) 내부에서 폭을 고정해 refresh마다 값이 오를 때 생기는
+// 잦은 타이틀 폭 흔들림을 줄인다. 구간 경계(999→1.0K 등, 블록 생애주기에 드물게 1회)는 정보
+// 손실 없이 고정할 수 없어 그대로 둔다. 피겨 스페이스(U+2007)는 San Francisco 등 타이틀에 쓰는
+// monospacedDigitSystemFont 계열에서 숫자와 동일 폭을 갖도록 설계된 문자라 패딩에 적합하다.
+func formatTokensStable(_ n: Int) -> String {
+    let figureSpace = "\u{2007}"
+    switch n {
+    case 0..<1_000:
+        return String(n).leftPad(to: 3, with: figureSpace)
+    case 0..<1_000_000:
+        let kText = String(format: "%.1fK", Double(n) / 1_000)
+        // 반올림으로 999.9K를 넘겨 "1000.0K"(7자)가 되면 구간 내 폭 고정이 깨지므로, 그 값은
+        // 정보 손실 없이 M 단위로 승격해 표시한다(예: 999,950 → "1.00M").
+        if kText.count > 6 {
+            return String(format: "%.2fM", Double(n) / 1_000_000).leftPad(to: 7, with: figureSpace)
+        }
+        return kText.leftPad(to: 6, with: figureSpace)
+    default:
+        let mText = String(format: "%.2fM", Double(n) / 1_000_000)
+        // 이 앱이 다루는 5시간 블록/일간/누적 토큰 규모를 크게 벗어나는 극단치(약 10억 근접)에서만
+        // 발생 — B(10억) 단위 버킷을 새로 만들기보다 폭 고정을 지키는 쪽을 택해 상한 고정 표기한다.
+        if mText.count > 7 {
+            return "999.99M"
+        }
+        return mText.leftPad(to: 7, with: figureSpace)
     }
 }
 
@@ -840,6 +920,21 @@ func flameStage(for tier: MoodTier) -> FlameStage {
     }
 }
 
+// flame/blaze 단계 전용 흔들림(flicker) 애니메이션 튜닝 포인트.
+let flameFlickerInterval: TimeInterval = 0.2   // 흔들림 재계산 주기(초당 5회, 상태바 이미지만 재대입 — 가벼움)
+let flameFlickerPeriod: TimeInterval = 1.6      // 메인(느린) 숨쉬기 흔들림 한 주기(초)
+
+// 시간 기반 흔들림 값(대략 -1...1). elapsed는 보통 Date().timeIntervalSinceReferenceDate를 그대로 넣는다.
+// 느린 주성분(flameFlickerPeriod, 전체가 숨쉬듯 부풀었다 줄었다)에 더 빠르고 진폭 작은 보조
+// 성분(주기 ≈ 0.31배, 끝이 날름거리듯 잔떨림)을 얹어 완전한 주기성을 깬다 — 단일 sin 하나만 쓰면
+// 좌우로 똑같은 리듬으로 왔다갔다하는 "흔들의자" 같은 인상이라 실제 불꽃의 불규칙한 일렁임과는
+// 거리가 멀다. phaseShift로 서로 다른 위상을 줘 blaze의 메인/곁불꽃이 따로 움직이게 한다.
+func flameSway(elapsed: TimeInterval, phaseShift: Double = 0) -> CGFloat {
+    let slow = sin(elapsed * 2.0 * .pi / flameFlickerPeriod + phaseShift)
+    let fast = sin(elapsed * 2.0 * .pi / (flameFlickerPeriod * 0.31) + phaseShift * 1.7) * 0.4
+    return CGFloat(slow + fast) / 1.4   // 두 성분 합의 최대치(1.4)로 나눠 대략 -1...1로 정규화
+}
+
 // 무드 글리프의 "모양" 테마 — 색(TitleFieldColor)은 테마와 무관하게 MoodTier.color 그대로 쓴다.
 // 자유 텍스트 입력을 허용하지 않는 이유: 컬러 프레젠테이션 이모지를 넣으면 위 색상 틴팅이 조용히
 // 먹히지 않기 때문에(:712 주석 참고), 색 틴팅이 검증된 텍스트 프레젠테이션 글리프로만 구성된
@@ -913,18 +1008,52 @@ func moodSignatureImage(tier: MoodTier) -> NSImage {
     return image
 }
 
+// flame 테마 전용 배색 — circles/bars/signature 테마가 공유하는 MoodTier.color(회색/초록/노랑/
+// 주황/빨강 "신호등" 배색)와는 별개다. 저 배색을 그대로 썼다면 calm이 초록으로 나와 "불씨"라는
+// 형태와 어긋난다. 빨강은 critical 전용으로 예약해(calm/warm/hot은 노랑~주황 범위에서만 움직임)
+// 낮은 진행률에서 빨강이 섞여 "한도를 다 썼다"는 오해를 주지 않게 한다. inner가 nil이면(idle)
+// 코어 하이라이트 없이 완전히 식은 색만 쓴다 — idle은 활성 블록이 없는 상태라 실제로 "타는 중"이
+// 아니므로 불꽃 코어를 얹지 않는다.
+func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
+    switch tier {
+    case .idle:
+        return (NSColor(calibratedWhite: 0.55, alpha: 1), nil)
+    case .calm:
+        return (NSColor(calibratedRed: 0.72, green: 0.24, blue: 0.10, alpha: 1),
+                NSColor(calibratedRed: 0.95, green: 0.55, blue: 0.20, alpha: 1))
+    case .warm:
+        return (NSColor(calibratedRed: 0.95, green: 0.45, blue: 0.05, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.80, blue: 0.20, alpha: 1))
+    case .hot:
+        return (NSColor(calibratedRed: 0.92, green: 0.32, blue: 0.04, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.85, blue: 0.25, alpha: 1))
+    case .critical:
+        return (NSColor(calibratedRed: 0.88, green: 0.16, blue: 0.10, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.90, blue: 0.35, alpha: 1))
+    }
+}
+
 // flame 테마 전용 커스텀 벡터 아이콘 — 이모지 🔥 대신 Core Graphics로 직접 그려 색 틴팅이
 // 정상 동작하게 한다(파일 상단 MoodGlyphTheme 주석 참고). FlameStage(3단계: 불씨/불꽃/화염)에
 // 따라 실루엣 자체가 커지고 복잡해진다 — 불씨는 화염 모양이 아니라 둥근 점, 불꽃은 표준 화염
-// 한 덩이, 화염은 메인 화염 옆에 곁불꽃이 하나 더 붙는다. 색은 tier.color를 그대로 써서(5단계)
-// 형태(3단계) 위에 세밀한 색 피드백을 얹는다.
-func moodFlameImage(tier: MoodTier) -> NSImage {
+// 한 덩이, 화염은 메인 화염 옆에 곁불꽃이 하나 더 붙는다. flameColors(for:)의 outer/inner 2톤을
+// 겹쳐 칠해 실제 불꽃처럼 겉은 진하고 속은 밝은 느낌을 낸다 — 코어는 같은 실루엣을 가로 55%·
+// 세로 70%로 줄이고 바닥은 그대로 맞춰(가운데 정렬 아님) 밑에서부터 차오르는 것처럼 보이게 한다.
+// elapsed(기본 0)를 넘기면 flame/blaze 단계 실루엣이 flameSway()로 미세하게 일렁인다 — ember는
+// 항상 elapsed와 무관하게 정적이다(flameBezierPath 참고).
+func moodFlameImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
-    let color = tier.color.nsColor ?? .labelColor
+    let colors = flameColors(for: tier)
+    let stage = flameStage(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
-        let path = flameBezierPath(stage: flameStage(for: tier), in: rect)
-        color.setFill()
-        path.fill()
+        colors.outer.setFill()
+        flameBezierPath(stage: stage, in: rect, elapsed: elapsed).fill()
+        if let inner = colors.inner {
+            let coreRect = CGRect(x: rect.midX - rect.width * 0.275, y: rect.minY,
+                                   width: rect.width * 0.55, height: rect.height * 0.70)
+            inner.setFill()
+            flameBezierPath(stage: stage, in: coreRect, elapsed: elapsed).fill()
+        }
         return true
     }
     image.isTemplate = false
@@ -933,23 +1062,33 @@ func moodFlameImage(tier: MoodTier) -> NSImage {
 
 // 단일 화염 실루엣 — 정규화 좌표(밑변 중앙이 원점)로 정의한 뒤 rect에 맞춰 스케일한다.
 // lean이 클수록 끝이 오른쪽으로(음수면 왼쪽으로) 기울어 "일렁이는" 인상을 준다.
+// 밑변은 평평하게(불꽃이 바닥에 "앉은" 인상), 옆선은 각각 단일 베지어 한 번으로 배(볼록)에서
+// 끝까지 S자로 휘어 오르게 해 물방울과 구분되는 "일렁이는 불꽃" 실루엣을 만든다. 앵커를 늘려
+// 허리/어깨 단을 추가로 넣어본 적이 있는데, 양쪽을 대칭으로 접으면 마디가 층층이 쌓인 모양이
+// 되어(💩 실루엣과 흡사) 오히려 나빠졌다 — 그래서 옆선마다 앵커 하나(밑변 끝)에서 끝(tip)까지
+// 곡선 1개로만 잇는다. 앵커가 적을수록 이어붙는 지점에서 생기는 꺾임(kink) 위험도 준다.
+// 배(볼록) 제어점은 캔버스 경계(u=0.03/0.97)에 바짝 붙이지 않고 안쪽으로 당겨(0.12/0.88)
+// 완만하게 잡는다 — 실제 곡선은 캔버스 안에 여유를 두고 그려짐에도(경계 밖으로 잘리는 게
+// 아님), 아이콘이 11x14pt라는 극히 작은 크기로 렌더링되다 보니 배→끝 구간의 급격한 곡률이
+// 매끄러운 곡선이 아니라 뭉툭/각진 "직선으로 잘린 듯한" 인상으로 보였다. 제어점을 완만하게
+// 당기면 같은 작은 크기에서도 둥근 물방울 형태로 또렷하게 읽힌다.
 private func singleFlamePath(in rect: CGRect, lean: CGFloat) -> NSBezierPath {
     func pt(_ u: CGFloat, _ v: CGFloat) -> CGPoint {
         CGPoint(x: rect.minX + u * rect.width, y: rect.minY + v * rect.height)
     }
     let path = NSBezierPath()
-    path.move(to: pt(0.5, 0.0))
-    path.curve(to: pt(0.08, 0.42), controlPoint1: pt(0.30, 0.05), controlPoint2: pt(0.02, 0.20))
-    path.curve(to: pt(0.30, 0.68), controlPoint1: pt(0.14, 0.60), controlPoint2: pt(0.18, 0.72))
-    path.curve(to: pt(0.5 + lean, 1.0), controlPoint1: pt(0.38, 0.82), controlPoint2: pt(0.46 + lean * 0.5, 0.94))
-    path.curve(to: pt(0.68, 0.66), controlPoint1: pt(0.58 + lean * 0.5, 0.90), controlPoint2: pt(0.80, 0.74))
-    path.curve(to: pt(0.90, 0.38), controlPoint1: pt(0.62, 0.58), controlPoint2: pt(0.96, 0.50))
-    path.curve(to: pt(0.5, 0.0), controlPoint1: pt(0.98, 0.22), controlPoint2: pt(0.68, 0.02))
+    path.move(to: pt(0.22, 0.0))
+    path.line(to: pt(0.78, 0.0))
+    path.curve(to: pt(0.5 + lean, 1.0), controlPoint1: pt(0.88, 0.36), controlPoint2: pt(0.50 + lean * 0.3, 0.80))
+    path.curve(to: pt(0.22, 0.0), controlPoint1: pt(0.50 + lean * 0.3, 0.80), controlPoint2: pt(0.12, 0.36))
     path.close()
     return path
 }
 
-private func flameBezierPath(stage: FlameStage, in rect: CGRect) -> NSBezierPath {
+// elapsed(기본 0)는 flame/blaze 단계에서만 쓰인다 — ember는 무시해 항상 정적으로 유지한다
+// (모니터링 활성 블록이 없는 idle/calm 상태에 흔들림을 주면 "계산이 진행 중"이라는 정보와
+// 어긋나므로 의도적으로 제외).
+private func flameBezierPath(stage: FlameStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
     switch stage {
     case .ember:
         // 화염 실루엣이 아니라 바닥에 깔린 작고 둥근 불씨 — 높이 canvas의 ~42%
@@ -958,20 +1097,26 @@ private func flameBezierPath(stage: FlameStage, in rect: CGRect) -> NSBezierPath
         let emberRect = CGRect(x: rect.midX - width / 2, y: rect.minY, width: width, height: height)
         return NSBezierPath(ovalIn: emberRect)
     case .flame:
-        // 표준 물방울형 화염 실루엣 — 높이 ~78%, 살짝 기울어진 단일 불꽃
-        let height = rect.height * 0.78
+        // 표준 물방울형 화염 실루엣 — 높이 ~78%, 살짝 기울어진 단일 불꽃. flameSway로 높이(±7%)와
+        // lean(±16%)을 흔들어 "타오르는" 느낌을 낸다 — lean은 singleFlamePath 정의상 끝부분(v≈1)
+        // 제어점만 크게 움직이므로 뿌리는 고정된 채 끝만 날름거리는 모양이 자연히 나온다.
+        let sway = flameSway(elapsed: elapsed)
+        let height = rect.height * (0.78 + sway * 0.07)
         let flameRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: height)
-        return singleFlamePath(in: flameRect, lean: 0.12)
+        return singleFlamePath(in: flameRect, lean: 0.03 + sway * 0.16)
     case .blaze:
-        // 메인 화염(높이 ~98%) + 옆에 작은 곁불꽃 — 가장 크고 밝은 단계
-        let mainHeight = rect.height * 0.98
-        let mainRect = CGRect(x: rect.minX + rect.width * 0.12, y: rect.minY,
+        // 메인 화염(높이 ~98%) + 옆에 작은 곁불꽃 — 가장 크고 밝은 단계. 메인/곁불꽃에 서로 다른
+        // 위상의 sway를 줘 두 불꽃이 따로 움직이게 하고, x에도 미세한 흔들림을 더해 함께 춤추듯 보이게 한다.
+        let mainSway = flameSway(elapsed: elapsed)
+        let mainHeight = rect.height * (0.98 + mainSway * 0.07)
+        let mainRect = CGRect(x: rect.minX + rect.width * 0.12 + mainSway * rect.width * 0.02, y: rect.minY,
                                width: rect.width * 0.75, height: mainHeight)
-        let main = singleFlamePath(in: mainRect, lean: 0.08)
-        let sideHeight = rect.height * 0.55
-        let sideRect = CGRect(x: rect.minX - rect.width * 0.05, y: rect.minY,
+        let main = singleFlamePath(in: mainRect, lean: 0.03 + mainSway * 0.16)
+        let sideSway = flameSway(elapsed: elapsed, phaseShift: 2.4)
+        let sideHeight = rect.height * (0.55 + sideSway * 0.07)
+        let sideRect = CGRect(x: rect.minX - rect.width * 0.05 + sideSway * rect.width * 0.02, y: rect.minY,
                                width: rect.width * 0.5, height: sideHeight)
-        main.append(singleFlamePath(in: sideRect, lean: -0.15))
+        main.append(singleFlamePath(in: sideRect, lean: -0.06 + sideSway * 0.16))
         return main
     }
 }
@@ -985,7 +1130,11 @@ func moodImageToApply(tier: MoodTier?) -> NSImage? {
     guard TitleSettings.icon() != .none,
           theme.isImageBased,
           let tier = tier else { return nil }
-    return theme == .signature ? moodSignatureImage(tier: tier) : moodFlameImage(tier: tier)
+    // flame 테마는 refresh 트리거 시점에도 refreshFlameFlicker()가 매 0.2초마다 그리는 것과 동일한
+    // "지금 시각" 흔들림 프레임을 써야 한다 — elapsed를 0으로 고정하면 매 refresh마다 아이콘이 rest
+    // 포즈로 스냅됐다가 최대 0.2초 뒤 흔들림 타이머가 되돌리는 깜빡임이 생긴다.
+    return theme == .signature ? moodSignatureImage(tier: tier)
+                                : moodFlameImage(tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
 }
 
 extension TitleSettings {
@@ -1215,14 +1364,14 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     }
     for field in TitleSettings.enabledFieldsInOrder() {
         switch field {
-        case .outputTokens:     parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
-        case .totalTokens:      parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: TitleSettings.color(for: field)))
+        case .outputTokens:     parts.append(TitlePart(text: formatTokensStable(ctx.outputTokens), color: TitleSettings.color(for: field)))
+        case .totalTokens:      parts.append(TitlePart(text: formatTokensStable(ctx.totalTokens), color: TitleSettings.color(for: field)))
         case .cost:             parts.append(TitlePart(text: formatCost(ctx.cost), color: TitleSettings.color(for: field)))
         case .remainingTime:    if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: TitleSettings.color(for: field))) }
         case .model:            if let m = ctx.model { parts.append(TitlePart(text: shortModelName(m), color: TitleSettings.color(for: field))) }
-        case .todayTokens:      parts.append(TitlePart(text: formatTokens(ctx.todayTokens), color: TitleSettings.color(for: field)))
+        case .todayTokens:      parts.append(TitlePart(text: formatTokensStable(ctx.todayTokens), color: TitleSettings.color(for: field)))
         case .todayCost:        parts.append(TitlePart(text: formatCost(ctx.todayCost), color: TitleSettings.color(for: field)))
-        case .cumulativeTokens: parts.append(TitlePart(text: formatTokens(ctx.cumulativeTokens), color: TitleSettings.color(for: field)))
+        case .cumulativeTokens: parts.append(TitlePart(text: formatTokensStable(ctx.cumulativeTokens), color: TitleSettings.color(for: field)))
         }
     }
     return parts
@@ -1473,11 +1622,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var celebrationBadgeExpiresAt: Date? = nil
     private var celebrationBadgeTimer: Timer? = nil
     private let celebrationBadgeDuration: TimeInterval = 15
-    // 자동/수동 새로고침 직후 잠깐 나타났다 사라지는 반짝임 — celebrationBadge와 동일한
-    // "일회성 타이머로 만료 시점에 updateStatusBarTitle()만 재호출" 패턴.
-    private var refreshFlashExpiresAt: Date? = nil
-    private var refreshFlashTimer: Timer? = nil
-    private let refreshFlashDuration: TimeInterval = 1.5
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
     // 아래 6개도 동일한 이유로 유지 — appendFooter()는 이제 obtainMainMenu()가 메인 메뉴 최초
@@ -1498,6 +1642,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var bodyItemCount = 0  // replaceBody(with:)가 이 개수만큼만 메인 메뉴 맨 앞에서 교체한다
     private var footerLocalizedItems: [(NSMenuItem, () -> String)] = []  // 언어 전환 시 footer title 패치용
     private weak var refreshButtonRow: NSMenuItem?  // "지금 새로고침"의 커스텀 뷰 항목 — 언어 전환 시 버튼 타이틀만 따로 patch
+    private var coldStartTimer: Timer?  // 콜드 스타트(앱 최초 실행) 전용 로딩 점 순환 애니메이션 — 이후 refresh에는 관여하지 않음
+    private var coldStartDotPhase = 0  // 0...3, 표시 폭 고정을 위해 미표시 구간은 공백으로 패딩
+    private(set) var flameFlickerTimer: Timer?  // flame/blaze 단계에서만 syncFlameFlickerTimer()가 시작/중지한다
+    private var lastMoodTier: MoodTier?  // 흔들림 타이머가 재사용할, 가장 최근 refresh에서 계산된 tier
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyDefaultsIfNeeded()
@@ -1505,10 +1653,52 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)  // Hide from Dock
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        renderTitle(plain: "\(titleIconPrefix())…", warning: nil)
+        startColdStartAnimation()
 
         refresh()
         rescheduleTimer()
+    }
+
+    // 콜드 스타트 동안만 타이틀/메뉴 헤더에 점 순환("불러오는 중.", "..", "...")을 보여준다. 수동/자동
+    // refresh 경로는 건드리지 않는다(기존 설계 의도인 "정보량 없는 반복 깜빡임 방지"를 그대로 유지).
+    // renderColdStartFrame()이 replaceBody(_:)를 무조건 1회 호출해 obtainMainMenu()를 통해
+    // statusItem.menu를 즉시 부착한다 — 그렇지 않으면 첫 buildMenu()가 끝나기 전까지 메뉴가 없어
+    // 콜드 스타트 도중 아이콘 클릭이 무반응이 된다.
+    private func startColdStartAnimation() {
+        coldStartTimer?.invalidate()
+        coldStartDotPhase = 0
+        renderColdStartFrame(forceBody: true)  // 최초 1회는 메뉴 부착을 위해 mainMenuIsOpen과 무관하게 렌더
+        coldStartTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
+            self?.tickColdStartAnimation()
+        }
+    }
+
+    private func tickColdStartAnimation() {
+        coldStartDotPhase = (coldStartDotPhase + 1) % 4
+        renderColdStartFrame(forceBody: false)
+    }
+
+    private func renderColdStartFrame(forceBody: Bool) {
+        let dots = String(repeating: ".", count: coldStartDotPhase)
+            .padding(toLength: 3, withPad: " ", startingAt: 0)
+        renderTitle(plain: "\(titleIconPrefix())\(dots)", warning: nil)
+        guard forceBody || mainMenuIsOpen else { return }
+        replaceBody { menu in
+            self.appendLoadingHeader(menu, dots: dots)
+        }
+    }
+
+    // 로딩 중 메뉴 헤더("⏳ 불러오는 중...") + 마지막 갱신 시각 라벨 조합 — 콜드 스타트 점 애니메이션과
+    // 스켈레톤 폴백(직전 렌더 shape 없음) 양쪽에서 동일한 두 줄 구성을 공유한다.
+    private func appendLoadingHeader(_ menu: NSMenu, dots: String) {
+        addSectionHeader(menu, t("⏳ 불러오는 중\(dots)", "⏳ Loading\(dots)"))
+        appendLastUpdatedLabel(menu)
+    }
+
+    // 콜드 스타트 첫 refresh()가 완료되면 애니메이션을 멈춘다 — 두 번째 refresh부터는 이미 nil이라 무해하다.
+    private func stopColdStartAnimation() {
+        coldStartTimer?.invalidate()
+        coldStartTimer = nil
     }
 
     // 갱신 주기 변경 시 기존 타이머를 무효화하고 새 간격으로 재스케줄
@@ -1530,9 +1720,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if manual {
             // 수동 새로고침은 사용자가 직접 트리거한 행위라 즉각적인 피드백이 유용하다. 자동
             // 백그라운드 틱(10초~5분마다)에는 적용하지 않는다 — 정보량 없이 매번 깜빡이면
-            // 예전에 제거한 무드 펄스처럼 산만함만 재도입하게 된다. 최초 기동 시 쓰던 것과
-            // 동일한 "…" placeholder를 재사용한다(applicationDidFinishLaunching 참고).
-            renderTitle(plain: "\(titleIconPrefix())…", warning: nil)
+            // 예전에 제거한 무드 펄스처럼 산만함만 재도입하게 된다. 예전엔 타이틀 전체를 "…"로
+            // 치환해 폭이 흔들렸으나, 텍스트는 그대로 두고 버튼 투명도만 낮춰 폭 변화 없이 "처리
+            // 중"을 표시한다 — 아래 완료 시점에 1.0으로 복원.
+            statusItem.button?.alphaValue = 0.55
         }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
@@ -1542,10 +1733,17 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.cachedStats = stats
                 self.cachedAll = entries
                 self.lastUpdateTime = Date()
+                self.stopColdStartAnimation()  // 콜드 스타트 첫 refresh 완료 — 이후 buildMenu()가 실데이터로 덮어씀
+                // 게이미피케이션 기록/이스터에그 워터마크는 항상 재계산한다 — readAll()의 O(N log N)
+                // 병합·정렬 스킵과 달리 이 둘은 cachedAll 위 단일 패스 필터/집계라 비용이 낮고 스킵할
+                // 근거가 안 된다. updateGamificationRecord()는 "오늘 자정"이라는 벽시계 시각에
+                // 의존하므로 JSONL이 하루 종일 안 바뀌어도 자정이 지나면 오늘 토큰/비용을 0으로
+                // 리셋해야 하고, updateEasterEggState()의 justCrossed*는 다음 호출에서 스스로 nil로
+                // 돌아가는 자기소멸 설계라 게이팅하면 "🎉 마일스톤" 배지가 영구 고정된다.
                 self.updateGamificationRecord()
                 self.updateEasterEggState()
-                self.scheduleRefreshFlash()
                 self.buildMenu()
+                if manual { self.statusItem.button?.alphaValue = 1.0 }
                 self.isRefreshing = false
             }
         }
@@ -1559,21 +1757,21 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         replaceBody { menu in
             if let skeleton = self.lastBlockDisplayData?.asLoadingSkeleton() {
                 self.renderBlockMenu(skeleton, into: menu)
+                self.appendLastUpdatedLabel(menu)
             } else {
-                self.addSectionHeader(menu, t("⏳ 불러오는 중…", "⏳ Loading…"))
+                self.appendLoadingHeader(menu, dots: "…")
             }
-            self.appendLastUpdatedLabel(menu)
         }
     }
 
     // 재미 모드와 무관하게 항상 최신 상태로 갱신한다 — 스트릭은 "실제 사용한 날"을 반영해야 하므로
     // 화면에 안 보인다고 건너뛰면 나중에 재미 모드를 켰을 때 그 사이의 활동이 반영되지 않은 잘못된
     // 갭/리셋이 발생한다. 드롭다운 노출만 TitleSettings.isFunModeFeatureEnabled(.streakSection)으로 게이팅한다.
-    func updateGamificationRecord() {
+    func updateGamificationRecord(defaults: UserDefaults = .standard) {
         let todayStart = Calendar.current.startOfDay(for: Date())
         let todayStats = UsageStats(entries: cachedAll.filter { $0.timestamp >= todayStart })
         let today = localDayString(Date())
-        let previous = GamificationSettings.load()
+        let previous = GamificationSettings.load(defaults: defaults)
         let next = computeGamification(previous: previous, today: today,
                                         todayTokens: todayStats.totalTokens, todayCost: todayStats.totalCost)
 
@@ -1584,29 +1782,29 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             (previous.bestDayCost   > 0 && todayStats.totalCost   >= previous.bestDayCost)
 
         if next != previous {
-            GamificationSettings.save(next)
+            GamificationSettings.save(next, defaults: defaults)
         }
     }
 
     // 재미 모드 여부와 무관하게 워터마크는 항상 갱신한다(스트릭/최고기록과 동일한 이유) — 표시가
     // 꺼져 있어도 "이미 넘긴 마일스톤"은 계속 정확히 추적되어야, 나중에 재미 모드를 켰을 때 과거
     // 마일스톤이 몰아서 터지지 않는다. 실제 셀러브레이션 노출만 activeCelebrationBadge()에서 게이팅한다.
-    func updateEasterEggState() {
+    func updateEasterEggState(defaults: UserDefaults = .standard) {
         let lifetimeTokens = UsageStats(entries: cachedAll).totalTokens
-        let prevToken = EasterEggSettings.announcedTokenMilestone()
+        let prevToken = EasterEggSettings.announcedTokenMilestone(defaults: defaults)
         let tokenResult = checkMilestone(currentValue: lifetimeTokens, thresholds: tokenMilestones,
                                           previouslyAnnounced: prevToken)
         if tokenResult.announced != (prevToken ?? -1) {
-            EasterEggSettings.setAnnouncedTokenMilestone(tokenResult.announced)
+            EasterEggSettings.setAnnouncedTokenMilestone(tokenResult.announced, defaults: defaults)
         }
         justCrossedTokenMilestone = tokenResult.justCrossed
 
-        let streakDays = GamificationSettings.load().currentStreakDays
-        let prevStreak = EasterEggSettings.announcedStreakMilestone()
+        let streakDays = GamificationSettings.load(defaults: defaults).currentStreakDays
+        let prevStreak = EasterEggSettings.announcedStreakMilestone(defaults: defaults)
         let streakResult = checkMilestone(currentValue: streakDays, thresholds: streakMilestones,
                                            previouslyAnnounced: prevStreak)
         if streakResult.announced != (prevStreak ?? -1) {
-            EasterEggSettings.setAnnouncedStreakMilestone(streakResult.announced)
+            EasterEggSettings.setAnnouncedStreakMilestone(streakResult.announced, defaults: defaults)
         }
         justCrossedStreakMilestone = streakResult.justCrossed
 
@@ -1642,30 +1840,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return TitlePart(text: text, color: .green)
     }
 
-    // celebrationBadge와 동일한 구조 — 자동 갱신 주기가 refreshFlashDuration(1.5초)보다 훨씬 길
-    // 수 있으므로(최대 5분), 만료 시점에 맞춰 짧은 1회성 타이머로 타이틀만 재계산해 정확히 사라지게
-    // 한다. refresh()가 다시 일어나 만료 전에 재호출되면 만료 시각을 매번 갱신하므로(재호출 시
-    // 이전 타이머는 invalidate) 연속 갱신 중에도 자연스럽게 이어져 보인다.
-    private func scheduleRefreshFlash() {
-        // 꺼져 있으면 아예 스케줄하지 않는다 — 반짝임은 축하 배지의 마일스톤 워터마크처럼 꺼진
-        // 동안에도 정확히 추적해야 할 장기 상태가 없는 순수 코스메틱이라, 매 refresh()마다 불필요한
-        // 타이머를 만들 이유가 없다.
-        guard TitleSettings.isFunModeFeatureEnabled(.refreshFlash) else { return }
-        refreshFlashExpiresAt = Date().addingTimeInterval(refreshFlashDuration)
-        refreshFlashTimer?.invalidate()
-        refreshFlashTimer = Timer.scheduledTimer(withTimeInterval: refreshFlashDuration, repeats: false) { [weak self] _ in
-            self?.updateStatusBarTitle()
-        }
-    }
-
-    // 재미 모드(새로고침 반짝임) ON이고 아직 만료되지 않았을 때만 non-nil. 타이틀 끝에 덧붙이는
-    // TitlePart라 실데이터(아이콘/무드/필드)는 그대로 보이고 끝에 ✨만 잠깐 얹힌다.
-    func activeRefreshFlash() -> TitlePart? {
-        guard TitleSettings.isFunModeFeatureEnabled(.refreshFlash) else { return nil }
-        guard let expires = refreshFlashExpiresAt, expires > Date() else { return nil }
-        return TitlePart(text: "✨", color: .defaultColor)
-    }
-
     func buildMenu() {
         if let stats = cachedStats {
             buildMenu(fromCache: stats)
@@ -1692,12 +1866,55 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return moodTestTierOverride() ?? computeMood(hasActiveBlock: hasActiveBlock, elapsedRatio: elapsedRatio, warning: warning)
     }
 
+    // 실제 tier 재계산 없이 상태바 아이콘만 흔든다 — 타이머 자체의 시작/중지는 applyMood()가 호출하는
+    // syncFlameFlickerTimer()가 담당하고, 여기 있는 조건 체크는 그 판단과 어긋나는 상태에서 우연히
+    // 한 틱이 더 발생해도(예: invalidate 직후 이미 큐잉된 틱) 안전하게 무시하기 위한 방어적 가드이다.
+    private func refreshFlameFlicker() {
+        guard TitleSettings.isFunModeFeatureEnabled(.moodIcon),
+              TitleSettings.icon() != .none,
+              TitleSettings.moodGlyphTheme() == .flame,
+              let tier = lastMoodTier,
+              flameStage(for: tier) != .ember else { return }
+        statusItem.button?.image = moodFlameImage(tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
+    }
+
+    // flame 테마 + 무드 아이콘 on + 아이콘 표시 + 활성 flame/blaze 단계일 때만 타이머를 돌린다. 그 외
+    // 조건에서는 타이머 자체를 멈춰 무의미한 5Hz 백그라운드 깨어남을 없앤다. refreshFlameFlicker()의
+    // 기존 가드는 안전망(방어적 이중 체크)으로 그대로 둔다.
+    private func syncFlameFlickerTimer() {
+        let shouldRun = TitleSettings.isFunModeFeatureEnabled(.moodIcon)
+            && TitleSettings.icon() != .none
+            && TitleSettings.moodGlyphTheme() == .flame
+            && (lastMoodTier.map { flameStage(for: $0) != .ember } ?? false)
+        if shouldRun {
+            guard flameFlickerTimer == nil else { return }
+            flameFlickerTimer = Timer.scheduledTimer(withTimeInterval: flameFlickerInterval, repeats: true) { [weak self] _ in
+                self?.refreshFlameFlicker()
+            }
+        } else {
+            flameFlickerTimer?.invalidate()
+            flameFlickerTimer = nil
+        }
+    }
+
+    // 무드 tier 변경 시 상태바 아이콘과 lastMoodTier를 항상 함께 갱신하는 단일 진입점 — 흔들림
+    // 타이머 시작/중지 판단(syncFlameFlickerTimer())도 여기서 함께 처리해, 향후 호출부가 추가되거나
+    // 복붙 실수가 나도 아이콘/lastMoodTier/타이머가 서로 어긋날 위험이 없다.
+    func applyMood(_ tier: MoodTier?) {
+        lastMoodTier = tier
+        // statusItem은 옵셔널 체이닝으로 접근 — 정상 실행 경로에서는 applicationDidFinishLaunching이
+        // 항상 먼저 statusItem을 만들어 두므로 실질적으로 nil일 일이 없지만, 셀프테스트가 앱 생명주기
+        // 없이 ClaudeMonitorApp() 인스턴스만 만들어 applyMood()를 직접 호출할 수 있게 허용한다(실제
+        // NSStatusItem을 생성하면 테스트 실행 중 사용자의 진짜 메뉴바에 아이콘이 나타나므로 피해야 함).
+        statusItem?.button?.image = moodImageToApply(tier: tier)
+        syncFlameFlickerTimer()
+    }
+
     // buildTitleParts() 결과 맨 앞에 활성 축하 배지(있으면)를 얹는다 — 타이틀을 대체하지 않고
     // 실데이터 파트와 공존시키기 위한 공통 헬퍼.
     private func titlePartsWithBadge(_ ctx: TitleContext) -> [TitlePart] {
         var parts = buildTitleParts(ctx)
         if let badge = activeCelebrationBadge() { parts.insert(badge, at: 0) }
-        if let flash = activeRefreshFlash() { parts.append(flash) }
         return parts
     }
 
@@ -1706,11 +1923,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 렌더링한다(사용자가 고른 구분자가 적용됨).
     func renderIdleTitle(_ label: String) {
         let badge = activeCelebrationBadge()
-        let flash = activeRefreshFlash()
         let moodEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon) && TitleSettings.icon() != .none
-        // signature 테마가 아니거나 무드가 꺼져 있으면 nil을 대입해 이전 프레임 이미지를 지운다.
-        statusItem.button?.image = moodImageToApply(tier: moodEnabled ? (moodTestTierOverride() ?? .idle) : nil)
-        guard badge != nil || flash != nil || moodEnabled else {
+        // signature/flame 테마가 아니거나 무드가 꺼져 있으면 nil을 대입해 이전 프레임 이미지를 지운다.
+        applyMood(moodEnabled ? (moodTestTierOverride() ?? .idle) : nil)
+        guard badge != nil || moodEnabled else {
             renderTitle(plain: "\(titleIconPrefix())\(label)", warning: nil)
             return
         }
@@ -1725,7 +1941,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             parts.append(TitlePart(text: "\(titleIconPrefix())\(label)".trimmingCharacters(in: .whitespaces), color: .defaultColor))
         }
-        if let flash = flash { parts.append(flash) }
         renderTitle(parts: parts, warning: nil)
     }
 
@@ -1734,21 +1949,22 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
         let resetText: String = active.map(resetCountdownText(for:)) ?? ""
         if let b = active {
-            // b.models.last는 CLI가 모델을 처음 발견한 순서라 "최근 사용 모델"이 아닐 수 있다.
-            // 실제 JSONL 엔트리(시간순 정렬됨)에서 블록 구간 내 마지막 모델을 우선 사용.
+            // 블록 구간의 실제 JSONL 엔트리(cachedAll)에서 토큰 수 기준으로 가장 많이 쓴 모델을
+            // 채택한다. b.models 배열은 CLI가 모델을 처음 발견한 순서라 "최다 사용 모델"이 아닐 수
+            // 있으므로 신뢰하지 않는다.
             let start = parseISO8601(b.startTime)
             let end = parseISO8601(b.endTime)
-            let lastModel: String? = {
+            let topModel: String? = {
                 guard let s = start, let e = end else { return nil }
-                return cachedAll.filter { $0.timestamp >= s && $0.timestamp < e }.last?.model
+                return mostUsedModel(in: cachedAll.filter { $0.timestamp >= s && $0.timestamp < e })
             }()
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
-            statusItem.button?.image = moodImageToApply(tier: moodTier)
+            applyMood(moodTier)
             let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
                                    totalTokens: b.totalTokens,
                                    cost: b.costUSD,
                                    remainingText: resetText.isEmpty ? nil : resetText,
-                                   model: lastModel ?? b.models.last,
+                                   model: topModel ?? b.models.last,
                                    moodTier: moodTier,
                                    todayTokens: gamificationTodayTokens,
                                    todayCost: gamificationTodayCost,
@@ -1772,18 +1988,18 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let warning = (block != nil) ? usageWarning(tokens: blockStats.totalTokens, cost: blockStats.totalCost) : nil
 
         if noData {
-            statusItem.button?.image = nil
+            applyMood(nil)
             renderTitle(plain: "\(titleIconPrefix())" + t("데이터 없음", "no data"), warning: nil)
         } else if block == nil {
             renderIdleTitle(t("유휴", "idle"))
         } else if let b = block {
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
-            statusItem.button?.image = moodImageToApply(tier: moodTier)
+            applyMood(moodTier)
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
                                    totalTokens: blockStats.totalTokens,
                                    cost: blockStats.totalCost,
                                    remainingText: b.remaining > 0 ? formatTime(b.remaining) : nil,
-                                   model: blockEntries.last?.model,
+                                   model: mostUsedModel(in: blockEntries), // 블록 내 토큰 수 기준 최다 사용 모델(마지막 사용 모델이 아님)
                                    moodTier: moodTier,
                                    todayTokens: gamificationTodayTokens,
                                    todayCost: gamificationTodayCost,
@@ -2689,6 +2905,37 @@ func runSelfTests() -> Never {
     check(shortModelName("claude-opus-4-8[1m]") == "Opus 4.8", "opus-4-8[1m] → Opus 4.8")
     check(shortModelName("claude-3-5-haiku-20241022") == "Haiku 3.5", "3-5-haiku → Haiku 3.5")
 
+    // mostUsedModel (순수 함수) — 토큰 수 기준 최다 사용 모델, 원본 문자열 유지
+    check(mostUsedModel(in: []) == nil, "mostUsedModel: 빈 배열 → nil")
+
+    check(mostUsedModel(in: [entry(Date(), "claude-opus-4-1-20250805", out: 10)])
+            == "claude-opus-4-1-20250805",
+          "mostUsedModel: 엔트리 1개 → 원본 모델 문자열 그대로 반환(shortModelName 미적용)")
+
+    check(mostUsedModel(in: [
+            entry(Date(), "claude-sonnet-4-5", out: 100),
+            entry(Date(), "claude-opus-4-1-20250805", out: 10),
+            entry(Date(), "claude-opus-4-1-20250805", out: 10),
+          ]) == "claude-sonnet-4-5",
+          "mostUsedModel: 토큰 합계가 더 큰 모델을 선택(등장 개수가 아닌 토큰 기준)")
+
+    check(mostUsedModel(in: [
+            entry(Date(), "claude-sonnet-4-5", out: 30),
+            entry(Date(), "claude-opus-4-1-20250805", out: 20),
+            entry(Date(), "claude-opus-4-1-20250805", out: 20),
+          ]) == "claude-opus-4-1-20250805",
+          "mostUsedModel: 같은 모델의 여러 엔트리 토큰을 합산한 뒤 비교(40 > 30)")
+
+    check(mostUsedModel(in: [
+            entry(Date(), "claude-opus-4-1-20250805", out: 5),
+            entry(Date(), "claude-sonnet-4-5", out: 5),
+          ]) == "claude-opus-4-1-20250805",
+          "mostUsedModel: 토큰 수 동점이면 모델 문자열 알파벳순으로 결정론적 선택")
+
+    check(mostUsedModel(in: [entry(Date(), "claude-opus-4-1-20250805", out: 1)])
+            .map(shortModelName) == "Opus 4.1",
+          "mostUsedModel: 결과에 shortModelName()을 적용하면 정상 축약됨(원본 보존 확인, 이중 축약 아님)")
+
     // getPricing
     check(getPricing(for: "claude-opus-4-1").matched == true, "opus-4-1 정밀 매칭")
     check(getPricing(for: "claude-opus-4-1").pricing.output == 75.0, "opus 출력 단가 75")
@@ -2708,6 +2955,26 @@ func runSelfTests() -> Never {
     check(formatTokens(2_000_000) == "2.00M", "formatTokens 2.00M")
     check(formatCost(0.005) == "$0.0050", "formatCost 소액 4자리")
     check(formatCost(0.18) == "$0.18", "formatCost 일반")
+
+    // formatTokensStable — 같은 자릿수 구간 내부에서는 항상 동일한 문자 길이(타이틀 폭 고정 검증)
+    check(formatTokensStable(5).count == formatTokensStable(999).count,
+          "formatTokensStable: 0~999 구간 내부 폭 고정")
+    check(formatTokensStable(1_500).count == formatTokensStable(999_900).count,
+          "formatTokensStable: K 구간 내부 폭 고정")
+    check(formatTokensStable(5) != formatTokensStable(5).trimmingCharacters(in: .whitespaces),
+          "formatTokensStable: 짧은 값은 왼쪽 패딩이 실제로 붙음")
+    check(formatTokensStable(999_950).hasSuffix("M"),
+          "formatTokensStable: 반올림으로 999.9K를 넘는 값(999_950)은 K가 아니라 M 단위로 승격")
+    check(formatTokensStable(999_950).count == 7,
+          "formatTokensStable: 승격된 M 표시도 7자 폭 고정 유지")
+    check(formatTokensStable(999_949).hasSuffix("K"),
+          "formatTokensStable: 승격 경계 바로 아래 값은 정상적으로 K 단위 유지")
+    check(formatTokensStable(999_999_999).count == 7,
+          "formatTokensStable: M 상한 근접 값도 7자 폭 유지(999.99M로 클램프)")
+
+    // String.leftPad
+    check("ab".leftPad(to: 5, with: "-") == "---ab", "leftPad: 부족분만큼 왼쪽에 패딩")
+    check("abcde".leftPad(to: 3, with: "-") == "abcde", "leftPad: 이미 길면 그대로 반환")
 
     // FiveHourBlock.active
     let base = Date(timeIntervalSince1970: 1_704_067_200)  // 2024-01-01 00:00:00 UTC
@@ -2828,11 +3095,6 @@ func runSelfTests() -> Never {
         check(computeMood(hasActiveBlock: true, elapsedRatio: 0.1, warning: w) == .critical,
               "mood: 예산 설정 시 warning.ratio(0.95)가 elapsedRatio(0.1) 대신 우선 적용")
     } else { check(false, "mood: warning override 테스트용 UsageWarning 생성 실패") }
-
-    // FunModeFeature: 케이스 목록/라벨 회귀 (activeRefreshFlash() 자체는 실제 Timer/앱 인스턴스
-    // 상태에 의존해 이 순수 함수 테스트 스위트로는 검증하지 않음 — celebrationBadgeTimer와 동일한 관례)
-    check(FunModeFeature.allCases.contains(.refreshFlash), "funMode: refreshFlash 케이스 포함")
-    check(!FunModeFeature.refreshFlash.label.isEmpty, "funMode: refreshFlash 라벨 존재")
 
     // TitleSettings.isFunModeFeatureEnabled / toggleFunModeFeature (전용 UserDefaults suite로 격리)
     let funModeSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
@@ -3035,6 +3297,44 @@ func runSelfTests() -> Never {
     check(Set(MoodTier.allCases.map(flameStage(for:))).count == 3,
           "flameStage: MoodTier 5단계가 정확히 3개의 아이콘 형태로 묶임")
 
+    // flameSway — 시간에 따라 실제로 값이 변하는 순수 함수인지(흔들림 애니메이션의 기반)
+    check(flameSway(elapsed: 0) != flameSway(elapsed: flameFlickerPeriod / 4),
+          "flameSway: elapsed가 다르면 다른 흔들림 값을 반환")
+
+    // moodFlameImage(elapsed:) — ember(idle/calm)는 elapsed와 무관하게 완전히 정적이어야 하고,
+    // flame/blaze(warm 이상)는 elapsed에 따라 실제로 도형이 달라져야 한다(회귀 방지).
+    check(moodFlameImage(tier: .idle, elapsed: 0).tiffRepresentation == moodFlameImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
+          "moodFlameImage: ember 단계(idle)는 elapsed가 달라도 이미지가 동일(정적 유지)")
+    check(moodFlameImage(tier: .calm, elapsed: 0).tiffRepresentation == moodFlameImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
+          "moodFlameImage: ember 단계(calm)는 elapsed가 달라도 이미지가 동일(정적 유지)")
+    check(moodFlameImage(tier: .hot, elapsed: 0).tiffRepresentation != moodFlameImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
+          "moodFlameImage: flame 단계(hot)는 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
+    check(moodFlameImage(tier: .critical, elapsed: 0).tiffRepresentation != moodFlameImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
+          "moodFlameImage: blaze 단계(critical)는 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
+
+    // F4 회귀: moodImageToApply()는 elapsed=0 고정 프레임이 아니라 실시간 elapsed를 써야 한다.
+    // Date()를 모킹할 수 없어 "실시간 호출 결과가 elapsed=0 정지 프레임과 다르다"로 간접
+    // 검증한다 — sin 기반 흔들림 값이 우연히 elapsed=0과 정확히 같은 위상일 확률은 사실상 0이다.
+    let restFrame = moodFlameImage(tier: .hot, elapsed: 0)
+    let liveFrame = moodImageToApply(tier: .hot)
+    check(liveFrame?.tiffRepresentation != restFrame.tiffRepresentation,
+          "moodImageToApply: flame/blaze 단계는 elapsed=0 고정 프레임이 아니라 실시간 elapsed 사용")
+
+    // F5 회귀: syncFlameFlickerTimer()가 조건에 따라 타이머를 실제로 시작/중지하는지(정지 상태 =
+    // flameFlickerTimer == nil). 이 시점 TitleSettings.icon()은 .keyboard, moodGlyphTheme()은
+    // .flame으로 이미 설정돼 있다(위 flame 테마 테스트 블록에서 설정).
+    let flickerApp = ClaudeMonitorApp()
+    flickerApp.applyMood(.hot)
+    check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: flame 단계 진입 시 타이머 시작")
+    flickerApp.applyMood(.idle)
+    check(flickerApp.flameFlickerTimer == nil, "syncFlameFlickerTimer: ember 단계로 돌아가면 타이머 중지")
+    flickerApp.applyMood(.critical)
+    check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: blaze 단계에서도 타이머 시작")
+    TitleSettings.setMoodGlyphTheme(.circles)
+    flickerApp.applyMood(.critical)
+    check(flickerApp.flameFlickerTimer == nil, "syncFlameFlickerTimer: flame 테마가 아니면 tier와 무관하게 타이머 중지")
+    flickerApp.flameFlickerTimer?.invalidate()
+
     if let smgt = savedMoodGlyphTheme { UserDefaults.standard.set(smgt, forKey: "moodGlyphTheme") }
     else { UserDefaults.standard.removeObject(forKey: "moodGlyphTheme") }
 
@@ -3084,7 +3384,7 @@ func runSelfTests() -> Never {
     let titleCtx = TitleContext(outputTokens: 12_300, totalTokens: 50_000, cost: 4.2,
                                 remainingText: nil, model: "claude-sonnet-4-5")
     setEnabled([.outputTokens, .cost])
-    check(buildTitleText(titleCtx) == "⌨ 12.3K $4.20", "title: outputTokens+cost 조합(기존 기본 포맷과 동일)")
+    check(buildTitleText(titleCtx) == "⌨ \u{2007}12.3K $4.20", "title: outputTokens+cost 조합(formatTokensStable 패딩 반영)")
     setEnabled([.remainingTime])
     check(buildTitleText(titleCtx) == "⌨", "title: 값 없는 필드만 선택 시 ⌨ 단독으로 축소")
     setEnabled([.model])
@@ -3092,8 +3392,8 @@ func runSelfTests() -> Never {
     let todayCumulativeCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil,
                                           todayTokens: 128_000, todayCost: 2.5, cumulativeTokens: 5_200_000)
     setEnabled([.todayTokens, .todayCost, .cumulativeTokens])
-    check(buildTitleText(todayCumulativeCtx) == "⌨ 128.0K $2.50 5.20M",
-          "title: 오늘 토큰+오늘 비용+누적 토큰 조합")
+    check(buildTitleText(todayCumulativeCtx) == "⌨ 128.0K $2.50 \u{2007}\u{2007}5.20M",
+          "title: 오늘 토큰+오늘 비용+누적 토큰 조합(formatTokensStable 패딩 반영)")
     for (field, value) in savedTitleDefaults {
         if let v = value { UserDefaults.standard.set(v, forKey: field.defaultsKey) }
         else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
@@ -3216,15 +3516,15 @@ func runSelfTests() -> Never {
     UserDefaults.standard.set(["model", "cost", "outputTokens"], forKey: "titleFieldsOrder")
     TitleSettings.setIcon(.keyboard)
     TitleSettings.setSeparator(.pipe)
-    check(buildTitleText(titleCtx) == "⌨ | Sonnet 4.5 | $4.20 | 12.3K",
+    check(buildTitleText(titleCtx) == "⌨ | Sonnet 4.5 | $4.20 | \u{2007}12.3K",
           "title: 커스텀 순서(model→cost→outputTokens) + 구분자(|) 조합")
     TitleSettings.setSeparator(.none)
-    check(buildTitleText(titleCtx) == "⌨Sonnet 4.5$4.2012.3K", "title: 구분자 없음 조합")
+    check(buildTitleText(titleCtx) == "⌨Sonnet 4.5$4.20\u{2007}12.3K", "title: 구분자 없음 조합")
     TitleSettings.setIcon(.robot)
     TitleSettings.setSeparator(.space)
-    check(buildTitleText(titleCtx) == "🤖 Sonnet 4.5 $4.20 12.3K", "title: 커스텀 아이콘(로봇) 조합")
+    check(buildTitleText(titleCtx) == "🤖 Sonnet 4.5 $4.20 \u{2007}12.3K", "title: 커스텀 아이콘(로봇) 조합")
     TitleSettings.setIcon(.none)
-    check(buildTitleText(titleCtx) == "Sonnet 4.5 $4.20 12.3K", "title: 아이콘 없음 — 선행 구분자 없이 첫 필드부터 시작")
+    check(buildTitleText(titleCtx) == "Sonnet 4.5 $4.20 \u{2007}12.3K", "title: 아이콘 없음 — 선행 구분자 없이 첫 필드부터 시작")
     TitleSettings.setColor(.blue, for: .cost)
     UserDefaults.standard.removeObject(forKey: "titleColor_model")  // 이 검증은 model이 미지정(defaultColor)임을 전제로 함
     let coloredParts = buildTitleParts(titleCtx)
@@ -3252,6 +3552,74 @@ func runSelfTests() -> Never {
     check(acquireSingleInstanceLock(path: lockTestPath), "lock: 첫 획득 성공")
     check(!acquireSingleInstanceLock(path: lockTestPath), "lock: 동일 파일 재획득 실패(중복 인스턴스 차단)")
     try? FileManager.default.removeItem(atPath: lockTestPath)
+
+    // UsageDataReader.readAll() — 파일 변경 없는 사이클에서 전체 재병합/재정렬을 스킵하는지
+    // (성능 최적화 회귀 테스트). 실제 홈 디렉터리 대신 임시 디렉터리를 주입해 격리한다.
+    do {
+        let readerHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeMonitorSelfTest.reader.\(UUID().uuidString)")
+        let projectDir = readerHome.appendingPathComponent(".claude/projects/proj1")
+        try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let sessionFile = projectDir.appendingPathComponent("session1.jsonl")
+
+        func line(uuid: String, ts: String, outputTokens: Int) -> String {
+            "{\"type\":\"assistant\",\"uuid\":\"\(uuid)\",\"timestamp\":\"\(ts)\"," +
+            "\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":\(outputTokens)}}}\n"
+        }
+
+        try? (line(uuid: "a", ts: "2026-01-01T00:00:00Z", outputTokens: 100))
+            .write(to: sessionFile, atomically: true, encoding: .utf8)
+
+        let reader = UsageDataReader(homeDir: readerHome)
+        let first = reader.readAll()
+        check(first.count == 1 && first.first?.outputTokens == 100,
+              "readAll: 첫 호출은 파일을 파싱해 엔트리를 반환")
+        check(reader.lastReadChanged, "readAll: 첫 호출은 lastReadChanged == true")
+
+        let second = reader.readAll()
+        check(second.map { $0.uuid } == first.map { $0.uuid },
+              "readAll: 파일 변경 없는 2차 호출도 동일한 엔트리를 반환(재병합 스킵해도 결과 불변)")
+        check(!reader.lastReadChanged,
+              "readAll: 파일 변경 없으면 lastReadChanged == false(전체 재병합/재정렬 스킵)")
+
+        if let handle = try? FileHandle(forWritingTo: sessionFile) {
+            handle.seekToEndOfFile()
+            handle.write((line(uuid: "b", ts: "2026-01-01T00:05:00Z", outputTokens: 200)).data(using: .utf8)!)
+            try? handle.close()
+        }
+        let third = reader.readAll()
+        check(third.count == 2, "readAll: 파일에 줄 추가 후 3차 호출은 신규 엔트리를 포함")
+        check(reader.lastReadChanged, "readAll: 파일이 바뀌면 lastReadChanged가 다시 true로 복귀")
+
+        try? FileManager.default.removeItem(at: readerHome)
+    }
+
+    // F1 회귀: refresh()가 entriesChanged와 무관하게 updateGamificationRecord()/
+    // updateEasterEggState()를 항상 호출해야 하는지 뒷받침하는 두 함수 자체의 동작 검증. 전용
+    // UserDefaults(suiteName:)로 격리해 실사용자 스트릭/마일스톤 상태를 절대 건드리지 않는다.
+    let f1GamSuite = "ClaudeMonitorSelfTest.gam.\(UUID().uuidString)"
+    if let gd = UserDefaults(suiteName: f1GamSuite) {
+        let gamApp = ClaudeMonitorApp()
+        let pastDate = Date(timeIntervalSince1970: 1_600_000_000)  // 2020년 — "오늘"이 아님
+        gamApp.cachedAll = [UsageEntry(timestamp: pastDate, model: "claude-sonnet-5",
+                                        inputTokens: 0, outputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0,
+                                        sessionId: "s1", uuid: "u1")]
+        gamApp.updateGamificationRecord(defaults: gd)
+        check(gamApp.gamificationTodayTokens == 0,
+              "updateGamificationRecord: cachedAll에 '오늘' 엔트리가 없으면 오늘 토큰은 0")
+
+        gamApp.updateEasterEggState(defaults: gd)  // 최초 호출 — 아직 마일스톤 미달, 베이스라인만 기록
+        gamApp.cachedAll.append(UsageEntry(timestamp: pastDate, model: "claude-sonnet-5",
+                                            inputTokens: 0, outputTokens: 1_500_000, cacheReadTokens: 0, cacheWriteTokens: 0,
+                                            sessionId: "s1", uuid: "u2"))
+        gamApp.updateEasterEggState(defaults: gd)
+        check(gamApp.justCrossedTokenMilestone == 1_000_000,
+              "updateEasterEggState: 마일스톤을 실제로 넘기면 justCrossed에 해당 임계값 설정")
+
+        gamApp.updateEasterEggState(defaults: gd)  // 동일 상태로 재호출
+        check(gamApp.justCrossedTokenMilestone == nil,
+              "updateEasterEggState: 재호출 시 자기소멸(nil로 복귀) — entriesChanged 게이팅이 되살아나면 이 회귀가 깨짐")
+    }
 
     // migrateLegacyDefaultsIfNeeded (전용 legacy/new suite 쌍으로 격리 — 실제 ClaudeMonitor 도메인은 건드리지 않음)
     let legacySuite = "ClaudeMonitorSelfTest.legacy.\(UUID().uuidString)"
