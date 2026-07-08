@@ -1011,24 +1011,30 @@ func moodSignatureImage(tier: MoodTier) -> NSImage {
 // flame 테마 전용 배색 — circles/bars/signature 테마가 공유하는 MoodTier.color(회색/초록/노랑/
 // 주황/빨강 "신호등" 배색)와는 별개다. 저 배색을 그대로 썼다면 calm이 초록으로 나와 "불씨"라는
 // 형태와 어긋난다. 빨강은 critical 전용으로 예약해(calm/warm/hot은 노랑~주황 범위에서만 움직임)
-// 낮은 진행률에서 빨강이 섞여 "한도를 다 썼다"는 오해를 주지 않게 한다. inner가 nil이면(idle)
+// 낮은 진행률에서 빨강이 섞여 "한도를 다 썼다"는 오해를 주지 않게 한다. mid/inner가 nil이면(idle)
 // 코어 하이라이트 없이 완전히 식은 색만 쓴다 — idle은 활성 블록이 없는 상태라 실제로 "타는 중"이
-// 아니므로 불꽃 코어를 얹지 않는다.
-func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
+// 아니므로 불꽃 코어를 얹지 않는다. outer(빨강)→mid(주황)→inner(노랑) 3톤은 실제 불꽃의 겉→속
+// 온도 변화(불꽃 이모지 🔥의 배색)를 겨냥한 것 — 기존 2톤(outer/inner)보다 한 겹 더 넣어 코어가
+// "밝은 색 얼룩"이 아니라 화염 중심에서 번져 나오는 것처럼 보이게 한다.
+func flameColors(for tier: MoodTier) -> (outer: NSColor, mid: NSColor?, inner: NSColor?) {
     switch tier {
     case .idle:
-        return (NSColor(calibratedWhite: 0.55, alpha: 1), nil)
+        return (NSColor(calibratedWhite: 0.55, alpha: 1), nil, nil)
     case .calm:
         return (NSColor(calibratedRed: 0.72, green: 0.24, blue: 0.10, alpha: 1),
+                NSColor(calibratedRed: 0.88, green: 0.42, blue: 0.14, alpha: 1),
                 NSColor(calibratedRed: 0.95, green: 0.55, blue: 0.20, alpha: 1))
     case .warm:
         return (NSColor(calibratedRed: 0.95, green: 0.45, blue: 0.05, alpha: 1),
+                NSColor(calibratedRed: 0.98, green: 0.62, blue: 0.12, alpha: 1),
                 NSColor(calibratedRed: 1.00, green: 0.80, blue: 0.20, alpha: 1))
     case .hot:
         return (NSColor(calibratedRed: 0.92, green: 0.32, blue: 0.04, alpha: 1),
+                NSColor(calibratedRed: 0.96, green: 0.58, blue: 0.14, alpha: 1),
                 NSColor(calibratedRed: 1.00, green: 0.85, blue: 0.25, alpha: 1))
     case .critical:
         return (NSColor(calibratedRed: 0.88, green: 0.16, blue: 0.10, alpha: 1),
+                NSColor(calibratedRed: 0.94, green: 0.50, blue: 0.16, alpha: 1),
                 NSColor(calibratedRed: 1.00, green: 0.90, blue: 0.35, alpha: 1))
     }
 }
@@ -1036,11 +1042,11 @@ func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
 // flame 테마 전용 커스텀 벡터 아이콘 — 이모지 🔥 대신 Core Graphics로 직접 그려 색 틴팅이
 // 정상 동작하게 한다(파일 상단 MoodGlyphTheme 주석 참고). FlameStage(3단계: 불씨/불꽃/화염)에
 // 따라 실루엣 자체가 커지고 복잡해진다 — 불씨는 화염 모양이 아니라 둥근 점, 불꽃은 표준 화염
-// 한 덩이, 화염은 메인 화염 옆에 곁불꽃이 하나 더 붙는다. flameColors(for:)의 outer/inner 2톤을
-// 겹쳐 칠해 실제 불꽃처럼 겉은 진하고 속은 밝은 느낌을 낸다 — 코어는 같은 실루엣을 가로 55%·
-// 세로 70%로 줄이고 바닥은 그대로 맞춰(가운데 정렬 아님) 밑에서부터 차오르는 것처럼 보이게 한다.
-// elapsed(기본 0)를 넘기면 flame/blaze 단계 실루엣이 flameSway()로 미세하게 일렁인다 — ember는
-// 항상 elapsed와 무관하게 정적이다(flameBezierPath 참고).
+// 한 덩이, 화염은 메인 화염 옆에 곁불꽃이 하나 더 붙는다. flameColors(for:)의 outer/mid/inner 3톤을
+// 겹쳐 칠해 실제 불꽃처럼 겉은 진하고 속은 밝은 느낌을 낸다 — mid는 가로 72%·세로 85%, 코어는
+// 가로 55%·세로 70%로 줄이고 바닥은 그대로 맞춰(가운데 정렬 아님) 밑에서부터 차오르는 것처럼
+// 보이게 한다. elapsed(기본 0)를 넘기면 flame/blaze 단계 실루엣이 flameSway()로 미세하게
+// 일렁인다 — ember는 항상 elapsed와 무관하게 정적이다(flameBezierPath 참고).
 func moodFlameImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
     let colors = flameColors(for: tier)
@@ -1048,6 +1054,12 @@ func moodFlameImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let image = NSImage(size: size, flipped: false) { rect in
         colors.outer.setFill()
         flameBezierPath(stage: stage, in: rect, elapsed: elapsed).fill()
+        if let mid = colors.mid {
+            let midRect = CGRect(x: rect.midX - rect.width * 0.36, y: rect.minY,
+                                  width: rect.width * 0.72, height: rect.height * 0.85)
+            mid.setFill()
+            flameBezierPath(stage: stage, in: midRect, elapsed: elapsed).fill()
+        }
         if let inner = colors.inner {
             let coreRect = CGRect(x: rect.midX - rect.width * 0.275, y: rect.minY,
                                    width: rect.width * 0.55, height: rect.height * 0.70)
@@ -1060,27 +1072,28 @@ func moodFlameImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     return image
 }
 
-// 단일 화염 실루엣 — 정규화 좌표(밑변 중앙이 원점)로 정의한 뒤 rect에 맞춰 스케일한다.
+// 단일 화염 실루엣 — 정규화 좌표(밑변 중앙 근처가 원점)로 정의한 뒤 rect에 맞춰 스케일한다.
 // lean이 클수록 끝이 오른쪽으로(음수면 왼쪽으로) 기울어 "일렁이는" 인상을 준다.
 // 밑변은 평평하게(불꽃이 바닥에 "앉은" 인상), 옆선은 각각 단일 베지어 한 번으로 배(볼록)에서
 // 끝까지 S자로 휘어 오르게 해 물방울과 구분되는 "일렁이는 불꽃" 실루엣을 만든다. 앵커를 늘려
 // 허리/어깨 단을 추가로 넣어본 적이 있는데, 양쪽을 대칭으로 접으면 마디가 층층이 쌓인 모양이
 // 되어(💩 실루엣과 흡사) 오히려 나빠졌다 — 그래서 옆선마다 앵커 하나(밑변 끝)에서 끝(tip)까지
 // 곡선 1개로만 잇는다. 앵커가 적을수록 이어붙는 지점에서 생기는 꺾임(kink) 위험도 준다.
-// 배(볼록) 제어점은 캔버스 경계(u=0.03/0.97)에 바짝 붙이지 않고 안쪽으로 당겨(0.12/0.88)
-// 완만하게 잡는다 — 실제 곡선은 캔버스 안에 여유를 두고 그려짐에도(경계 밖으로 잘리는 게
-// 아님), 아이콘이 11x14pt라는 극히 작은 크기로 렌더링되다 보니 배→끝 구간의 급격한 곡률이
-// 매끄러운 곡선이 아니라 뭉툭/각진 "직선으로 잘린 듯한" 인상으로 보였다. 제어점을 완만하게
-// 당기면 같은 작은 크기에서도 둥근 물방울 형태로 또렷하게 읽힌다.
+// 좌우 곡선의 제어점은 서로 대칭이 아니라 비대칭이다 — 왼쪽은 배가 낮고 빠르게 좁아지고(어깨),
+// 오른쪽은 더 완만하게 길게 뻗어 tip이 중심보다 오른쪽으로 치우친다(🔥 이모지 실루엣 참고).
+// 대칭 물방울보다 실제 불꽃처럼 한쪽으로 흐르는 인상을 주면서도, 옆선마다 곡선 1개라는 원칙은
+// 그대로 지켜 앞 문단의 꺾임/뭉침 문제를 재도입하지 않는다. 제어점은 11x14pt 실제 크기(및
+// 22x28/33x42 배율)로 렌더링해 가며 맞췄다 — 캔버스 경계에 바짝 붙이면(과거 시도) 배→끝 구간의
+// 급격한 곡률이 극소 크기에서 뭉툭/각진 인상으로 보여, 제어점을 안쪽으로 당겨 완만하게 잡는다.
 private func singleFlamePath(in rect: CGRect, lean: CGFloat) -> NSBezierPath {
     func pt(_ u: CGFloat, _ v: CGFloat) -> CGPoint {
         CGPoint(x: rect.minX + u * rect.width, y: rect.minY + v * rect.height)
     }
     let path = NSBezierPath()
-    path.move(to: pt(0.22, 0.0))
-    path.line(to: pt(0.78, 0.0))
-    path.curve(to: pt(0.5 + lean, 1.0), controlPoint1: pt(0.88, 0.36), controlPoint2: pt(0.50 + lean * 0.3, 0.80))
-    path.curve(to: pt(0.22, 0.0), controlPoint1: pt(0.50 + lean * 0.3, 0.80), controlPoint2: pt(0.12, 0.36))
+    path.move(to: pt(0.18, 0.0))
+    path.line(to: pt(0.82, 0.0))
+    path.curve(to: pt(0.62 + lean, 1.0), controlPoint1: pt(0.94, 0.46), controlPoint2: pt(0.66 + lean * 0.3, 0.88))
+    path.curve(to: pt(0.18, 0.0), controlPoint1: pt(0.30 + lean * 0.3, 0.58), controlPoint2: pt(0.02, 0.26))
     path.close()
     return path
 }
