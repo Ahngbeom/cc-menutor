@@ -1062,16 +1062,18 @@ func moodFlameImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
 
 // 단일 화염 실루엣 — 정규화 좌표(밑변 중앙이 원점)로 정의한 뒤 rect에 맞춰 스케일한다.
 // lean이 클수록 끝이 오른쪽으로(음수면 왼쪽으로) 기울어 "일렁이는" 인상을 준다.
-// 밑변은 평평하게(불꽃이 바닥에 "앉은" 인상), 옆선은 각각 단일 베지어 한 번으로 배(볼록)에서
-// 끝까지 S자로 휘어 오르게 해 물방울과 구분되는 "일렁이는 불꽃" 실루엣을 만든다. 앵커를 늘려
-// 허리/어깨 단을 추가로 넣어본 적이 있는데, 양쪽을 대칭으로 접으면 마디가 층층이 쌓인 모양이
-// 되어(💩 실루엣과 흡사) 오히려 나빠졌다 — 그래서 옆선마다 앵커 하나(밑변 끝)에서 끝(tip)까지
-// 곡선 1개로만 잇는다. 앵커가 적을수록 이어붙는 지점에서 생기는 꺾임(kink) 위험도 준다.
-// 배(볼록) 제어점은 캔버스 경계(u=0.03/0.97)에 바짝 붙이지 않고 안쪽으로 당겨(0.12/0.88)
-// 완만하게 잡는다 — 실제 곡선은 캔버스 안에 여유를 두고 그려짐에도(경계 밖으로 잘리는 게
-// 아님), 아이콘이 11x14pt라는 극히 작은 크기로 렌더링되다 보니 배→끝 구간의 급격한 곡률이
-// 매끄러운 곡선이 아니라 뭉툭/각진 "직선으로 잘린 듯한" 인상으로 보였다. 제어점을 완만하게
-// 당기면 같은 작은 크기에서도 둥근 물방울 형태로 또렷하게 읽힌다.
+// 밑변은 평평하게(불꽃이 바닥에 "앉은" 인상), 옆선은 각각 단일 베지어 한 번으로 밑변 끝에서
+// 끝(tip)까지 잇는다(앵커를 늘려 허리/어깨 단을 추가하면 마디가 층층이 쌓인 모양이 돼(💩 실루엣과
+// 흡사) 오히려 나빠짐 — 옆선마다 앵커 하나로만 잇는 이유).
+// 제어점은 밑변 끝→끝점을 잇는 직선을 33%/66% 지점에서 따라가며 그 지점에서 수직 방향으로만
+// 살짝 부풀린 위치에 둔다 — 즉 진행 방향이 도중에 크게 꺾이지 않고 계속 끝점 쪽으로 완만하게
+// 휘어간다. 예전엔 첫 제어점(u=0.88)을 밑변 근처(v=0.36)에서 이미 최대로 부풀리고 둘째
+// 제어점(u≈0.5)은 훨씬 위(v=0.80)에서 거의 중앙선까지 급격히 되돌아오게 잡았는데, 이 방식은
+// v=0.36~0.80 구간에서 u가 큰 폭으로 꺾여야 해서 11x14pt라는 극히 작은 크기에서는 부드러운
+// 곡선이 아니라 뭉툭/각진 "대각선으로 잘린 듯한" 인상으로 보였다. "직선 경로 + 수직 bulge"
+// 방식은 방향 전환이 완만해 같은 작은 크기에서도
+// 매끈하게 읽힌다. 좌우 곡선이 더 이상 제어점을 공유하지 않아 끝이 완전히 둥글진 않고 살짝 각진
+// 첨점이 생기는데, 실제 불꽃도 흔히 그렇게 보이므로 의도적으로 허용한다.
 private func singleFlamePath(in rect: CGRect, lean: CGFloat) -> NSBezierPath {
     func pt(_ u: CGFloat, _ v: CGFloat) -> CGPoint {
         CGPoint(x: rect.minX + u * rect.width, y: rect.minY + v * rect.height)
@@ -1079,8 +1081,12 @@ private func singleFlamePath(in rect: CGRect, lean: CGFloat) -> NSBezierPath {
     let path = NSBezierPath()
     path.move(to: pt(0.22, 0.0))
     path.line(to: pt(0.78, 0.0))
-    path.curve(to: pt(0.5 + lean, 1.0), controlPoint1: pt(0.88, 0.36), controlPoint2: pt(0.50 + lean * 0.3, 0.80))
-    path.curve(to: pt(0.22, 0.0), controlPoint1: pt(0.50 + lean * 0.3, 0.80), controlPoint2: pt(0.12, 0.36))
+    path.curve(to: pt(0.5 + lean, 1.0),
+               controlPoint1: pt(0.86 + lean * 0.33, 0.38),
+               controlPoint2: pt(0.69 + lean * 0.66, 0.69))
+    path.curve(to: pt(0.22, 0.0),
+               controlPoint1: pt(0.31 + lean * 0.66, 0.69),
+               controlPoint2: pt(0.14 + lean * 0.33, 0.38))
     path.close()
     return path
 }
@@ -1105,18 +1111,28 @@ private func flameBezierPath(stage: FlameStage, in rect: CGRect, elapsed: TimeIn
         let flameRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: height)
         return singleFlamePath(in: flameRect, lean: 0.03 + sway * 0.16)
     case .blaze:
-        // 메인 화염(높이 ~98%) + 옆에 작은 곁불꽃 — 가장 크고 밝은 단계. 메인/곁불꽃에 서로 다른
-        // 위상의 sway를 줘 두 불꽃이 따로 움직이게 하고, x에도 미세한 흔들림을 더해 함께 춤추듯 보이게 한다.
+        // 메인 화염(높이 ~90%) + 양옆에 작은 곁불꽃 — 가장 크고 밝은 단계. 메인/양쪽 곁불꽃에 서로
+        // 다른 위상의 sway를 줘 세 불꽃이 따로 움직이게 하고, x에도 미세한 흔들림을 더해 함께
+        // 춤추듯 보이게 한다. mainHeight 기준값(0.90)+진폭(0.05)의 합을 1.0 밑으로 잡아 캔버스
+        // 상단을 넘지 않게 한다.
         let mainSway = flameSway(elapsed: elapsed)
-        let mainHeight = rect.height * (0.98 + mainSway * 0.07)
+        let mainHeight = rect.height * (0.90 + mainSway * 0.05)
         let mainRect = CGRect(x: rect.minX + rect.width * 0.12 + mainSway * rect.width * 0.02, y: rect.minY,
                                width: rect.width * 0.75, height: mainHeight)
         let main = singleFlamePath(in: mainRect, lean: 0.03 + mainSway * 0.16)
-        let sideSway = flameSway(elapsed: elapsed, phaseShift: 2.4)
-        let sideHeight = rect.height * (0.55 + sideSway * 0.07)
-        let sideRect = CGRect(x: rect.minX - rect.width * 0.05 + sideSway * rect.width * 0.02, y: rect.minY,
-                               width: rect.width * 0.5, height: sideHeight)
-        main.append(singleFlamePath(in: sideRect, lean: -0.06 + sideSway * 0.16))
+        let leftSideSway = flameSway(elapsed: elapsed, phaseShift: 2.4)
+        let leftSideHeight = rect.height * (0.55 + leftSideSway * 0.07)
+        let leftSideRect = CGRect(x: rect.minX - rect.width * 0.05 + leftSideSway * rect.width * 0.02, y: rect.minY,
+                                   width: rect.width * 0.5, height: leftSideHeight)
+        main.append(singleFlamePath(in: leftSideRect, lean: -0.06 + leftSideSway * 0.16))
+        // 오른쪽 곁불꽃 — 왼쪽과 캔버스 중심 기준으로 대칭인 x 오프셋(-0.05 → 1-(-0.05+0.5)=0.55)과
+        // 반대 부호의 lean(바깥쪽인 오른쪽으로 기울게)을 써서 좌우 균형을 맞춘다. phaseShift를
+        // 왼쪽(2.4)과 다르게 줘(-1.1) 두 곁불꽃이 거울처럼 동기화되지 않고 독립적으로 흔들리게 한다.
+        let rightSideSway = flameSway(elapsed: elapsed, phaseShift: -1.1)
+        let rightSideHeight = rect.height * (0.55 + rightSideSway * 0.07)
+        let rightSideRect = CGRect(x: rect.minX + rect.width * 0.55 + rightSideSway * rect.width * 0.02, y: rect.minY,
+                                    width: rect.width * 0.5, height: rightSideHeight)
+        main.append(singleFlamePath(in: rightSideRect, lean: 0.06 + rightSideSway * 0.16))
         return main
     }
 }
@@ -3311,6 +3327,26 @@ func runSelfTests() -> Never {
           "moodFlameImage: flame 단계(hot)는 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
     check(moodFlameImage(tier: .critical, elapsed: 0).tiffRepresentation != moodFlameImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
           "moodFlameImage: blaze 단계(critical)는 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
+
+    // 회귀: blaze 단계 도형이 캔버스 경계를 크게 벗어나면 안 된다. 세로는 mainHeight가 캔버스
+    // 높이(rect.height)를 넘지 않아야 하고(불꽃 끝은 singleFlamePath의 실제 앵커 포인트(v=1.0)라
+    // bounds.maxY가 정확히 그 높이를 반영), 가로는 좌우 곁불꽃이 캔버스를 살짝 포개는 것 자체는
+    // 의도된 디자인(sideRect가 -0.05*width에서 시작)이라 완전히 0~width 안에 들어갈 필요는 없지만,
+    // 여유 마진(±2pt)을 넘는 극단적 오버플로는 회귀로 잡는다. elapsed를 촘촘히 스캔해 모든
+    // 프레임을 확인한다.
+    let flameCanvas = CGRect(x: 0, y: 0, width: 11, height: 14)
+    var blazeOverflowed = false
+    var flameScanElapsed = 0.0
+    while flameScanElapsed < 8.0 {
+        let bounds = flameBezierPath(stage: .blaze, in: flameCanvas, elapsed: flameScanElapsed).bounds
+        if bounds.maxY > flameCanvas.height + 0.001
+            || bounds.minX < -2.0 || bounds.maxX > flameCanvas.width + 2.0 {
+            blazeOverflowed = true
+            break
+        }
+        flameScanElapsed += 0.05
+    }
+    check(!blazeOverflowed, "flameBezierPath: blaze 단계는 흔들림 전 구간에서 캔버스 경계를 크게 넘지 않음")
 
     // F4 회귀: moodImageToApply()는 elapsed=0 고정 프레임이 아니라 실시간 elapsed를 써야 한다.
     // Date()를 모킹할 수 없어 "실시간 호출 결과가 elapsed=0 정지 프레임과 다르다"로 간접
