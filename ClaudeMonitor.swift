@@ -947,6 +947,11 @@ func flameStage(for tier: MoodTier) -> FlameStage {
 let flameFlickerInterval: TimeInterval = 0.2   // 흔들림 재계산 주기(초당 5회, 상태바 이미지만 재대입 — 가벼움)
 let flameFlickerPeriod: TimeInterval = 1.6      // 메인(느린) 숨쉬기 흔들림 한 주기(초)
 
+// 유휴(활성 블록 없음) 상태 히어로 아이콘이 MoodTier.allCases(idle/calm/warm/hot/critical)를
+// 순환 전시하는 프레임 간격 — 진행률 실데이터가 없는 유휴 상태에서 flameColors(for:) 팔레트
+// 전체를 쇼케이스처럼 보여준다.
+let idleFlameCycleInterval: TimeInterval = 1.4
+
 // 시간 기반 흔들림 값(대략 -1...1). elapsed는 보통 Date().timeIntervalSinceReferenceDate를 그대로 넣는다.
 // 느린 주성분(flameFlickerPeriod, 전체가 숨쉬듯 부풀었다 줄었다)에 더 빠르고 진폭 작은 보조
 // 성분(주기 ≈ 0.31배, 끝이 날름거리듯 잔떨림)을 얹어 완전한 주기성을 깬다 — 단일 sin 하나만 쓰면
@@ -958,10 +963,10 @@ func flameSway(elapsed: TimeInterval, phaseShift: Double = 0) -> CGFloat {
     return CGFloat(slow + fast) / 1.4   // 두 성분 합의 최대치(1.4)로 나눠 대략 -1...1로 정규화
 }
 
-// flame 무드 아이콘 전용 배색 — MoodTier.color(회색/초록/노랑/주황/빨강 "신호등" 배색)와는 별개다.
-// 저 배색을 그대로 썼다면 calm이 초록으로 나와 "불씨"라는
-// 형태와 어긋난다. 빨강은 critical 전용으로 예약해(calm/warm/hot은 노랑~주황 범위에서만 움직임)
-// 낮은 진행률에서 빨강이 섞여 "한도를 다 썼다"는 오해를 주지 않게 한다. inner가 nil이면(idle)
+// flame 무드 아이콘 전용 배색 — MoodTier.color(회색/초록/노랑/주황/빨강 "신호등" 배색)와
+// 동일한 4단계 색 진행(초록→노랑→주황→빨강)을 아이콘 자체의 outer/inner 2톤으로도 그대로
+// 표현한다. calm=초록, warm=노랑, hot=주황, critical=빨강으로 단계가 올라갈수록 색상환을
+// 따라 "차분한 색 → 위험한 색"으로 또렷이 구분되게 한다. inner가 nil이면(idle)
 // 코어 하이라이트 없이 완전히 식은 색만 쓴다 — idle은 활성 블록이 없는 상태라 실제로 "타는 중"이
 // 아니므로 불꽃 코어를 얹지 않는다.
 func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
@@ -969,17 +974,17 @@ func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
     case .idle:
         return (NSColor(calibratedWhite: 0.55, alpha: 1), nil)
     case .calm:
-        return (NSColor(calibratedRed: 0.72, green: 0.24, blue: 0.10, alpha: 1),
-                NSColor(calibratedRed: 0.95, green: 0.55, blue: 0.20, alpha: 1))
+        return (NSColor(calibratedRed: 0.13, green: 0.55, blue: 0.13, alpha: 1),
+                NSColor(calibratedRed: 0.45, green: 0.85, blue: 0.35, alpha: 1))
     case .warm:
-        return (NSColor(calibratedRed: 0.95, green: 0.45, blue: 0.05, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.80, blue: 0.20, alpha: 1))
+        return (NSColor(calibratedRed: 0.85, green: 0.65, blue: 0.05, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.92, blue: 0.35, alpha: 1))
     case .hot:
-        return (NSColor(calibratedRed: 0.92, green: 0.32, blue: 0.04, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.85, blue: 0.25, alpha: 1))
+        return (NSColor(calibratedRed: 0.90, green: 0.45, blue: 0.05, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.75, blue: 0.20, alpha: 1))
     case .critical:
-        return (NSColor(calibratedRed: 0.88, green: 0.16, blue: 0.10, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.90, blue: 0.35, alpha: 1))
+        return (NSColor(calibratedRed: 0.85, green: 0.15, blue: 0.10, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.15, alpha: 1))
     }
 }
 
@@ -1585,8 +1590,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private weak var resetAnchorButtonRow: NSMenuItem?  // "리셋 기준 시각"의 커스텀 뷰 항목 — 언어 전환/앵커 변경 시 버튼 타이틀만 따로 patch
     private var coldStartTimer: Timer?  // 콜드 스타트(앱 최초 실행) 전용 로딩 점 순환 애니메이션 — 이후 refresh에는 관여하지 않음
     private var coldStartDotPhase = 0  // 0...3, 표시 폭 고정을 위해 미표시 구간은 공백으로 패딩
+    private var coldStartFlameIndex = 0  // MoodTier.allCases(5개) 순환 인덱스 — coldStartDotPhase(mod 4)와 별개로 둬야 critical(인덱스 4)에도 도달한다
     private(set) var flameFlickerTimer: Timer?  // flame/blaze 단계에서만 syncFlameFlickerTimer()가 시작/중지한다
     private var lastMoodTier: MoodTier?  // 흔들림 타이머가 재사용할, 가장 최근 refresh에서 계산된 tier
+    private(set) var idleFlameCycleTimer: Timer?  // 유휴 상태 + 메뉴 열림일 때만 syncIdleFlameCycleTimer()가 시작/중지한다
+    private(set) var idleFlameCycleIndex: Int = 0  // MoodTier.allCases 상의 현재 순환 프레임
+    private(set) weak var idleHeroIconRow: NSMenuItem?  // tickIdleFlameCycle()이 전체 메뉴 재구성 없이 직접 patch할 유휴 히어로 행
+    private var isCurrentlyIdle = false  // 가장 최근 renderBlockSections() 결과 — menuWillOpen/menuDidClose가 재사용
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyDefaultsIfNeeded()
@@ -1608,6 +1618,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startColdStartAnimation() {
         coldStartTimer?.invalidate()
         coldStartDotPhase = 0
+        coldStartFlameIndex = 0
         renderColdStartFrame(forceBody: true)  // 최초 1회는 메뉴 부착을 위해 mainMenuIsOpen과 무관하게 렌더
         coldStartTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
             self?.tickColdStartAnimation()
@@ -1616,13 +1627,26 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func tickColdStartAnimation() {
         coldStartDotPhase = (coldStartDotPhase + 1) % 4
+        coldStartFlameIndex = (coldStartFlameIndex + 1) % MoodTier.allCases.count
         renderColdStartFrame(forceBody: false)
     }
 
+    // 무드 아이콘 기능이 켜져 있으면 메뉴바 아이콘도 idle→calm→warm→hot→critical을 훑는 로딩
+    // 쇼케이스로 보여준다 — 새 타이머 없이 기존 점 애니메이션(coldStartTimer) 틱을 그대로 재사용.
+    // 첫 refresh()가 끝나면 buildMenu()가 applyMood()로 실제 tier(또는 무드 아이콘 꺼짐이면 nil)를
+    // 덮어쓰므로 이 프레임이 어디서 멈췄든 자연스럽게 실제 상태로 이어진다.
     private func renderColdStartFrame(forceBody: Bool) {
         let dots = String(repeating: ".", count: coldStartDotPhase)
             .padding(toLength: 3, withPad: " ", startingAt: 0)
-        renderTitle(plain: "\(titleIconPrefix())\(dots)", warning: nil)
+        let moodEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon)
+        if moodEnabled {
+            // 무드 아이콘이 이미지로 렌더링되므로 텍스트 쪽 고정 글리프(titleIconPrefix())는
+            // 빼고 점만 남긴다 — renderIdleTitle()의 동일 컨벤션과 맞춤(이중 아이콘 방지).
+            statusItem?.button?.image = moodFlameImage(tier: MoodTier.allCases[coldStartFlameIndex])
+            renderTitle(plain: dots, warning: nil)
+        } else {
+            renderTitle(plain: "\(titleIconPrefix())\(dots)", warning: nil)
+        }
         guard forceBody || mainMenuIsOpen else { return }
         replaceBody { menu in
             self.appendLoadingHeader(menu, dots: dots)
@@ -1847,6 +1871,39 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         syncFlameFlickerTimer()
     }
 
+    // 유휴(활성 블록 없음) 상태 + 메뉴가 열려 있을 때만 순환 타이머를 돌린다 — 닫혀 있으면 아무도
+    // 안 보이므로 배터리를 아낀다. private가 아닌 internal로 둬 applyMood()처럼 self-test가 직접
+    // 호출해 시작/중지를 검증할 수 있게 한다.
+    func syncIdleFlameCycleTimer(isIdle: Bool, menuOpen: Bool) {
+        let shouldRun = isIdle && menuOpen
+        if shouldRun {
+            guard idleFlameCycleTimer == nil else { return }
+            idleFlameCycleTimer = Timer.scheduledTimer(withTimeInterval: idleFlameCycleInterval, repeats: true) { [weak self] _ in
+                self?.tickIdleFlameCycle()
+            }
+        } else {
+            idleFlameCycleTimer?.invalidate()
+            idleFlameCycleTimer = nil
+        }
+    }
+
+    // 전체 메뉴를 다시 그리지 않고 idleHeroIconRow의 아이콘/텍스트 색만 직접 patch한다 — 열려 있는
+    // 드롭다운에서 사용자가 다른 항목에 마우스를 올리고 있어도 항목 재삽입으로 호버 상태가 흔들리지
+    // 않는다(footerLocalizedItems/refreshButtonRow와 같은 patch 패턴). idleHeroIconRow가 아직 없어도
+    // (예: 마지막 렌더가 활성 블록이었던 경우) 인덱스 자체는 계속 전진시켜, 다음 유휴 렌더 시점에
+    // 자연스럽게 이어진 프레임을 보여준다.
+    func tickIdleFlameCycle() {
+        idleFlameCycleIndex = (idleFlameCycleIndex + 1) % MoodTier.allCases.count
+        guard let view = idleHeroIconRow?.view else { return }
+        let tier = MoodTier.allCases[idleFlameCycleIndex]
+        if let iconView = view.subviews.compactMap({ $0 as? NSImageView }).first {
+            iconView.image = moodFlameImage(tier: tier)
+        }
+        if let field = view.subviews.compactMap({ $0 as? NSTextField }).first {
+            field.textColor = tier.color.nsColor ?? .labelColor
+        }
+    }
+
     // buildTitleParts() 결과 맨 앞에 활성 축하 배지(있으면)를 얹는다 — 타이틀을 대체하지 않고
     // 실데이터 파트와 공존시키기 위한 공통 헬퍼.
     private func titlePartsWithBadge(_ ctx: TitleContext) -> [TitlePart] {
@@ -1958,11 +2015,19 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 메인 메뉴가 열리고 닫히는 시점을 추적 — refresh()가 그 사이에 스켈레톤을 보여줄지 판단한다.
+    // 유휴 순환 애니메이션도 여기서 함께 시작/중지한다 — 마침 유휴 상태에서 메뉴를 열면 다음 30초
+    // 자동 refresh를 기다리지 않고 즉시 순환이 시작된다.
     func menuWillOpen(_ menu: NSMenu) {
-        if menu === mainMenu { mainMenuIsOpen = true }
+        if menu === mainMenu {
+            mainMenuIsOpen = true
+            syncIdleFlameCycleTimer(isIdle: isCurrentlyIdle, menuOpen: mainMenuIsOpen)
+        }
     }
     func menuDidClose(_ menu: NSMenu) {
-        if menu === mainMenu { mainMenuIsOpen = false }
+        if menu === mainMenu {
+            mainMenuIsOpen = false
+            syncIdleFlameCycleTimer(isIdle: isCurrentlyIdle, menuOpen: mainMenuIsOpen)
+        }
     }
 
     // 메인 5시간 블록 메뉴 인스턴스를 최초 1회만 만들고 이후로는 재사용한다. footer(설정
@@ -2125,6 +2190,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // ── 5-Hour Block Section ──
         addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
         if let b = block {
+            isCurrentlyIdle = false
             // 재미 모드(무드 아이콘) on/off와 무관하게 항상 계산되는 색 — 색상 코딩은 가독성
             // 기능이지, 재미 모드가 게이팅하는 "기분" 표시 기능이 아니다. resolveMood()는
             // 재미 모드가 꺼져 있으면 항상 nil을 반환하므로 여기서는 쓰지 않고, 그 안에서 쓰는
@@ -2138,11 +2204,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             switch b.resetState {
             case .remaining(let text):
-                skeleton ? addSkeletonLabel(menu, big: true)
-                         : addHeroLabel(menu, "  " + t("\(text) 남음", "\(text) remaining"), color: heroColor, image: heroFlameIcon)
+                if skeleton { addSkeletonLabel(menu, big: true) }
+                else { addHeroLabel(menu, "  " + t("\(text) 남음", "\(text) remaining"), color: heroColor, image: heroFlameIcon) }
             case .alreadyReset:
-                skeleton ? addSkeletonLabel(menu, big: true)
-                         : addHeroLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"), color: heroColor, image: heroFlameIcon)
+                if skeleton { addSkeletonLabel(menu, big: true) }
+                else { addHeroLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"), color: heroColor, image: heroFlameIcon) }
             case .none:
                 break
             }
@@ -2180,9 +2246,17 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                          : addLabel(menu, "  \(tier.glyph) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: moodFlameImage(tier: tier))
             }
         } else {
-            addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
+            isCurrentlyIdle = true
+            // 진행률 실데이터가 없으므로 대신 MoodTier.allCases 전체를 순환 전시해 flameColors(for:)
+            // 팔레트를 유휴 상태에서도 보여준다 — 실제 순환은 tickIdleFlameCycle()이 idleHeroIconRow를
+            // 직접 patch하며 진행하고, 여기서는 매 렌더 시점의 현재 프레임만 반영한다.
+            let cycleTier = MoodTier.allCases[idleFlameCycleIndex % MoodTier.allCases.count]
+            idleHeroIconRow = addHeroLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"),
+                                            color: cycleTier.color.nsColor ?? .labelColor,
+                                            image: moodFlameImage(tier: cycleTier))
             addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
         }
+        syncIdleFlameCycleTimer(isIdle: isCurrentlyIdle, menuOpen: mainMenuIsOpen)
         menu.addItem(.separator())
 
         // ── Model Section ──
@@ -2772,9 +2846,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 5시간 블록 섹션에서 가장 중요한 값(남은 시간/리셋 상태)을 다른 줄보다 크고 굵게 강조한다.
-    // image: hero 줄 앞에 작은 불꽃 아이콘을 붙이기 위한 파라미터.
-    func addHeroLabel(_ menu: NSMenu, _ title: String, color: NSColor, image: NSImage? = nil) {
-        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold), color: color, image: image))
+    // image: hero 줄 앞에 작은 불꽃 아이콘을 붙이기 위한 파라미터. 생성한 NSMenuItem을 반환해
+    // 유휴 순환 애니메이션(tickIdleFlameCycle)처럼 이후 아이콘만 직접 patch해야 하는 호출부가
+    // 참조를 잡을 수 있게 한다 — 대부분의 호출부는 반환값이 필요 없으므로 @discardableResult.
+    @discardableResult
+    func addHeroLabel(_ menu: NSMenu, _ title: String, color: NSColor, image: NSImage? = nil) -> NSMenuItem {
+        let item = infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold), color: color, image: image)
+        menu.addItem(item)
+        return item
     }
 
     // addLabel과 폰트는 동일하되 색만 지정 — 진행률 바/경고 배너처럼 상태에 따라 색이 바뀌는 줄용.
@@ -3409,6 +3488,29 @@ func runSelfTests() -> Never {
     flickerApp.applyMood(.critical)
     check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: blaze 단계에서도 타이머 시작")
     flickerApp.flameFlickerTimer?.invalidate()
+
+    // F6 회귀: syncIdleFlameCycleTimer()는 유휴+메뉴 열림 조합일 때만 타이머를 돌려야 한다.
+    let idleCycleApp = ClaudeMonitorApp()
+    idleCycleApp.syncIdleFlameCycleTimer(isIdle: true, menuOpen: true)
+    check(idleCycleApp.idleFlameCycleTimer != nil, "syncIdleFlameCycleTimer: 유휴+메뉴 열림 → 타이머 시작")
+    idleCycleApp.syncIdleFlameCycleTimer(isIdle: false, menuOpen: true)
+    check(idleCycleApp.idleFlameCycleTimer == nil, "syncIdleFlameCycleTimer: 활성 블록으로 전환되면 타이머 중지")
+    idleCycleApp.syncIdleFlameCycleTimer(isIdle: true, menuOpen: true)
+    check(idleCycleApp.idleFlameCycleTimer != nil, "syncIdleFlameCycleTimer: 다시 유휴로 돌아오면 타이머 재시작")
+    idleCycleApp.syncIdleFlameCycleTimer(isIdle: true, menuOpen: false)
+    check(idleCycleApp.idleFlameCycleTimer == nil, "syncIdleFlameCycleTimer: 유휴여도 메뉴가 닫히면 타이머 중지")
+    idleCycleApp.idleFlameCycleTimer?.invalidate()
+
+    // F7 회귀: tickIdleFlameCycle()은 idleHeroIconRow가 없어도(예: 마지막 렌더가 활성 블록) 인덱스
+    // 자체는 계속 전진시키고, MoodTier.allCases 길이에서 wrap해야 한다.
+    let tickApp = ClaudeMonitorApp()
+    check(tickApp.idleFlameCycleIndex == 0, "tickIdleFlameCycle: 초기 인덱스 = 0")
+    for _ in 0..<MoodTier.allCases.count {
+        tickApp.tickIdleFlameCycle()
+    }
+    check(tickApp.idleFlameCycleIndex == 0, "tickIdleFlameCycle: MoodTier.allCases 개수만큼 돌면 다시 0으로 wrap")
+    tickApp.tickIdleFlameCycle()
+    check(tickApp.idleFlameCycleIndex == 1, "tickIdleFlameCycle: 매 호출마다 인덱스 1씩 전진")
 
     // TitleSettings (전용 UserDefaults suite로 실제 사용자 설정과 격리)
     let titleSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
