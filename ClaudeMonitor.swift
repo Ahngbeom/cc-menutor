@@ -283,33 +283,6 @@ extension TitleSettings {
     }
 }
 
-enum TitleIcon: String, CaseIterable {
-    case keyboard = "⌨", robot = "🤖", brain = "🧠", chat = "💬", bolt = "⚡", chart = "📊", diamond = "🔶", none = ""
-    var label: String {
-        switch self {
-        case .keyboard: return t("⌨️ 키보드 (기본)", "⌨️ Keyboard (Default)")
-        case .robot:    return t("🤖 로봇", "🤖 Robot")
-        case .brain:    return t("🧠 두뇌", "🧠 Brain")
-        case .chat:     return t("💬 말풍선", "💬 Speech Bubble")
-        case .bolt:     return t("⚡ 번개", "⚡ Bolt")
-        case .chart:    return t("📊 차트", "📊 Chart")
-        case .diamond:  return t("🔶 다이아몬드", "🔶 Diamond")
-        case .none:     return t("표시 안 함", "None")
-        }
-    }
-}
-
-extension TitleSettings {
-    private static let iconKey = "titleIcon"
-    static func icon(defaults: UserDefaults = .standard) -> TitleIcon {
-        guard let raw = defaults.string(forKey: iconKey), let i = TitleIcon(rawValue: raw) else { return .keyboard }
-        return i
-    }
-    static func setIcon(_ icon: TitleIcon, defaults: UserDefaults = .standard) {
-        defaults.set(icon.rawValue, forKey: iconKey)
-    }
-}
-
 enum RefreshInterval: TimeInterval, CaseIterable {
     case sec10 = 10, sec30 = 30, min1 = 60, min5 = 300
     var label: String {
@@ -985,81 +958,8 @@ func flameSway(elapsed: TimeInterval, phaseShift: Double = 0) -> CGFloat {
     return CGFloat(slow + fast) / 1.4   // 두 성분 합의 최대치(1.4)로 나눠 대략 -1...1로 정규화
 }
 
-// 무드 글리프의 "모양" 테마 — 색(TitleFieldColor)은 테마와 무관하게 MoodTier.color 그대로 쓴다.
-// 자유 텍스트 입력을 허용하지 않는 이유: 컬러 프레젠테이션 이모지를 넣으면 위 색상 틴팅이 조용히
-// 먹히지 않기 때문에(:712 주석 참고), 색 틴팅이 검증된 텍스트 프레젠테이션 글리프로만 구성된
-// 테마 중에서 고르게 한다.
-enum MoodGlyphTheme: String, CaseIterable {
-    case circles, bars, signature, flame
-
-    var label: String {
-        switch self {
-        case .circles:   return t("○ 원형 (기본)", "○ Circles (Default)")
-        case .bars:      return t("▁ 막대", "▁ Bars")
-        case .signature: return t("▮ 시그니쳐 (커서 블록)", "▮ Signature (Cursor Block)")
-        case .flame:     return t("🔥 불꽃 (불씨 → 화염)", "🔥 Flame (Ember → Blaze)")
-        }
-    }
-
-    // signature/flame 테마는 텍스트 글리프가 아니라 statusItem.button.image로 렌더링되므로(아래
-    // moodSignatureImage/moodFlameImage 참고) 이 값을 참조하는 호출부는 이미지 테마일 때 스킵한다.
-    var isImageBased: Bool { self == .signature || self == .flame }
-
-    // signature/flame은 텍스트 글리프가 아니라 이미지로 렌더링되므로 이 함수는 실제로 호출되지
-    // 않는다 — circles와 동일한 값을 반환해 만에 하나 호출되더라도(예: 향후 새 호출부 추가 실수)
-    // 빈 문자열 대신 안전한 폴백을 준다.
-    func glyph(for tier: MoodTier) -> String {
-        switch self {
-        case .circles, .signature, .flame:
-            return tier.glyph
-        case .bars:
-            switch tier {
-            case .idle:     return "▁"
-            case .calm:     return "▃"
-            case .warm:     return "▅"
-            case .hot:      return "▇"
-            case .critical: return "█"
-            }
-        }
-    }
-}
-
-// signature 테마 전용 커스텀 벡터 아이콘 — 유니코드 글리프 대신 Core Graphics로 직접 그린
-// "터미널 커서 블록" 모티프(Claude Code가 CLI 도구라는 정체성과 연결). tier가 올라갈수록 블록
-// 안쪽 채움이 바닥부터 차오른다.
-func moodSignatureImage(tier: MoodTier) -> NSImage {
-    let size = CGSize(width: 11, height: 14)
-    let fillRatio: CGFloat
-    switch tier {
-    case .idle:     fillRatio = 0
-    case .calm:     fillRatio = 0.25
-    case .warm:     fillRatio = 0.5
-    case .hot:      fillRatio = 0.75
-    case .critical: fillRatio = 1.0
-    }
-    let color = tier.color.nsColor ?? .labelColor
-    let image = NSImage(size: size, flipped: false) { rect in
-        let outlineRect = rect.insetBy(dx: 1, dy: 1)
-        let outline = NSBezierPath(roundedRect: outlineRect, xRadius: 2, yRadius: 2)
-        color.withAlphaComponent(0.4).setStroke()
-        outline.lineWidth = 1
-        outline.stroke()
-        if fillRatio > 0 {
-            let fillHeight = max(0, outlineRect.height * fillRatio - 2)
-            let fillRect = CGRect(x: outlineRect.minX + 1.5, y: outlineRect.minY + 1.5,
-                                   width: outlineRect.width - 3, height: fillHeight)
-            let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1)
-            color.withAlphaComponent(0.85).setFill()
-            fillPath.fill()
-        }
-        return true
-    }
-    image.isTemplate = false
-    return image
-}
-
-// flame 테마 전용 배색 — circles/bars/signature 테마가 공유하는 MoodTier.color(회색/초록/노랑/
-// 주황/빨강 "신호등" 배색)와는 별개다. 저 배색을 그대로 썼다면 calm이 초록으로 나와 "불씨"라는
+// flame 무드 아이콘 전용 배색 — MoodTier.color(회색/초록/노랑/주황/빨강 "신호등" 배색)와는 별개다.
+// 저 배색을 그대로 썼다면 calm이 초록으로 나와 "불씨"라는
 // 형태와 어긋난다. 빨강은 critical 전용으로 예약해(calm/warm/hot은 노랑~주황 범위에서만 움직임)
 // 낮은 진행률에서 빨강이 섞여 "한도를 다 썼다"는 오해를 주지 않게 한다. inner가 nil이면(idle)
 // 코어 하이라이트 없이 완전히 식은 색만 쓴다 — idle은 활성 블록이 없는 상태라 실제로 "타는 중"이
@@ -1083,8 +983,8 @@ func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
     }
 }
 
-// flame 테마 전용 커스텀 벡터 아이콘 — 이모지 🔥 대신 Core Graphics로 직접 그려 색 틴팅이
-// 정상 동작하게 한다(파일 상단 MoodGlyphTheme 주석 참고). FlameStage(3단계: 불씨/불꽃/화염)에
+// 무드 아이콘 전용 커스텀 벡터 아이콘 — 이모지 🔥 대신 Core Graphics로 직접 그려 색 틴팅이
+// 정상 동작하게 한다. FlameStage(3단계: 불씨/불꽃/화염)에
 // 따라 실루엣 자체가 커지고 복잡해진다 — 불씨는 화염 모양이 아니라 둥근 점, 불꽃은 표준 화염
 // 한 덩이, 화염은 메인 화염 옆에 곁불꽃이 하나 더 붙는다. flameColors(for:)의 outer/inner 2톤을
 // 겹쳐 칠해 실제 불꽃처럼 겉은 진하고 속은 밝은 느낌을 낸다 — 코어는 같은 실루엣을 가로 55%·
@@ -1187,31 +1087,14 @@ private func flameBezierPath(stage: FlameStage, in rect: CGRect, elapsed: TimeIn
     }
 }
 
-// statusItem.button.image에 대입할 이미지 — signature/flame 테마가 선택되어 있고 아이콘이 표시
-// 상태(TitleIcon != .none)이며 무드 타이어가 있을 때만 non-nil. 그 외에는 nil을 반환해 호출부가
-// "이전 테마의 잔류 이미지 지우기"에도 그대로 쓸 수 있게 한다(테마를 circles/bars로 되돌렸을 때
-// 이전 프레임 이미지가 남아있지 않도록).
+// statusItem.button.image에 대입할 이미지 — 무드 타이어가 있을 때만 non-nil. 그 외에는 nil을
+// 반환해 호출부가 "무드 아이콘이 꺼진 상태의 잔류 이미지 지우기"에도 그대로 쓸 수 있게 한다.
 func moodImageToApply(tier: MoodTier?) -> NSImage? {
-    let theme = TitleSettings.moodGlyphTheme()
-    guard TitleSettings.icon() != .none,
-          theme.isImageBased,
-          let tier = tier else { return nil }
-    // flame 테마는 refresh 트리거 시점에도 refreshFlameFlicker()가 매 0.2초마다 그리는 것과 동일한
-    // "지금 시각" 흔들림 프레임을 써야 한다 — elapsed를 0으로 고정하면 매 refresh마다 아이콘이 rest
-    // 포즈로 스냅됐다가 최대 0.2초 뒤 흔들림 타이머가 되돌리는 깜빡임이 생긴다.
-    return theme == .signature ? moodSignatureImage(tier: tier)
-                                : moodFlameImage(tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
-}
-
-extension TitleSettings {
-    private static let moodGlyphThemeKey = "moodGlyphTheme"
-    static func moodGlyphTheme(defaults: UserDefaults = .standard) -> MoodGlyphTheme {
-        guard let raw = defaults.string(forKey: moodGlyphThemeKey), let t = MoodGlyphTheme(rawValue: raw) else { return .circles }
-        return t
-    }
-    static func setMoodGlyphTheme(_ theme: MoodGlyphTheme, defaults: UserDefaults = .standard) {
-        defaults.set(theme.rawValue, forKey: moodGlyphThemeKey)
-    }
+    guard let tier = tier else { return nil }
+    // refresh 트리거 시점에도 refreshFlameFlicker()가 매 0.2초마다 그리는 것과 동일한 "지금 시각"
+    // 흔들림 프레임을 써야 한다 — elapsed를 0으로 고정하면 매 refresh마다 아이콘이 rest 포즈로
+    // 스냅됐다가 최대 0.2초 뒤 흔들림 타이머가 되돌리는 깜빡임이 생긴다.
+    return moodFlameImage(tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
 }
 
 // 순수 함수: 활성 블록 여부 + 경과 비율(예산 미설정 시) + usageWarning 비율(예산 설정 시, 우선)로 tier 산출.
@@ -1404,29 +1287,20 @@ struct TitleContext {
     }
 }
 
+let titleIconGlyph = "⌨"
+
 // idle/no-data 고정 문자열과 launch placeholder도 이 값을 공유해 커스터마이징과 어긋나지 않게 한다.
-func titleIconPrefix() -> String {
-    let icon = TitleSettings.icon().rawValue
-    return icon.isEmpty ? "" : "\(icon) "
-}
+func titleIconPrefix() -> String { "\(titleIconGlyph) " }
 
 struct TitlePart { let text: String; let color: TitleFieldColor }
 
 func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     var parts: [TitlePart] = []
-    // ctx.moodTier는 재미 모드 ON일 때만 non-nil — OFF면 기존처럼 정적 TitleIcon을 그대로 사용해
-    // 출력이 이전과 동일함을 보장한다. 사용자가 아이콘을 "표시 안 함"으로 두면 무드도 함께 숨긴다.
-    if TitleSettings.icon() != .none {
-        if let tier = ctx.moodTier {
-            // signature/flame 테마는 텍스트 파트가 아니라 statusItem.button.image로 렌더링된다
-            // (호출부의 moodImageToApply(tier:) 참고) — 여기서는 글리프 텍스트를 아예 만들지 않는다.
-            if !TitleSettings.moodGlyphTheme().isImageBased {
-                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color))
-            }
-        } else {
-            let icon = TitleSettings.icon().rawValue
-            if !icon.isEmpty { parts.append(TitlePart(text: icon, color: .defaultColor)) }
-        }
+    // ctx.moodTier는 재미 모드 ON일 때만 non-nil — 무드 아이콘은 텍스트가 아니라
+    // statusItem.button.image로 렌더링되므로(moodImageToApply(tier:) 참고) 여기서는 글리프
+    // 텍스트를 만들지 않는다. OFF면 고정 ⌨ 아이콘 텍스트를 그대로 쓴다.
+    if ctx.moodTier == nil {
+        parts.append(TitlePart(text: titleIconGlyph, color: .defaultColor))
     }
     for field in TitleSettings.enabledFieldsInOrder() {
         switch field {
@@ -1692,11 +1566,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let celebrationBadgeDuration: TimeInterval = 15
     private var isRefreshing = false
     weak var titleFieldsSubmenu: NSMenu?  // 열려 있는 표시 항목 서브메뉴 — 통째 재구성 없이 행만 갱신하기 위한 참조
-    // 아래 6개도 동일한 이유로 유지 — appendFooter()는 이제 obtainMainMenu()가 메인 메뉴 최초
+    // 아래 4개도 동일한 이유로 유지 — appendFooter()는 이제 obtainMainMenu()가 메인 메뉴 최초
     // 생성 시 딱 1회만 호출하므로 이 weak var들은 그 1회 생성된 인스턴스를 계속 가리킨다.
     weak var separatorSubmenu: NSMenu?
-    weak var iconSubmenu: NSMenu?
-    weak var moodThemeSubmenu: NSMenu?
     weak var refreshIntervalSubmenu: NSMenu?
     weak var languageSubmenu: NSMenu?
     weak var funModeSubmenu: NSMenu?
@@ -1940,20 +1812,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 한 틱이 더 발생해도(예: invalidate 직후 이미 큐잉된 틱) 안전하게 무시하기 위한 방어적 가드이다.
     private func refreshFlameFlicker() {
         guard TitleSettings.isFunModeFeatureEnabled(.moodIcon),
-              TitleSettings.icon() != .none,
-              TitleSettings.moodGlyphTheme() == .flame,
               let tier = lastMoodTier,
               flameStage(for: tier) != .ember else { return }
         statusItem.button?.image = moodFlameImage(tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
     }
 
-    // flame 테마 + 무드 아이콘 on + 아이콘 표시 + 활성 flame/blaze 단계일 때만 타이머를 돌린다. 그 외
-    // 조건에서는 타이머 자체를 멈춰 무의미한 5Hz 백그라운드 깨어남을 없앤다. refreshFlameFlicker()의
-    // 기존 가드는 안전망(방어적 이중 체크)으로 그대로 둔다.
+    // 무드 아이콘 on + 활성 flame/blaze 단계일 때만 타이머를 돌린다. 그 외 조건에서는 타이머 자체를
+    // 멈춰 무의미한 5Hz 백그라운드 깨어남을 없앤다. refreshFlameFlicker()의 기존 가드는 안전망
+    // (방어적 이중 체크)으로 그대로 둔다.
     private func syncFlameFlickerTimer() {
         let shouldRun = TitleSettings.isFunModeFeatureEnabled(.moodIcon)
-            && TitleSettings.icon() != .none
-            && TitleSettings.moodGlyphTheme() == .flame
             && (lastMoodTier.map { flameStage(for: $0) != .ember } ?? false)
         if shouldRun {
             guard flameFlickerTimer == nil else { return }
@@ -1992,8 +1860,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 렌더링한다(사용자가 고른 구분자가 적용됨).
     func renderIdleTitle(_ label: String) {
         let badge = activeCelebrationBadge()
-        let moodEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon) && TitleSettings.icon() != .none
-        // signature/flame 테마가 아니거나 무드가 꺼져 있으면 nil을 대입해 이전 프레임 이미지를 지운다.
+        let moodEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon)
+        // 무드가 꺼져 있으면 nil을 대입해 이전 프레임 이미지를 지운다.
         applyMood(moodEnabled ? (moodTestTierOverride() ?? .idle) : nil)
         guard badge != nil || moodEnabled else {
             renderTitle(plain: "\(titleIconPrefix())\(label)", warning: nil)
@@ -2002,10 +1870,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var parts: [TitlePart] = []
         if let badge = badge { parts.append(badge) }
         if moodEnabled {
-            let tier = moodTestTierOverride() ?? .idle
-            if !TitleSettings.moodGlyphTheme().isImageBased {
-                parts.append(TitlePart(text: TitleSettings.moodGlyphTheme().glyph(for: tier), color: tier.color))
-            }
+            // 무드 아이콘은 텍스트 글리프가 아니라 statusItem.button.image로 렌더링되므로(applyMood
+            // 참고) 여기서는 label만 붙인다.
             parts.append(TitlePart(text: label, color: .defaultColor))
         } else {
             parts.append(TitlePart(text: "\(titleIconPrefix())\(label)".trimmingCharacters(in: .whitespaces), color: .defaultColor))
@@ -2266,9 +2132,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let heroTier = moodTestTierOverride()
                 ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)
             let heroColor = heroTier.color.nsColor ?? .labelColor
-            // flame 아이콘 테마 선택 시에만 hero 줄 앞에 작은 불꽃 아이콘을 붙인다 — 아래 "기분" 줄이
-            // 이미 쓰는 조건부 패턴과 동일.
-            let heroFlameIcon = TitleSettings.moodGlyphTheme() == .flame ? moodFlameImage(tier: heroTier) : nil
+            // hero 줄 앞에 작은 불꽃 아이콘을 붙인다 — 재미 모드(무드 아이콘) on/off와 무관하게
+            // heroColor와 같은 이유로 항상 표시.
+            let heroFlameIcon = moodFlameImage(tier: heroTier)
 
             switch b.resetState {
             case .remaining(let text):
@@ -2310,9 +2176,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if let tier = b.moodTier {
                 let scopeWord = t(b.warning != nil ? "사용" : "경과", b.warning != nil ? "used" : "elapsed")
-                let flameIcon = TitleSettings.moodGlyphTheme() == .flame ? moodFlameImage(tier: tier) : nil
                 skeleton ? addSkeletonLabel(menu)
-                         : addLabel(menu, "  \(TitleSettings.moodGlyphTheme().glyph(for: tier)) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: flameIcon)
+                         : addLabel(menu, "  \(tier.glyph) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: moodFlameImage(tier: tier))
             }
         } else {
             addLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"))
@@ -2426,13 +2291,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(funModeItem)
         track(funModeItem, funModeMake)
 
-        // 무드 아이콘의 모양(테마)을 고르는 서브메뉴 — 무드 아이콘과 관련이 깊어 재미 모드 바로 다음에 배치.
-        let moodGlyphThemeMake = { "  🎨 " + t("무드 아이콘 모양", "Mood Icon Style") }
-        let moodGlyphThemeItem = NSMenuItem(title: moodGlyphThemeMake(), action: nil, keyEquivalent: "")
-        moodGlyphThemeItem.submenu = obtainMoodThemeSubmenu()
-        menu.addItem(moodGlyphThemeItem)
-        track(moodGlyphThemeItem, moodGlyphThemeMake)
-
         let titleFieldsMake = { "  ⌨ " + t("메뉴바 표시 항목", "Menu Bar Fields") }
         let titleFieldsItem = NSMenuItem(title: titleFieldsMake(), action: nil, keyEquivalent: "")
         titleFieldsItem.submenu = buildTitleFieldsSubmenu()
@@ -2444,13 +2302,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         separatorItem.submenu = obtainSeparatorSubmenu()
         menu.addItem(separatorItem)
         track(separatorItem, separatorMake)
-
-        // "메뉴바 표시 항목"과 같은 ⌨ 글리프를 쓰면 두 서브메뉴가 구분되지 않아 🖼로 분리.
-        let iconMake = { "  🖼 " + t("메뉴바 아이콘", "Menu Bar Icon") }
-        let iconItem = NSMenuItem(title: iconMake(), action: nil, keyEquivalent: "")
-        iconItem.submenu = obtainIconSubmenu()
-        menu.addItem(iconItem)
-        track(iconItem, iconMake)
 
         let refreshIntervalMake = { "  ⏱ " + t("자동 갱신 주기", "Auto-Refresh Interval") }
         let refreshIntervalItem = NSMenuItem(title: refreshIntervalMake(), action: nil, keyEquivalent: "")
@@ -2503,8 +2354,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTitleFieldsSubmenu()
         refreshFunModeSubmenu()
         refreshRadioSubmenu(separatorSubmenu, current: TitleSettings.separator(), action: #selector(setSeparatorButton(_:))) { $0.label }
-        refreshRadioSubmenu(iconSubmenu, current: TitleSettings.icon(), action: #selector(setIconButton(_:))) { $0.label }
-        refreshRadioSubmenu(moodThemeSubmenu, current: TitleSettings.moodGlyphTheme(), action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
         refreshRadioSubmenu(refreshIntervalSubmenu, current: RefreshSettings.interval(), action: #selector(setRefreshIntervalButton(_:))) { $0.label }
         refreshRadioSubmenu(languageSubmenu, current: TitleSettings.languagePreference(), action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
     }
@@ -2720,46 +2569,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshRadioSubmenu(separatorSubmenu, current: sep, action: #selector(setSeparatorButton(_:))) { $0.label }
     }
 
-    // ── 메뉴바 아이콘 서브메뉴(라디오 스타일 — 하나만 선택, "표시 안 함" 포함) ──
-    private func obtainIconSubmenu() -> NSMenu {
-        let current = TitleSettings.icon()
-        if let existing = iconSubmenu {
-            refreshRadioSubmenu(existing, current: current, action: #selector(setIconButton(_:))) { $0.label }
-            return existing
-        }
-        let sub = buildRadioSubmenuView(current: current, action: #selector(setIconButton(_:))) { $0.label }
-        iconSubmenu = sub
-        return sub
-    }
-
-    @objc func setIconButton(_ sender: NSButton) {
-        let icon = TitleIcon.allCases[sender.tag]
-        TitleSettings.setIcon(icon)
-        updateStatusBarTitle()
-        refreshRadioSubmenu(iconSubmenu, current: icon, action: #selector(setIconButton(_:))) { $0.label }
-    }
-
-    // ── 무드 아이콘 모양 서브메뉴(라디오 스타일 — 하나만 선택). 무드 아이콘 토글이 꺼져 있어도
-    // 다른 라디오 서브메뉴들과 동일하게 항상 노출한다 — 값을 미리 정해두면 나중에 토글을 켰을 때
-    // 그대로 적용된다. ──
-    private func obtainMoodThemeSubmenu() -> NSMenu {
-        let current = TitleSettings.moodGlyphTheme()
-        if let existing = moodThemeSubmenu {
-            refreshRadioSubmenu(existing, current: current, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
-            return existing
-        }
-        let sub = buildRadioSubmenuView(current: current, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
-        moodThemeSubmenu = sub
-        return sub
-    }
-
-    @objc func setMoodGlyphThemeButton(_ sender: NSButton) {
-        let theme = MoodGlyphTheme.allCases[sender.tag]
-        TitleSettings.setMoodGlyphTheme(theme)
-        updateStatusBarTitle()
-        refreshRadioSubmenu(moodThemeSubmenu, current: theme, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
-    }
-
     // ── 재미 모드 서브메뉴 행 — titleFieldRowView에서 이동/색상 버튼만 제거한 축소판. 라디오와
     // 달리 각 행이 자신의 on/off만 독립적으로 토글한다(하나를 켠다고 다른 게 꺼지지 않음). ──
     private func funModeRowView(feature: FunModeFeature, tag: Int) -> NSView {
@@ -2963,7 +2772,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 5시간 블록 섹션에서 가장 중요한 값(남은 시간/리셋 상태)을 다른 줄보다 크고 굵게 강조한다.
-    // image: flame 아이콘 테마 선택 시에만 hero 줄 앞에 작은 불꽃 아이콘을 붙이기 위한 파라미터.
+    // image: hero 줄 앞에 작은 불꽃 아이콘을 붙이기 위한 파라미터.
     func addHeroLabel(_ menu: NSMenu, _ title: String, color: NSColor, image: NSImage? = nil) {
         menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold), color: color, image: image))
     }
@@ -2984,8 +2793,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // ── 5시간 블록 진행률 전용 그래픽 캡슐 막대 ──
     // infoRowItem과 같은 컨벤션(row NSView를 만들어 NSMenuItem.view에 꽂고 isEnabled=false로 호버
     // 하이라이트 억제)을 따르되, 텍스트가 아니라 CALayer 기반 트랙/채움 뷰를 그린다. 채움 색은
-    // flameColors(for:)(상태바 flame 아이콘과 동일 팔레트)를 그대로 재사용해, 무드 아이콘 테마
-    // 선택과 무관하게 항상 같은 색 언어를 쓴다(heroColor 계산부 주석과 같은 원칙 — 색상 코딩은
+    // flameColors(for:)(상태바 flame 아이콘과 동일 팔레트)를 그대로 재사용해, 재미 모드(무드 아이콘)
+    // on/off와 무관하게 항상 같은 색 언어를 쓴다(heroColor 계산부 주석과 같은 원칙 — 색상 코딩은
     // 재미 모드 게이팅 대상이 아니라 가독성 기능). ratio가 nil이면 스켈레톤(빈 트랙만, 퍼센트 텍스트
     // 없음) — addSkeletonLabel과 동일하게 값이 아직 없다는 신호만 준다.
     private func flameProgressBarRow(ratio: Double?, tier: MoodTier) -> NSMenuItem {
@@ -3521,82 +3330,23 @@ func runSelfTests() -> Never {
         check(false, "egg: 전용 UserDefaults suite 생성 성공해야 함")
     }
 
-    // buildTitleParts: 무드 아이콘이 정적 아이콘 슬롯을 대체/미대체하는 순수 함수 로직 검증
-    // MoodTier.critical.glyph(circles 고정값)와 비교하므로, 실제 사용자가 무드 글리프 테마를
-    // bars로 바꿔둔 상태에서도 정확히 통과하도록 강제로 circles로 고정 후 복원한다.
-    let savedIconMood = UserDefaults.standard.string(forKey: "titleIcon")
-    let savedMoodGlyphThemeForMoodTest = UserDefaults.standard.string(forKey: "moodGlyphTheme")
-    TitleSettings.setMoodGlyphTheme(.circles)
-    TitleSettings.setIcon(.keyboard)
+    // buildTitleParts: 무드 아이콘이 정적 아이콘 텍스트 슬롯을 대체/미대체하는 순수 함수 로직 검증.
+    // 무드 아이콘은 텍스트 글리프가 아니라 statusItem.button.image로 렌더링되므로(moodImageToApply
+    // 참고) moodTier가 있으면 buildTitleParts는 글리프 텍스트를 전혀 만들지 않는다.
     let moodCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil, moodTier: .critical)
-    if let moodPart = buildTitleParts(moodCtx).first {
-        check(moodPart.text == MoodTier.critical.glyph, "mood: buildTitleParts 첫 파트가 무드 글리프")
-        check(moodPart.color == .red, "mood: buildTitleParts 첫 파트 색이 critical(red)")
-    } else {
-        check(false, "mood: buildTitleParts가 무드 파트를 반환해야 함")
-    }
+    check(!buildTitleParts(moodCtx).contains(where: { $0.text == MoodTier.critical.glyph || $0.text == titleIconGlyph }),
+          "mood: moodTier가 있으면 아이콘/글리프 텍스트를 만들지 않음(이미지로 렌더링)")
     let noMoodCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil)
     if let staticPart = buildTitleParts(noMoodCtx).first {
-        check(staticPart.text == "⌨", "mood: moodTier nil이면 기존 정적 아이콘 그대로(회귀 가드)")
+        check(staticPart.text == titleIconGlyph, "mood: moodTier nil이면 고정 정적 아이콘 그대로(회귀 가드)")
         check(staticPart.color == .defaultColor, "mood: moodTier nil이면 기본 색(회귀 가드)")
     } else {
         check(false, "mood: buildTitleParts가 아이콘 파트를 반환해야 함")
     }
-    TitleSettings.setIcon(.none)
-    let hiddenIconCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil, moodTier: .hot)
-    check(!buildTitleParts(hiddenIconCtx).contains(where: { $0.text == MoodTier.hot.glyph }),
-          "mood: 아이콘 '표시 안 함'이면 무드 글리프도 함께 숨김")
-    if let siMood = savedIconMood { UserDefaults.standard.set(siMood, forKey: "titleIcon") }
-    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
-    if let smgt = savedMoodGlyphThemeForMoodTest { UserDefaults.standard.set(smgt, forKey: "moodGlyphTheme") }
-    else { UserDefaults.standard.removeObject(forKey: "moodGlyphTheme") }
 
-    // MoodGlyphTheme.glyph(for:) 순수 함수 — 테마 간 구분성 검증
-    check(MoodGlyphTheme.bars.glyph(for: .critical) != MoodGlyphTheme.circles.glyph(for: .critical),
-          "moodGlyphTheme: bars와 circles는 서로 다른 글리프를 준다")
-    check(MoodGlyphTheme.circles.glyph(for: .critical) == MoodTier.critical.glyph,
-          "moodGlyphTheme: circles 테마는 MoodTier.glyph와 동일(기본값 하위호환)")
-
-    // buildTitleParts가 선택된 무드 글리프 테마를 반영하는지 (전역 .standard 키를 저장/복원)
-    let savedMoodGlyphTheme = UserDefaults.standard.string(forKey: "moodGlyphTheme")
-    TitleSettings.setIcon(.keyboard)
-    TitleSettings.setMoodGlyphTheme(.bars)
-    let barsCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil, moodTier: .critical)
-    check(buildTitleParts(barsCtx).first?.text == "█", "moodGlyphTheme: bars 선택 시 buildTitleParts가 █ 반환")
-    TitleSettings.setMoodGlyphTheme(.circles)
-    check(buildTitleParts(barsCtx).first?.text == "●", "moodGlyphTheme: circles로 되돌리면 다시 ● 반환")
-
-    // signature 테마: 텍스트 글리프 대신 statusItem.button.image로 렌더링되므로 buildTitleParts는
-    // 글리프 텍스트를 만들지 않아야 하고, moodImageToApply()는 조건(테마=signature, 아이콘 표시,
-    // tier 존재)이 모두 맞을 때만 이미지를 반환해야 한다.
-    TitleSettings.setMoodGlyphTheme(.signature)
-    check(!buildTitleParts(barsCtx).contains(where: { $0.text == MoodTier.critical.glyph || $0.text == "█" }),
-          "moodGlyphTheme: signature 선택 시 buildTitleParts가 텍스트 글리프를 만들지 않음(이미지로 렌더링)")
-    check(moodImageToApply(tier: .critical) != nil,
-          "moodImageToApply: signature 테마 + 아이콘 표시 + tier 있음 → 이미지 생성")
-    TitleSettings.setMoodGlyphTheme(.circles)
-    check(moodImageToApply(tier: .critical) == nil,
-          "moodImageToApply: circles 테마면 이미지 없음(nil)")
-    TitleSettings.setMoodGlyphTheme(.signature)
-    check(moodImageToApply(tier: nil) == nil,
-          "moodImageToApply: tier가 nil이면(무드 꺼짐) 이미지 없음")
-    TitleSettings.setIcon(.none)
-    check(moodImageToApply(tier: .critical) == nil,
-          "moodImageToApply: 아이콘 '표시 안 함'이면 signature 테마여도 이미지 없음")
-    TitleSettings.setIcon(.keyboard)
-
-    // flame 테마: signature와 동일한 이미지 기반 렌더링 규약을 따라야 한다.
-    TitleSettings.setMoodGlyphTheme(.flame)
-    check(!buildTitleParts(barsCtx).contains(where: { $0.text == MoodTier.critical.glyph || $0.text == "█" }),
-          "moodGlyphTheme: flame 선택 시 buildTitleParts가 텍스트 글리프를 만들지 않음(이미지로 렌더링)")
-    check(moodImageToApply(tier: .critical) != nil,
-          "moodImageToApply: flame 테마 + 아이콘 표시 + tier 있음 → 이미지 생성")
-    check(moodImageToApply(tier: nil) == nil,
-          "moodImageToApply: flame 테마여도 tier가 nil이면(무드 꺼짐) 이미지 없음")
-    TitleSettings.setIcon(.none)
-    check(moodImageToApply(tier: .critical) == nil,
-          "moodImageToApply: 아이콘 '표시 안 함'이면 flame 테마여도 이미지 없음")
-    TitleSettings.setIcon(.keyboard)
+    // moodImageToApply: tier 존재 여부에 따라서만 이미지 생성 여부가 갈린다(테마 선택 개념 없음).
+    check(moodImageToApply(tier: .critical) != nil, "moodImageToApply: tier 있음 → 이미지 생성")
+    check(moodImageToApply(tier: nil) == nil, "moodImageToApply: tier가 nil이면(무드 꺼짐) 이미지 없음")
 
     // FlameStage 그룹핑 불변식 — MoodTier 5단계를 정확히 3개의 아이콘 형태로 묶는지 검증
     check(flameStage(for: .idle) == flameStage(for: .calm), "flameStage: idle과 calm은 같은 불씨 단계")
@@ -3650,8 +3400,7 @@ func runSelfTests() -> Never {
           "moodImageToApply: flame/blaze 단계는 elapsed=0 고정 프레임이 아니라 실시간 elapsed 사용")
 
     // F5 회귀: syncFlameFlickerTimer()가 조건에 따라 타이머를 실제로 시작/중지하는지(정지 상태 =
-    // flameFlickerTimer == nil). 이 시점 TitleSettings.icon()은 .keyboard, moodGlyphTheme()은
-    // .flame으로 이미 설정돼 있다(위 flame 테마 테스트 블록에서 설정).
+    // flameFlickerTimer == nil).
     let flickerApp = ClaudeMonitorApp()
     flickerApp.applyMood(.hot)
     check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: flame 단계 진입 시 타이머 시작")
@@ -3659,13 +3408,7 @@ func runSelfTests() -> Never {
     check(flickerApp.flameFlickerTimer == nil, "syncFlameFlickerTimer: ember 단계로 돌아가면 타이머 중지")
     flickerApp.applyMood(.critical)
     check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: blaze 단계에서도 타이머 시작")
-    TitleSettings.setMoodGlyphTheme(.circles)
-    flickerApp.applyMood(.critical)
-    check(flickerApp.flameFlickerTimer == nil, "syncFlameFlickerTimer: flame 테마가 아니면 tier와 무관하게 타이머 중지")
     flickerApp.flameFlickerTimer?.invalidate()
-
-    if let smgt = savedMoodGlyphTheme { UserDefaults.standard.set(smgt, forKey: "moodGlyphTheme") }
-    else { UserDefaults.standard.removeObject(forKey: "moodGlyphTheme") }
 
     // TitleSettings (전용 UserDefaults suite로 실제 사용자 설정과 격리)
     let titleSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
@@ -3703,13 +3446,11 @@ func runSelfTests() -> Never {
     })
     let savedOrder2 = UserDefaults.standard.array(forKey: "titleFieldsOrder")
     let savedSeparator2 = UserDefaults.standard.string(forKey: "titleSeparator")
-    let savedIcon2 = UserDefaults.standard.string(forKey: "titleIcon")
     func setEnabled(_ fields: Set<TitleField>) {
         for f in TitleField.allCases { UserDefaults.standard.set(fields.contains(f), forKey: f.defaultsKey) }
     }
     UserDefaults.standard.set(TitleField.allCases.map(\.rawValue), forKey: "titleFieldsOrder")
     TitleSettings.setSeparator(.space)
-    TitleSettings.setIcon(.keyboard)
     let titleCtx = TitleContext(outputTokens: 12_300, totalTokens: 50_000, cost: 4.2,
                                 remainingText: nil, model: "claude-sonnet-4-5")
     setEnabled([.outputTokens, .cost])
@@ -3731,8 +3472,6 @@ func runSelfTests() -> Never {
     else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
     if let ss = savedSeparator2 { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
     else { UserDefaults.standard.removeObject(forKey: "titleSeparator") }
-    if let si = savedIcon2 { UserDefaults.standard.set(si, forKey: "titleIcon") }
-    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
 
     // TitleSettings.order / move (전용 UserDefaults suite로 격리)
     let orderSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
@@ -3778,34 +3517,8 @@ func runSelfTests() -> Never {
         check(false, "separator: 전용 UserDefaults suite 생성 성공해야 함")
     }
 
-    // TitleSettings.icon (전용 suite)
-    let iconSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
-    if let ic = UserDefaults(suiteName: iconSuite) {
-        check(TitleSettings.icon(defaults: ic) == .keyboard, "icon: 기본값 = 키보드")
-        TitleSettings.setIcon(.robot, defaults: ic)
-        check(TitleSettings.icon(defaults: ic) == .robot, "icon: 저장/조회 왕복")
-        ic.removePersistentDomain(forName: iconSuite)
-    } else {
-        check(false, "icon: 전용 UserDefaults suite 생성 성공해야 함")
-    }
-
-    // TitleSettings.moodGlyphTheme (전용 suite)
-    let moodGlyphThemeSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
-    if let mgt = UserDefaults(suiteName: moodGlyphThemeSuite) {
-        check(TitleSettings.moodGlyphTheme(defaults: mgt) == .circles, "moodGlyphTheme: 기본값 = 원형")
-        TitleSettings.setMoodGlyphTheme(.bars, defaults: mgt)
-        check(TitleSettings.moodGlyphTheme(defaults: mgt) == .bars, "moodGlyphTheme: 저장/조회 왕복")
-        mgt.removePersistentDomain(forName: moodGlyphThemeSuite)
-    } else {
-        check(false, "moodGlyphTheme: 전용 UserDefaults suite 생성 성공해야 함")
-    }
-    let savedIcon3 = UserDefaults.standard.string(forKey: "titleIcon")
-    TitleSettings.setIcon(.keyboard)
-    check(titleIconPrefix() == "⌨ ", "icon: titleIconPrefix 기본 아이콘")
-    TitleSettings.setIcon(.none)
-    check(titleIconPrefix() == "", "icon: titleIconPrefix 표시 안 함")
-    if let si3 = savedIcon3 { UserDefaults.standard.set(si3, forKey: "titleIcon") }
-    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
+    // titleIconPrefix — 고정 문자열(사용자가 고를 수 있는 선택지 없음)
+    check(titleIconPrefix() == "⌨ ", "icon: titleIconPrefix는 항상 고정 아이콘")
 
     // TitleSettings.color (전용 suite)
     let colorSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
@@ -3832,10 +3545,9 @@ func runSelfTests() -> Never {
         check(false, "refresh: 전용 UserDefaults suite 생성 성공해야 함")
     }
 
-    // buildTitleText: 커스텀 구분자 + 순서 + 아이콘 조합 (전역 .standard 키를 저장/복원 — enabled 상태도 포함)
+    // buildTitleText: 커스텀 구분자 + 순서 조합 (전역 .standard 키를 저장/복원 — enabled 상태도 포함)
     let savedOrder = UserDefaults.standard.array(forKey: "titleFieldsOrder")
     let savedSeparator = UserDefaults.standard.string(forKey: "titleSeparator")
-    let savedIcon4 = UserDefaults.standard.string(forKey: "titleIcon")
     let savedEnabled2 = Dictionary(uniqueKeysWithValues: TitleField.allCases.map {
         ($0, UserDefaults.standard.object(forKey: $0.defaultsKey))
     })
@@ -3843,17 +3555,12 @@ func runSelfTests() -> Never {
     let savedModelColor = UserDefaults.standard.string(forKey: "titleColor_model")
     setEnabled([.outputTokens, .cost, .model])
     UserDefaults.standard.set(["model", "cost", "outputTokens"], forKey: "titleFieldsOrder")
-    TitleSettings.setIcon(.keyboard)
     TitleSettings.setSeparator(.pipe)
     check(buildTitleText(titleCtx) == "⌨ | Sonnet 4.5 | $4.20 | \u{2007}12.3K",
           "title: 커스텀 순서(model→cost→outputTokens) + 구분자(|) 조합")
     TitleSettings.setSeparator(.none)
     check(buildTitleText(titleCtx) == "⌨Sonnet 4.5$4.20\u{2007}12.3K", "title: 구분자 없음 조합")
-    TitleSettings.setIcon(.robot)
     TitleSettings.setSeparator(.space)
-    check(buildTitleText(titleCtx) == "🤖 Sonnet 4.5 $4.20 \u{2007}12.3K", "title: 커스텀 아이콘(로봇) 조합")
-    TitleSettings.setIcon(.none)
-    check(buildTitleText(titleCtx) == "Sonnet 4.5 $4.20 \u{2007}12.3K", "title: 아이콘 없음 — 선행 구분자 없이 첫 필드부터 시작")
     TitleSettings.setColor(.blue, for: .cost)
     UserDefaults.standard.removeObject(forKey: "titleColor_model")  // 이 검증은 model이 미지정(defaultColor)임을 전제로 함
     let coloredParts = buildTitleParts(titleCtx)
@@ -3869,8 +3576,6 @@ func runSelfTests() -> Never {
     else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
     if let ss = savedSeparator { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
     else { UserDefaults.standard.removeObject(forKey: "titleSeparator") }
-    if let si4 = savedIcon4 { UserDefaults.standard.set(si4, forKey: "titleIcon") }
-    else { UserDefaults.standard.removeObject(forKey: "titleIcon") }
     for (field, value) in savedEnabled2 {
         if let v = value { UserDefaults.standard.set(v, forKey: field.defaultsKey) }
         else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
