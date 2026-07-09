@@ -331,6 +331,49 @@ enum RefreshSettings {
     }
 }
 
+// MARK: - Reset Anchor (5시간 블록 리셋 기준 시각 — 사용자가 claude.ai 등에서 확인한 실제
+// 리셋 순간을 등록하면, 이후 블록 계산이 FiveHourBlock.anchoredWindow(그 순간부터 5시간
+// 간격으로 반복되는 그리드)를 따른다. 사용자가 지우기 전까지 영구 유지되는 설정 —
+// 1회성 보정이 아니다.)
+
+enum ResetAnchorSettings {
+    private static let anchorKey = "resetAnchorInstant"
+    static func anchor(defaults: UserDefaults = .standard) -> Date? {
+        guard let raw = defaults.object(forKey: anchorKey) as? Double else { return nil }
+        return Date(timeIntervalSince1970: raw)
+    }
+    static func setAnchor(_ date: Date, defaults: UserDefaults = .standard) {
+        defaults.set(date.timeIntervalSince1970, forKey: anchorKey)
+    }
+    static func clearAnchor(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: anchorKey)
+    }
+}
+
+// "HH:mm"(24시간제, 로케일 무관 고정 포맷)을 now의 로컬 날짜에 적용해 Date로 변환한다.
+// 결과가 now 이전/같으면 자정을 넘긴 입력으로 보고 다음 날로 굴린다. 형식이 틀리면 nil.
+func parseLocalClockTime(_ text: String, relativeTo now: Date, calendar: Calendar = .current) -> Date? {
+    let parts = text.trimmingCharacters(in: .whitespaces).split(separator: ":")
+    guard parts.count == 2,
+          let hour = Int(parts[0]), let minute = Int(parts[1]),
+          (0...23).contains(hour), (0...59).contains(minute) else { return nil }
+    var comps = calendar.dateComponents([.year, .month, .day], from: now)
+    comps.hour = hour
+    comps.minute = minute
+    comps.second = 0
+    guard let candidate = calendar.date(from: comps) else { return nil }
+    if candidate <= now {
+        return calendar.date(byAdding: .day, value: 1, to: candidate)
+    }
+    return candidate
+}
+
+// parseLocalClockTime과 짝을 이루는 포맷터 — 로케일과 무관하게 항상 "HH:mm"(24시간제)로 표시한다.
+func formatLocalClockTime(_ date: Date, calendar: Calendar = .current) -> String {
+    let comps = calendar.dateComponents([.hour, .minute], from: date)
+    return String(format: "%02d:%02d", comps.hour ?? 0, comps.minute ?? 0)
+}
+
 // MARK: - Fun Mode (재미 모드 — 무드 아이콘 / 연속 사용 기록 / 마일스톤 축하, 3개 독립 토글)
 //
 // 세 기능은 서로 무관하므로(스트릭 기록은 보고 싶지만 타이틀을 가로채는 축하는 원치 않는 식) 하나의
@@ -707,8 +750,9 @@ struct FiveHourBlock {
     var isActive: Bool { Date() < end }
 
     // entries(시간 오름차순 정렬 가정)로 블록을 재구성하고, now가 포함된 활성 블록을 반환.
-    // 활성 블록이 없으면(최근 5시간 내 활동 없음) nil.
-    static func active(from entries: [UsageEntry], now: Date = Date()) -> FiveHourBlock? {
+    // 활성 블록이 없으면(최근 5시간 내 활동 없음) nil. anchor가 있으면 새 블록 시작점을
+    // floorToHourUTC 대신 anchoredWindow 그리드에 스냅한다(유휴 재시작 체이닝 로직은 그대로).
+    static func active(from entries: [UsageEntry], now: Date = Date(), anchor: Date? = nil) -> FiveHourBlock? {
         let fiveHours: TimeInterval = 5 * 3600
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!
@@ -722,7 +766,7 @@ struct FiveHourBlock {
             // 같은 블록 유지 조건: 현재 블록 끝 이전 && 직전 활동과의 공백 < 5시간
             let continues = start != nil && ts < end && ts.timeIntervalSince(lastTs) < fiveHours
             if !continues {
-                let s = floorToHourUTC(ts, cal)
+                let s = anchor.map { anchoredWindow(containing: ts, anchor: $0).start } ?? floorToHourUTC(ts, cal)
                 start = s
                 end = s.addingTimeInterval(fiveHours)
             }
@@ -732,6 +776,17 @@ struct FiveHourBlock {
         guard let s = start else { return nil }
         let block = FiveHourBlock(start: s, end: end)
         return now < block.end ? block : nil
+    }
+
+    // now를 포함하는 5시간 그리드 슬롯을 anchor 기준 절대 시각 산술로 계산한다(타임존/DST/
+    // 로케일 무관, now < anchor인 과거 방향도 음수 n으로 정확히 처리). 사용자가 claude.ai 등
+    // 외부에서 확인한 실제 리셋 순간을 anchor로 등록하면, 그 순간부터 5시간 간격으로 반복되는
+    // 그리드를 이후 블록 계산에 계속 재사용할 수 있다.
+    static func anchoredWindow(containing now: Date, anchor: Date) -> FiveHourBlock {
+        let fiveHours: TimeInterval = 5 * 3600
+        let n = (now.timeIntervalSince(anchor) / fiveHours).rounded(.down)
+        let start = anchor.addingTimeInterval(n * fiveHours)
+        return FiveHourBlock(start: start, end: start.addingTimeInterval(fiveHours))
     }
 
     private static func floorToHourUTC(_ date: Date, _ cal: Calendar) -> Date {
@@ -1592,6 +1647,8 @@ struct BlockSectionData {
     let warning: UsageWarning?
     let moodTier: MoodTier?
     let moodRatio: Double
+    let effectiveEnd: Date?           // 현재 표시 중인 블록의 유효 종료 시각(자연 계산이든 앵커
+                                       // 기준이든) — "리셋 기준 시각" 입력창 프리필용
 }
 
 struct BlockDisplayData {
@@ -1658,6 +1715,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var bodyItemCount = 0  // replaceBody(with:)가 이 개수만큼만 메인 메뉴 맨 앞에서 교체한다
     private var footerLocalizedItems: [(NSMenuItem, () -> String)] = []  // 언어 전환 시 footer title 패치용
     private weak var refreshButtonRow: NSMenuItem?  // "지금 새로고침"의 커스텀 뷰 항목 — 언어 전환 시 버튼 타이틀만 따로 patch
+    private weak var resetAnchorButtonRow: NSMenuItem?  // "리셋 기준 시각"의 커스텀 뷰 항목 — 언어 전환/앵커 변경 시 버튼 타이틀만 따로 patch
     private var coldStartTimer: Timer?  // 콜드 스타트(앱 최초 실행) 전용 로딩 점 순환 애니메이션 — 이후 refresh에는 관여하지 않음
     private var coldStartDotPhase = 0  // 0...3, 표시 폭 고정을 위해 미표시 구간은 공백으로 패딩
     private(set) var flameFlickerTimer: Timer?  // flame/blaze 단계에서만 syncFlameFlickerTimer()가 시작/중지한다
@@ -1963,18 +2021,32 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func updateStatusBarTitle(fromCache stats: StatsCache) {
         let active = stats.activeBlock()
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
-        let resetText: String = active.map(resetCountdownText(for:)) ?? ""
+        let anchor = ResetAnchorSettings.anchor()
         if let b = active {
             // 블록 구간의 실제 JSONL 엔트리(cachedAll)에서 토큰 수 기준으로 가장 많이 쓴 모델을
             // 채택한다. b.models 배열은 CLI가 모델을 처음 발견한 순서라 "최다 사용 모델"이 아닐 수
-            // 있으므로 신뢰하지 않는다.
+            // 있으므로 신뢰하지 않는다. 이 필터는 CLI가 실제로 집계한 자연 윈도우를 그대로 쓴다
+            // (앵커는 표시용 창/카운트다운/무드만 바꾸고, 토큰·비용 집계 창은 건드리지 않는다).
             let start = parseISO8601(b.startTime)
             let end = parseISO8601(b.endTime)
             let topModel: String? = {
                 guard let s = start, let e = end else { return nil }
                 return mostUsedModel(in: cachedAll.filter { $0.timestamp >= s && $0.timestamp < e })
             }()
-            let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning)
+            // 앵커가 설정돼 있으면 표시용 윈도우(카운트다운·무드)를 앵커 그리드 기준으로 바꾼다.
+            // 앵커가 없으면 기존 CLI 자연 윈도우 계산(b.elapsedRatio()/resetCountdownText)을
+            // 그대로 써서 동작 변화가 없게 한다.
+            let resetText: String
+            let elapsedRatio: Double
+            if let anchor = anchor {
+                let window = FiveHourBlock.anchoredWindow(containing: Date(), anchor: anchor)
+                resetText = formatTime(window.remaining)
+                elapsedRatio = window.progress
+            } else {
+                resetText = resetCountdownText(for: b)
+                elapsedRatio = b.elapsedRatio()
+            }
+            let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: elapsedRatio, warning: warning)
             applyMood(moodTier)
             let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
                                    totalTokens: b.totalTokens,
@@ -1992,7 +2064,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func updateStatusBarTitleFromEntries() {
-        let block = FiveHourBlock.active(from: cachedAll)
+        let block = FiveHourBlock.active(from: cachedAll, anchor: ResetAnchorSettings.anchor())
         let blockEntries: [UsageEntry]
         if let block = block {
             blockEntries = cachedAll.filter { $0.timestamp >= block.start && $0.timestamp < block.end }
@@ -2084,22 +2156,31 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func makeBlockDisplayData(fromCache stats: StatsCache) -> BlockDisplayData {
         let active = stats.activeBlock()
         let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
+        // 앵커가 설정돼 있으면 표시용 윈도우(시간창·진행률·리셋 텍스트·무드)를 앵커 그리드
+        // 기준으로 바꾼다. 토큰/비용(b.tokenCounts, b.costUSD)은 앵커 유무와 무관하게 CLI가
+        // 집계한 값 그대로 쓴다 — 표시 창과 CLI 집계 창이 살짝 어긋날 수 있다는 한계는
+        // README/CLAUDE.md에 문서화.
+        let anchorWindow: FiveHourBlock? = ResetAnchorSettings.anchor()
+            .map { FiveHourBlock.anchoredWindow(containing: Date(), anchor: $0) }
 
         let block: BlockSectionData?
         if let b = active {
             let start = parseISO8601(b.startTime)
             let end = parseISO8601(b.endTime)
             let windowText: String? = {
+                if let w = anchorWindow { return "\(formatTimeShort(w.start)) → \(formatTimeShort(w.end)) ⚓" }
                 guard let s = start, let e = end else { return nil }
                 return "\(formatTimeShort(s)) → \(formatTimeShort(e))"
             }()
             let progressRatio: Double = {
+                if let w = anchorWindow { return w.progress }
                 guard let s = start, let e = end else { return 0 }
                 let total = e.timeIntervalSince(s)
                 let elapsed = max(0, min(total, Date().timeIntervalSince(s)))
                 return total > 0 ? elapsed / total : 0
             }()
             let resetState: BlockSectionData.ResetState = {
+                if let w = anchorWindow { return .remaining(formatTime(w.remaining)) }
                 if let rm = b.projection?.remainingMinutes { return .remaining(formatTime(Double(rm) * 60)) }
                 if let e = end {
                     let rem = e.timeIntervalSinceNow
@@ -2113,14 +2194,15 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 totalTokens: b.totalTokens,
                 cost: b.costUSD,
                 messageCount: b.entries,
-                showProgressBar: start != nil && end != nil,
+                showProgressBar: anchorWindow != nil || (start != nil && end != nil),
                 progressRatio: progressRatio,
                 resetState: resetState,
-                warningResetText: resetCountdownText(for: b),
+                warningResetText: anchorWindow.map { formatTime($0.remaining) } ?? resetCountdownText(for: b),
                 burnRateText: b.burnRate?.costPerHour.map { formatCost($0) },
                 warning: warning,
-                moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: b.elapsedRatio(), warning: warning),
-                moodRatio: warning?.ratio ?? b.elapsedRatio()
+                moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: progressRatio, warning: warning),
+                moodRatio: warning?.ratio ?? progressRatio,
+                effectiveEnd: anchorWindow?.end ?? end
             )
         } else {
             block = nil
@@ -2377,6 +2459,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(refreshIntervalItem)
         track(refreshIntervalItem, refreshIntervalMake)
 
+        // 클릭 시 NSAlert로 실제 리셋 시각을 입력받는 액션 행 — 라디오 서브메뉴가 아니라
+        // "지금 새로고침"과 동일한 .view 기반 버튼 행이라 refreshButtonRow와 같은 이유로
+        // footerLocalizedItems(title 패치)가 아닌 resetAnchorButtonRow로 별도 추적한다.
+        let resetAnchorItem = NSMenuItem()
+        resetAnchorItem.view = actionRowView(title: resetAnchorButtonTitle(), action: #selector(openResetAnchorAlert(_:)))
+        menu.addItem(resetAnchorItem)
+        resetAnchorButtonRow = resetAnchorItem
+
         let languageMake = { "  🌐 " + t("표시 언어", "Display Language") }
         let languageItem = NSMenuItem(title: languageMake(), action: nil, keyEquivalent: "")
         languageItem.submenu = obtainLanguageSubmenu()
@@ -2410,6 +2500,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let button = refreshButtonRow?.view?.subviews.first as? NSButton {
             button.title = "  🔄 " + t("지금 새로고침", "Refresh Now")
         }
+        refreshResetAnchorButton()
         refreshTitleFieldsSubmenu()
         refreshFunModeSubmenu()
         refreshRadioSubmenu(separatorSubmenu, current: TitleSettings.separator(), action: #selector(setSeparatorButton(_:))) { $0.label }
@@ -2417,6 +2508,70 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshRadioSubmenu(moodThemeSubmenu, current: TitleSettings.moodGlyphTheme(), action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
         refreshRadioSubmenu(refreshIntervalSubmenu, current: RefreshSettings.interval(), action: #selector(setRefreshIntervalButton(_:))) { $0.label }
         refreshRadioSubmenu(languageSubmenu, current: TitleSettings.languagePreference(), action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
+    }
+
+    private func resetAnchorButtonTitle() -> String {
+        let state = ResetAnchorSettings.anchor() != nil ? t("설정됨", "On") : t("자동", "Automatic")
+        return "  ⚓ " + t("리셋 기준 시각: \(state)", "Reset Anchor: \(state)")
+    }
+
+    private func refreshResetAnchorButton() {
+        if let button = resetAnchorButtonRow?.view?.subviews.first as? NSButton {
+            button.title = resetAnchorButtonTitle()
+        }
+    }
+
+    // 현재 표시 중인 블록의 유효 종료 시각(자연 계산이든 이미 설정된 앵커 기준이든)을
+    // 입력창 프리필로 쓴다 — lastBlockDisplayData가 아직 없으면(콜드 스타트) 앵커가 있는
+    // 경우에만 그 그리드로 추정하고, 그마저 없으면 현재 시각으로 폴백한다.
+    private func currentEffectiveBlockEnd() -> Date {
+        if let data = lastBlockDisplayData {
+            switch data.state {
+            case .ready(let block, _, _, _), .loading(let block, _, _, _):
+                if let end = block?.effectiveEnd { return end }
+            case .noData:
+                break
+            }
+        }
+        if let anchor = ResetAnchorSettings.anchor() {
+            return FiveHourBlock.anchoredWindow(containing: Date(), anchor: anchor).end
+        }
+        return Date()
+    }
+
+    @objc func openResetAnchorAlert(_ sender: NSButton) {
+        let alert = NSAlert()
+        alert.messageText = t("리셋 기준 시각", "Reset Anchor Time")
+        alert.informativeText = t(
+            "claude.ai 사용량 페이지 등에서 확인한 정확한 리셋 시각을 HH:mm(24시간제)으로 입력하세요. 이후 블록도 이 시각을 기준으로 5시간 간격으로 반복 계산됩니다. 유휴 후 재시작 시점이 서버와 다시 어긋나면 다시 입력해 주세요. 비워두고 적용하면 자동 계산으로 되돌립니다.",
+            "Enter the exact reset time from claude.ai's usage page (or similar) as HH:mm (24-hour). Future blocks repeat every 5 hours from this moment. If the server's post-idle restart drifts again, just re-enter it. Leave blank and apply to revert to automatic calculation."
+        )
+        let field = NSTextField(string: formatLocalClockTime(currentEffectiveBlockEnd()))
+        field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: t("적용", "Apply"))
+        alert.addButton(withTitle: t("취소", "Cancel"))
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+
+        let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+        if text.isEmpty {
+            ResetAnchorSettings.clearAnchor()
+            refreshResetAnchorButton()
+            manualRefresh()
+            return
+        }
+        guard let corrected = parseLocalClockTime(text, relativeTo: Date()) else {
+            let err = NSAlert()
+            err.messageText = t("시각을 이해하지 못했습니다", "Could not parse the time")
+            err.informativeText = t("HH:mm 형식으로 입력해 주세요 (예: 20:41)", "Please use HH:mm format (e.g. 20:41)")
+            err.runModal()
+            return
+        }
+        ResetAnchorSettings.setAnchor(corrected)
+        refreshResetAnchorButton()
+        manualRefresh()
     }
 
     // ── 메뉴바 표시 항목 서브메뉴 — 커스텀 NSView 행(체크박스 + ▲/▼) ──
@@ -2711,7 +2866,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return BlockDisplayData(isEstimate: true, state: .noData)
         }
 
-        let activeBlock = FiveHourBlock.active(from: cachedAll)
+        let anchor = ResetAnchorSettings.anchor()
+        let activeBlock = FiveHourBlock.active(from: cachedAll, anchor: anchor)
         let blockEntries: [UsageEntry]
         if let activeBlock = activeBlock {
             blockEntries = cachedAll.filter { $0.timestamp >= activeBlock.start && $0.timestamp < activeBlock.end }
@@ -2724,8 +2880,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let block: BlockSectionData?
         if let activeBlock = activeBlock {
             let rem = activeBlock.remaining
+            let anchorMarker = anchor != nil ? " ⚓" : ""
             block = BlockSectionData(
-                windowText: "\(formatTimeShort(activeBlock.start)) → \(formatTimeShort(activeBlock.end))",
+                windowText: "\(formatTimeShort(activeBlock.start)) → \(formatTimeShort(activeBlock.end))\(anchorMarker)",
                 outputTokens: blockStats.outputTokens,
                 totalTokens: blockStats.totalTokens,
                 cost: blockStats.totalCost,
@@ -2737,7 +2894,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 burnRateText: nil,
                 warning: warning,
                 moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: activeBlock.progress, warning: warning),
-                moodRatio: warning?.ratio ?? activeBlock.progress
+                moodRatio: warning?.ratio ?? activeBlock.progress,
+                effectiveEnd: activeBlock.end
             )
         } else {
             block = nil
@@ -3029,6 +3187,73 @@ func runSelfTests() -> Never {
 
     // 빈 입력
     check(FiveHourBlock.active(from: [], now: base) == nil, "빈 entries → nil")
+
+    // FiveHourBlock.anchoredWindow — 절대 시각 산술 그리드
+    let anchorBase = Date(timeIntervalSince1970: 1_704_067_241)  // 임의 순간(정시 아님) 기준 앵커
+    do {
+        let w = FiveHourBlock.anchoredWindow(containing: anchorBase, anchor: anchorBase)
+        check(abs(w.start.timeIntervalSince1970 - anchorBase.timeIntervalSince1970) < 1, "now == anchor → start == anchor")
+        check(abs(w.end.timeIntervalSince1970 - (anchorBase + 5 * h).timeIntervalSince1970) < 1, "now == anchor → end == anchor+5h")
+    }
+    do {
+        let w = FiveHourBlock.anchoredWindow(containing: anchorBase + 5 * h + 1800, anchor: anchorBase)
+        check(abs(w.start.timeIntervalSince1970 - (anchorBase + 5 * h).timeIntervalSince1970) < 1,
+              "anchor+5h30m → 다음 그리드 슬롯(anchor+5h)에 스냅")
+    }
+    do {
+        // now가 anchor보다 과거 → 음수 n으로 과거 그리드 슬롯을 정확히 찾아야 함
+        let w = FiveHourBlock.anchoredWindow(containing: anchorBase - h, anchor: anchorBase)
+        check(abs(w.start.timeIntervalSince1970 - (anchorBase - 5 * h).timeIntervalSince1970) < 1,
+              "anchor-1h(과거 방향) → start == anchor-5h")
+        check(abs(w.end.timeIntervalSince1970 - anchorBase.timeIntervalSince1970) < 1, "anchor-1h → end == anchor")
+    }
+
+    // FiveHourBlock.active(from:now:anchor:) — 앵커 지정 시 새 블록 시작점이 floorToHourUTC 대신
+    // 앵커 그리드에 스냅되는지. 앵커 없을 때는 기존 동작과 동일해야 한다(위 테스트들로 이미 검증됨).
+    if let b = FiveHourBlock.active(from: [entry(base + 1800)], now: base + 2 * h, anchor: anchorBase) {
+        // base+1800(00:30)이 속한 anchorBase 기준 그리드 슬롯 시작점과 일치해야 함
+        let expected = FiveHourBlock.anchoredWindow(containing: base + 1800, anchor: anchorBase).start
+        check(abs(b.start.timeIntervalSince1970 - expected.timeIntervalSince1970) < 1,
+              "앵커 지정 시 floor-to-hour 대신 앵커 그리드에 스냅")
+    } else {
+        check(false, "앵커 지정 케이스도 활성 블록 반환돼야 함")
+    }
+
+    // ResetAnchorSettings — 전용 UserDefaults suite로 격리
+    let resetAnchorSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let rad = UserDefaults(suiteName: resetAnchorSuite) {
+        check(ResetAnchorSettings.anchor(defaults: rad) == nil, "resetAnchor: 기본값 = nil(자동)")
+        let sample = Date(timeIntervalSince1970: 1_704_067_241)
+        ResetAnchorSettings.setAnchor(sample, defaults: rad)
+        check(abs((ResetAnchorSettings.anchor(defaults: rad)?.timeIntervalSince1970 ?? 0) - sample.timeIntervalSince1970) < 1,
+              "resetAnchor: 저장/조회 왕복")
+        ResetAnchorSettings.clearAnchor(defaults: rad)
+        check(ResetAnchorSettings.anchor(defaults: rad) == nil, "resetAnchor: 해제 후 다시 nil")
+        rad.removePersistentDomain(forName: resetAnchorSuite)
+    } else {
+        check(false, "resetAnchor: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // parseLocalClockTime / formatLocalClockTime
+    let clockCal: Calendar = { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "Asia/Seoul")!; return c }()
+    let clockNow = Date(timeIntervalSince1970: 1_704_074_400)  // 2024-01-01 11:00:00 UTC == 20:00 KST
+    if let parsed = parseLocalClockTime("20:41", relativeTo: clockNow, calendar: clockCal) {
+        check(formatLocalClockTime(parsed, calendar: clockCal) == "20:41", "parseLocalClockTime: 정상 입력 왕복")
+        check(parsed > clockNow, "parseLocalClockTime: 오늘 20:00 시점에 20:41 입력 → 아직 안 지난 오늘 시각")
+    } else {
+        check(false, "parseLocalClockTime: 정상 입력(20:41) 파싱 실패하면 안 됨")
+    }
+    if let rolled = parseLocalClockTime("09:00", relativeTo: clockNow, calendar: clockCal) {
+        // now(20:00 KST)보다 이전 시각(09:00) 입력 → 다음 날로 굴러야 함(같은 날짜로 굴렀다면
+        // 버그 — day-diff는 시각까지 반영해 truncate되므로 달력일 자체를 비교한다)
+        let nextCalendarDay = clockCal.date(byAdding: .day, value: 1, to: clockCal.startOfDay(for: clockNow))!
+        check(clockCal.isDate(rolled, inSameDayAs: nextCalendarDay), "parseLocalClockTime: now 이전 시각 입력 시 다음날로 roll")
+    } else {
+        check(false, "parseLocalClockTime: roll 케이스도 파싱 성공해야 함")
+    }
+    check(parseLocalClockTime("abc", relativeTo: clockNow) == nil, "parseLocalClockTime: 잘못된 형식 → nil")
+    check(parseLocalClockTime("25:00", relativeTo: clockNow) == nil, "parseLocalClockTime: 범위 밖 시(25) → nil")
+    check(parseLocalClockTime("10:61", relativeTo: clockNow) == nil, "parseLocalClockTime: 범위 밖 분(61) → nil")
 
     // StatsCache 디코드 (실제 stats-cache.json 구조 픽스처)
     let todayStr: String = {
