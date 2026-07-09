@@ -7,6 +7,7 @@
 
 import Cocoa
 import Foundation
+import QuartzCore
 
 let APP_VERSION = "1.7"
 
@@ -906,12 +907,6 @@ func formatTime(_ interval: TimeInterval) -> String {
     let m = (Int(interval) % 3600) / 60
     if h > 0 { return "\(h)h \(m)m" }
     return "\(m)m"
-}
-
-func progressBar(_ ratio: Double, width: Int = 10) -> String {
-    let filled = Int(ratio * Double(width))
-    let empty = width - filled
-    return "[" + String(repeating: "█", count: filled) + String(repeating: "░", count: empty) + "]"
 }
 
 func formatTimeShort(_ date: Date) -> String {
@@ -2268,22 +2263,26 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 기능이지, 재미 모드가 게이팅하는 "기분" 표시 기능이 아니다. resolveMood()는
             // 재미 모드가 꺼져 있으면 항상 nil을 반환하므로 여기서는 쓰지 않고, 그 안에서 쓰는
             // moodTestTierOverride()/computeMood()를 직접 호출해 QA 오버라이드만 재사용한다.
-            let heroColor = (moodTestTierOverride()
-                ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)).color.nsColor ?? .labelColor
+            let heroTier = moodTestTierOverride()
+                ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)
+            let heroColor = heroTier.color.nsColor ?? .labelColor
+            // flame 아이콘 테마 선택 시에만 hero 줄 앞에 작은 불꽃 아이콘을 붙인다 — 아래 "기분" 줄이
+            // 이미 쓰는 조건부 패턴과 동일.
+            let heroFlameIcon = TitleSettings.moodGlyphTheme() == .flame ? moodFlameImage(tier: heroTier) : nil
 
             switch b.resetState {
             case .remaining(let text):
                 skeleton ? addSkeletonLabel(menu, big: true)
-                         : addHeroLabel(menu, "  " + t("\(text) 남음", "\(text) remaining"), color: heroColor)
+                         : addHeroLabel(menu, "  " + t("\(text) 남음", "\(text) remaining"), color: heroColor, image: heroFlameIcon)
             case .alreadyReset:
                 skeleton ? addSkeletonLabel(menu, big: true)
-                         : addHeroLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"), color: heroColor)
+                         : addHeroLabel(menu, "  " + t("✅ 블록 리셋됨 — 새 블록 시작 가능", "✅ Block reset — a new block can start"), color: heroColor, image: heroFlameIcon)
             case .none:
                 break
             }
             if b.showProgressBar {
-                skeleton ? addSkeletonLabel(menu)
-                         : addColoredLabel(menu, "  " + t("\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% 경과", "\(progressBar(b.progressRatio, width: 12)) \(Int(b.progressRatio * 100))% elapsed"), color: heroColor)
+                skeleton ? addSkeletonProgressBar(menu)
+                         : addFlameProgressBar(menu, ratio: b.progressRatio, tier: heroTier)
             }
 
             if skeleton {
@@ -2964,8 +2963,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 5시간 블록 섹션에서 가장 중요한 값(남은 시간/리셋 상태)을 다른 줄보다 크고 굵게 강조한다.
-    func addHeroLabel(_ menu: NSMenu, _ title: String, color: NSColor) {
-        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold), color: color))
+    // image: flame 아이콘 테마 선택 시에만 hero 줄 앞에 작은 불꽃 아이콘을 붙이기 위한 파라미터.
+    func addHeroLabel(_ menu: NSMenu, _ title: String, color: NSColor, image: NSImage? = nil) {
+        menu.addItem(infoRowItem(title, font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold), color: color, image: image))
     }
 
     // addLabel과 폰트는 동일하되 색만 지정 — 진행률 바/경고 배너처럼 상태에 따라 색이 바뀌는 줄용.
@@ -2979,6 +2979,74 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let font = big ? NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold)
                        : NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         menu.addItem(infoRowItem("  ░░░░░░░░░░░░", font: font, color: .tertiaryLabelColor))
+    }
+
+    // ── 5시간 블록 진행률 전용 그래픽 캡슐 막대 ──
+    // infoRowItem과 같은 컨벤션(row NSView를 만들어 NSMenuItem.view에 꽂고 isEnabled=false로 호버
+    // 하이라이트 억제)을 따르되, 텍스트가 아니라 CALayer 기반 트랙/채움 뷰를 그린다. 채움 색은
+    // flameColors(for:)(상태바 flame 아이콘과 동일 팔레트)를 그대로 재사용해, 무드 아이콘 테마
+    // 선택과 무관하게 항상 같은 색 언어를 쓴다(heroColor 계산부 주석과 같은 원칙 — 색상 코딩은
+    // 재미 모드 게이팅 대상이 아니라 가독성 기능). ratio가 nil이면 스켈레톤(빈 트랙만, 퍼센트 텍스트
+    // 없음) — addSkeletonLabel과 동일하게 값이 아직 없다는 신호만 준다.
+    private func flameProgressBarRow(ratio: Double?, tier: MoodTier) -> NSMenuItem {
+        let leftInset: CGFloat = 14   // 다른 본문 줄과 좌측 정렬 맞춤
+        let barWidth: CGFloat = 200
+        let barHeight: CGFloat = 8
+        let gap: CGFloat = 8
+        let rightPad: CGFloat = 6
+        let rowHeight: CGFloat = 22
+
+        // "100%" 폭을 항상 확보해 두어, 스켈레톤→실제값 전환 시 행 폭이 흔들리지 않게 한다.
+        let percentField = NSTextField(labelWithString: ratio.map { "\(Int($0 * 100))%" } ?? "")
+        percentField.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        percentField.textColor = .labelColor
+        percentField.sizeToFit()
+        let percentWidth: CGFloat = max(percentField.frame.width, 30)
+
+        let row = NSView(frame: NSRect(x: 0, y: 0,
+                                        width: leftInset + barWidth + gap + percentWidth + rightPad,
+                                        height: rowHeight))
+
+        let track = NSView(frame: NSRect(x: leftInset, y: (rowHeight - barHeight) / 2, width: barWidth, height: barHeight))
+        track.wantsLayer = true
+        track.layer?.cornerRadius = barHeight / 2
+        track.layer?.masksToBounds = true
+        track.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
+        row.addSubview(track)
+
+        if let ratio = ratio {
+            let clamped = min(max(ratio, 0), 1)
+            // 코너 반지름×2보다 좁으면 캡슐 모양이 깨지므로 최소 폭을 그만큼 클램프한다.
+            let fillWidth = clamped <= 0 ? 0 : max(barHeight, barWidth * CGFloat(clamped))
+            if fillWidth > 0 {
+                let fill = NSView(frame: NSRect(x: 0, y: 0, width: fillWidth, height: barHeight))
+                fill.wantsLayer = true
+                let gradient = CAGradientLayer()
+                gradient.frame = fill.bounds
+                let colors = flameColors(for: tier)
+                gradient.colors = [colors.outer.cgColor, (colors.inner ?? colors.outer).cgColor]
+                gradient.startPoint = CGPoint(x: 0, y: 0.5)
+                gradient.endPoint = CGPoint(x: 1, y: 0.5)
+                gradient.cornerRadius = barHeight / 2
+                fill.layer = gradient
+                track.addSubview(fill)
+            }
+            percentField.frame.origin = NSPoint(x: leftInset + barWidth + gap, y: (rowHeight - percentField.frame.height) / 2)
+            row.addSubview(percentField)
+        }
+
+        let item = NSMenuItem()
+        item.view = row
+        item.isEnabled = false
+        return item
+    }
+
+    private func addFlameProgressBar(_ menu: NSMenu, ratio: Double, tier: MoodTier) {
+        menu.addItem(flameProgressBarRow(ratio: ratio, tier: tier))
+    }
+
+    private func addSkeletonProgressBar(_ menu: NSMenu) {
+        menu.addItem(flameProgressBarRow(ratio: nil, tier: .idle))
     }
 
     // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
