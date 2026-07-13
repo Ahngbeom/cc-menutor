@@ -5,7 +5,7 @@
 # 사용자 기계에서 소스를 직접 빌드하므로 코드서명·Gatekeeper 이슈가 없다.
 set -euo pipefail
 
-VERSION="1.8"
+VERSION="1.9"
 INSTALL_DIR="${HOME}/.local/share/cc-menutor"
 TARBALL="https://github.com/Ahngbeom/cc-menutor/archive/refs/tags/v${VERSION}.tar.gz"
 
