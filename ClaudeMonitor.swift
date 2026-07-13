@@ -833,43 +833,6 @@ func formatTokens(_ n: Int) -> String {
     }
 }
 
-extension String {
-    // padding(toLength:withPad:startingAt:)는 오른쪽 패딩만 지원해 왼쪽 패딩용으로 직접 추가.
-    func leftPad(to width: Int, with pad: String) -> String {
-        let deficit = width - count
-        guard deficit > 0 else { return self }
-        return String(repeating: pad, count: deficit) + self
-    }
-}
-
-// 타이틀 전용 — 각 자릿수 구간(정수/K/M) 내부에서 폭을 고정해 refresh마다 값이 오를 때 생기는
-// 잦은 타이틀 폭 흔들림을 줄인다. 구간 경계(999→1.0K 등, 블록 생애주기에 드물게 1회)는 정보
-// 손실 없이 고정할 수 없어 그대로 둔다. 피겨 스페이스(U+2007)는 San Francisco 등 타이틀에 쓰는
-// monospacedDigitSystemFont 계열에서 숫자와 동일 폭을 갖도록 설계된 문자라 패딩에 적합하다.
-func formatTokensStable(_ n: Int) -> String {
-    let figureSpace = "\u{2007}"
-    switch n {
-    case 0..<1_000:
-        return String(n).leftPad(to: 3, with: figureSpace)
-    case 0..<1_000_000:
-        let kText = String(format: "%.1fK", Double(n) / 1_000)
-        // 반올림으로 999.9K를 넘겨 "1000.0K"(7자)가 되면 구간 내 폭 고정이 깨지므로, 그 값은
-        // 정보 손실 없이 M 단위로 승격해 표시한다(예: 999,950 → "1.00M").
-        if kText.count > 6 {
-            return String(format: "%.2fM", Double(n) / 1_000_000).leftPad(to: 7, with: figureSpace)
-        }
-        return kText.leftPad(to: 6, with: figureSpace)
-    default:
-        let mText = String(format: "%.2fM", Double(n) / 1_000_000)
-        // 이 앱이 다루는 5시간 블록/일간/누적 토큰 규모를 크게 벗어나는 극단치(약 10억 근접)에서만
-        // 발생 — B(10억) 단위 버킷을 새로 만들기보다 폭 고정을 지키는 쪽을 택해 상한 고정 표기한다.
-        if mText.count > 7 {
-            return "999.99M"
-        }
-        return mText.leftPad(to: 7, with: figureSpace)
-    }
-}
-
 func formatCost(_ c: Double) -> String {
     if c < 0.01 { return String(format: "$%.4f", c) }
     return String(format: "$%.2f", c)
@@ -924,6 +887,34 @@ enum MoodTier: String, CaseIterable {
         case .hot:      return t("가속", "Accelerating")
         case .critical: return t("한계 근접", "Near Limit")
         }
+    }
+}
+
+// 무드 아이콘의 "모양" 테마 — 5개 전부 이모지 대신 Core Graphics로 직접 그리는 커스텀 벡터
+// 아이콘이라(색 틴팅 문제, flame 관련 주석 참고) 과거 circles/bars 같은 텍스트 글리프 테마에
+// 있던 isImageBased 구분이 필요 없다. flame이 첫 케이스이자 기본값 — 기존 사용자 경험을 그대로 유지.
+enum MoodGlyphTheme: String, CaseIterable {
+    case flame, thermometer, battery, gauge, volcano
+
+    var label: String {
+        switch self {
+        case .flame:       return t("🔥 불꽃 (기본)", "🔥 Flame (Default)")
+        case .thermometer: return t("🌡️ 온도계", "🌡️ Thermometer")
+        case .battery:     return t("🔋 배터리", "🔋 Battery")
+        case .gauge:       return t("🎚️ 게이지", "🎚️ Gauge")
+        case .volcano:     return t("🌋 화산", "🌋 Volcano")
+        }
+    }
+}
+
+extension TitleSettings {
+    private static let moodGlyphThemeKey = "moodGlyphTheme"
+    static func moodGlyphTheme(defaults: UserDefaults = .standard) -> MoodGlyphTheme {
+        guard let raw = defaults.string(forKey: moodGlyphThemeKey), let theme = MoodGlyphTheme(rawValue: raw) else { return .flame }
+        return theme
+    }
+    static func setMoodGlyphTheme(_ theme: MoodGlyphTheme, defaults: UserDefaults = .standard) {
+        defaults.set(theme.rawValue, forKey: moodGlyphThemeKey)
     }
 }
 
@@ -1092,6 +1083,338 @@ private func flameBezierPath(stage: FlameStage, in rect: CGRect, elapsed: TimeIn
     }
 }
 
+// MARK: - Thermometer Mood Icon Theme
+//
+// flame과 동일한 3단계 그룹핑(idle+calm/warm+hot/critical)을 재사용하되, 실루엣 자체는 바뀌지
+// 않고(구근+관) "액체가 바닥부터 얼마나 찼는지"만 단계별로 커진다. 구근은 항상 가득 찬 것으로
+// 그린다(실제 온도계도 구근 저장분은 항상 있고 관을 타고 오르내리는 건 액주뿐이므로) — 그래서
+// low 단계에서도 완전히 빈 아이콘이 아니라 구근만 찬 모습으로 보인다.
+enum ThermometerStage: String, CaseIterable { case low, mid, high }
+
+func thermometerStage(for tier: MoodTier) -> ThermometerStage {
+    switch tier {
+    case .idle, .calm: return .low
+    case .warm, .hot:  return .mid
+    case .critical:    return .high
+    }
+}
+
+// flame과 동일한 초록→노랑→주황→빨강 위험도 색 언어를 그대로 재사용한다 — 모양만 다르고 색
+// 코딩은 앱 전체에서 일관되게 유지하기 위함.
+func thermometerColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
+
+private func thermometerFillPath(in rect: CGRect, ratio: CGFloat) -> NSBezierPath {
+    let bulbDiameter = rect.width * 0.85
+    let bulbRect = CGRect(x: rect.midX - bulbDiameter / 2, y: rect.minY, width: bulbDiameter, height: bulbDiameter)
+    let path = NSBezierPath(ovalIn: bulbRect)
+    let tubeWidth = rect.width * 0.34
+    let tubeMaxHeight = rect.height - bulbDiameter * 0.82
+    let tubeHeight = max(0, tubeMaxHeight * max(0, min(1, ratio)))
+    if tubeHeight > 0 {
+        let tubeRect = CGRect(x: rect.midX - tubeWidth / 2, y: bulbRect.minY + bulbDiameter * 0.18,
+                               width: tubeWidth, height: tubeHeight)
+        path.append(NSBezierPath(roundedRect: tubeRect, xRadius: tubeWidth / 2, yRadius: tubeWidth / 2))
+    }
+    return path
+}
+
+// low 단계는 elapsed와 무관하게 항상 정적(관 액주 높이 고정) — mid/high만 flameSway로 액면이
+// 미세하게 출렁인다(flameSway는 flame 전용 이름이지만 흔들림 곡선 자체는 범용이라 그대로 재사용).
+private func thermometerBezierPath(stage: ThermometerStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
+    switch stage {
+    case .low:
+        return thermometerFillPath(in: rect, ratio: 0.18)
+    case .mid:
+        let sway = flameSway(elapsed: elapsed)
+        return thermometerFillPath(in: rect, ratio: 0.55 + sway * 0.06)
+    case .high:
+        let sway = flameSway(elapsed: elapsed)
+        return thermometerFillPath(in: rect, ratio: 0.92 + sway * 0.05)
+    }
+}
+
+// flame과 동일한 outer/inner 2톤 오버레이 기법 — 같은 실루엣을 좁은 inset 영역에 다시 그려
+// 가운데가 밝게 빛나는 액주 하이라이트를 낸다.
+func moodThermometerImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+    let size = CGSize(width: 11, height: 14)
+    let colors = thermometerColors(for: tier)
+    let stage = thermometerStage(for: tier)
+    let image = NSImage(size: size, flipped: false) { rect in
+        colors.outer.setFill()
+        thermometerBezierPath(stage: stage, in: rect, elapsed: elapsed).fill()
+        if let inner = colors.inner {
+            let coreRect = CGRect(x: rect.midX - rect.width * 0.14, y: rect.minY,
+                                   width: rect.width * 0.28, height: rect.height * 0.62)
+            inner.setFill()
+            thermometerBezierPath(stage: stage, in: coreRect, elapsed: elapsed).fill()
+        }
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+// MARK: - Battery Mood Icon Theme
+//
+// "잔량 배터리"가 아니라 "사용량 게이지"로 방향을 맞춘다 — flame/온도계와 동일하게 tier가
+// 올라갈수록 채움도 늘어나고 초록→빨강으로 진행한다(문자 그대로의 배터리 잔량과는 반대 방향이지만
+// 5개 테마 전체가 공유하는 "위험도가 커질수록 채워진다" 언어를 지키기 위한 의도적 선택). 실제
+// 배터리 UI 관례를 따라 outer/inner 2톤이 아니라 단일 톤 채움만 쓴다(막대 배터리는 보통 단색).
+enum BatteryStage: String, CaseIterable { case low, mid, high }
+
+func batteryStage(for tier: MoodTier) -> BatteryStage {
+    switch tier {
+    case .idle, .calm: return .low
+    case .warm, .hot:  return .mid
+    case .critical:    return .high
+    }
+}
+
+func batteryColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
+
+private func batteryRatio(for stage: BatteryStage) -> CGFloat {
+    switch stage {
+    case .low:  return 0.18
+    case .mid:  return 0.55
+    case .high: return 0.92
+    }
+}
+
+// 세로형 배터리 — 위쪽 중앙에 작은 양극 단자, 아래는 본체.
+private func batteryBodyPath(in rect: CGRect) -> NSBezierPath {
+    let nubHeight = rect.height * 0.10
+    let nubWidth = rect.width * 0.4
+    let bodyRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height - nubHeight)
+    let path = NSBezierPath(roundedRect: bodyRect, xRadius: 1.5, yRadius: 1.5)
+    let nubRect = CGRect(x: rect.midX - nubWidth / 2, y: bodyRect.maxY - 0.5, width: nubWidth, height: nubHeight + 0.5)
+    path.append(NSBezierPath(roundedRect: nubRect, xRadius: 1, yRadius: 1))
+    return path
+}
+
+private func batteryFillPath(in rect: CGRect, ratio: CGFloat) -> NSBezierPath {
+    let nubHeight = rect.height * 0.10
+    let bodyRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height - nubHeight)
+    let inset = bodyRect.insetBy(dx: rect.width * 0.14, dy: rect.height * 0.05)
+    let fillHeight = max(0, inset.height * ratio)
+    let fillRect = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: fillHeight)
+    return NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1)
+}
+
+// high 단계(critical)만 알파를 펄스시켜 "저전력 경고"처럼 깜빡인다 — low/mid는 elapsed와
+// 무관하게 항상 정적(채움 높이 고정, 깜빡임 없음).
+func moodBatteryImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+    let size = CGSize(width: 11, height: 14)
+    let colors = batteryColors(for: tier)
+    let stage = batteryStage(for: tier)
+    let pulse: CGFloat = stage == .high
+        ? 0.55 + 0.45 * CGFloat((sin(elapsed * 2.0 * .pi / 0.7) + 1) / 2)
+        : 1.0
+    let image = NSImage(size: size, flipped: false) { rect in
+        NSColor(calibratedWhite: 0.6, alpha: 0.5).setStroke()
+        let body = batteryBodyPath(in: rect)
+        body.lineWidth = 0.9
+        body.stroke()
+        colors.outer.withAlphaComponent(pulse).setFill()
+        batteryFillPath(in: rect, ratio: batteryRatio(for: stage)).fill()
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+// MARK: - Gauge Mood Icon Theme
+//
+// 반원 다이얼 + 바늘. 트랙(다이얼 면)은 tier와 무관하게 항상 같은 중립색 — 바늘 위치(3그룹)와
+// 색(5단계)만 tier를 따라 바뀐다. 바늘은 idle/calm 그룹에서 왼쪽에 고정, warm/hot에서 정중앙
+// 부근을 미세하게 떨고, critical에서 오른쪽 끝 부근을 더 크게 떤다.
+enum GaugeStage: String, CaseIterable { case low, mid, high }
+
+func gaugeStage(for tier: MoodTier) -> GaugeStage {
+    switch tier {
+    case .idle, .calm: return .low
+    case .warm, .hot:  return .mid
+    case .critical:    return .high
+    }
+}
+
+func gaugeColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
+
+private func gaugeCenter(in rect: CGRect) -> CGPoint {
+    CGPoint(x: rect.midX, y: rect.minY + rect.height * 0.28)
+}
+
+private func gaugeArcPath(in rect: CGRect) -> NSBezierPath {
+    let path = NSBezierPath()
+    let radius = min(rect.width, rect.height) * 0.46
+    path.appendArc(withCenter: gaugeCenter(in: rect), radius: radius, startAngle: 0, endAngle: 180, clockwise: false)
+    return path
+}
+
+// t는 0(왼쪽/idle 방향)~1(오른쪽/critical 방향) 스윕 위치. mid/high 단계만 flameSway로 떤다.
+private func gaugeNeedlePath(stage: GaugeStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
+    let center = gaugeCenter(in: rect)
+    let length = min(rect.width, rect.height) * 0.42
+    let t: CGFloat
+    switch stage {
+    case .low:  t = 0.14
+    case .mid:  t = 0.5 + flameSway(elapsed: elapsed) * 0.10
+    case .high: t = 0.86 + flameSway(elapsed: elapsed) * 0.06
+    }
+    let angle = CGFloat.pi * (1 - t)
+    let tip = CGPoint(x: center.x + length * cos(angle), y: center.y + length * sin(angle))
+    let path = NSBezierPath()
+    path.move(to: CGPoint(x: center.x - 0.6, y: center.y))
+    path.line(to: tip)
+    path.line(to: CGPoint(x: center.x + 0.6, y: center.y))
+    path.close()
+    return path
+}
+
+// outer=바늘, inner=중심 허브 점(있으면 더 밝은 강조색, 없으면 바늘과 같은 색).
+func moodGaugeImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+    let size = CGSize(width: 11, height: 14)
+    let colors = gaugeColors(for: tier)
+    let stage = gaugeStage(for: tier)
+    let image = NSImage(size: size, flipped: false) { rect in
+        NSColor(calibratedWhite: 0.6, alpha: 0.55).setStroke()
+        let arc = gaugeArcPath(in: rect)
+        arc.lineWidth = 1.1
+        arc.stroke()
+        colors.outer.setFill()
+        gaugeNeedlePath(stage: stage, in: rect, elapsed: elapsed).fill()
+        let center = gaugeCenter(in: rect)
+        let hubRadius: CGFloat = 1.3
+        (colors.inner ?? colors.outer).setFill()
+        NSBezierPath(ovalIn: CGRect(x: center.x - hubRadius, y: center.y - hubRadius,
+                                     width: hubRadius * 2, height: hubRadius * 2)).fill()
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+// MARK: - Volcano Mood Icon Theme
+//
+// flame과 실루엣 계열은 비슷해 보이지만(위로 뾰족) 낮은 단계에서 회갈색 "휴화산" 그대로 정적이고,
+// 색이 아니라 분화구 위 연기/용암 글로우의 유무로 단계를 구분한다는 점이 다르다. dormant는 색조차
+// tier(idle/calm)와 무관하게 항상 같은 회갈색 — "쉬고 있다"는 신호를 색 변화 없이 형태로만 준다.
+enum VolcanoStage: String, CaseIterable { case dormant, smoking, erupting }
+
+func volcanoStage(for tier: MoodTier) -> VolcanoStage {
+    switch tier {
+    case .idle, .calm: return .dormant
+    case .warm, .hot:  return .smoking
+    case .critical:    return .erupting
+    }
+}
+
+// flame의 초록→빨강 배색을 그대로 쓰면 "쉬고 있는 산"에 초록/노랑이 섞여 어색하므로 화산만
+// 예외적으로 전용 팔레트를 쓴다 — 낮은 단계(dormant)는 회갈색 고정, erupting에서만 크레이터
+// 안쪽에 빨강/주황 용암 글로우(inner)가 나타난다.
+func volcanoColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
+    switch volcanoStage(for: tier) {
+    case .dormant:
+        return (NSColor(calibratedRed: 0.50, green: 0.46, blue: 0.42, alpha: 1), nil)
+    case .smoking:
+        return (NSColor(calibratedRed: 0.52, green: 0.42, blue: 0.30, alpha: 1), nil)
+    case .erupting:
+        return (NSColor(calibratedRed: 0.42, green: 0.22, blue: 0.16, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.45, blue: 0.12, alpha: 1))
+    }
+}
+
+// 정상 부근이 평평하게 잘린 사다리꼴 산 실루엣(작은 V자 노치가 분화구).
+private func volcanoMountainPath(in rect: CGRect) -> NSBezierPath {
+    func pt(_ u: CGFloat, _ v: CGFloat) -> CGPoint {
+        CGPoint(x: rect.minX + u * rect.width, y: rect.minY + v * rect.height)
+    }
+    let path = NSBezierPath()
+    path.move(to: pt(0.0, 0.0))
+    path.line(to: pt(0.32, 0.78))
+    path.line(to: pt(0.42, 0.70))
+    path.line(to: pt(0.58, 0.70))
+    path.line(to: pt(0.68, 0.78))
+    path.line(to: pt(1.0, 0.0))
+    path.close()
+    return path
+}
+
+// 분화구 위로 떠오르는 연기 뭉치 3개 — flameSway로 각자 다른 위상을 줘 따로 흔들리게 한다.
+private func smokeWispPath(in rect: CGRect, elapsed: TimeInterval) -> NSBezierPath {
+    let path = NSBezierPath()
+    let puffDiameters: [CGFloat] = [0.20, 0.15, 0.11]
+    var cy = rect.minY + rect.height * 0.72
+    for (index, diameterFactor) in puffDiameters.enumerated() {
+        let d = rect.width * diameterFactor
+        let sway = flameSway(elapsed: elapsed, phaseShift: Double(index) * 1.3)
+        let x = rect.midX + sway * rect.width * 0.10
+        path.append(NSBezierPath(ovalIn: CGRect(x: x - d / 2, y: cy - d / 2, width: d, height: d)))
+        cy += rect.height * 0.10
+    }
+    return path
+}
+
+// dormant는 elapsed와 무관하게 항상 정적(연기 없음) — smoking/erupting만 연기가 흔들린다.
+private func volcanoBezierPath(stage: VolcanoStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
+    let mountain = volcanoMountainPath(in: rect)
+    switch stage {
+    case .dormant:
+        return mountain
+    case .smoking, .erupting:
+        mountain.append(smokeWispPath(in: rect, elapsed: elapsed))
+        return mountain
+    }
+}
+
+// erupting 단계에서만 inner(용암 글로우)가 존재 — flame의 "실루엣을 축소해 다시 채우는" 기법
+// 대신, 분화구 노치 위치에 작은 별도 원을 얹는다(산 실루엣을 그대로 축소하면 바위 모양이 작아질
+// 뿐 "빛나는 크레이터"로 보이지 않기 때문).
+func moodVolcanoImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+    let size = CGSize(width: 11, height: 14)
+    let colors = volcanoColors(for: tier)
+    let stage = volcanoStage(for: tier)
+    let image = NSImage(size: size, flipped: false) { rect in
+        colors.outer.setFill()
+        volcanoBezierPath(stage: stage, in: rect, elapsed: elapsed).fill()
+        if let inner = colors.inner {
+            let craterRect = CGRect(x: rect.midX - rect.width * 0.14, y: rect.maxY - rect.height * 0.30,
+                                     width: rect.width * 0.28, height: rect.height * 0.18)
+            inner.setFill()
+            NSBezierPath(ovalIn: craterRect).fill()
+        }
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+// MARK: - Mood Icon Theme Dispatcher
+//
+// 현재 선택된 테마에 따라 적절한 렌더러로 위임하는 단일 진입점 — 호출부는 테마를 몰라도 되고,
+// 새 테마를 추가할 때 이 두 switch만 갱신하면 된다.
+func currentMoodImage(theme: MoodGlyphTheme, tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+    switch theme {
+    case .flame:       return moodFlameImage(tier: tier, elapsed: elapsed)
+    case .thermometer: return moodThermometerImage(tier: tier, elapsed: elapsed)
+    case .battery:     return moodBatteryImage(tier: tier, elapsed: elapsed)
+    case .gauge:       return moodGaugeImage(tier: tier, elapsed: elapsed)
+    case .volcano:     return moodVolcanoImage(tier: tier, elapsed: elapsed)
+    }
+}
+
+// flame의 "flameStage(for:) != .ember" 가드를 테마별로 일반화한 것 — 대부분 테마는 가장 낮은
+// 단계에서만 정적이고 나머지 단계가 애니메이션되지만, battery는 예외적으로 가장 높은(critical)
+// 단계에서만 깜빡인다(배터리 디자인 노트 참고).
+func moodIconAnimates(theme: MoodGlyphTheme, tier: MoodTier) -> Bool {
+    switch theme {
+    case .flame:       return flameStage(for: tier) != .ember
+    case .thermometer: return thermometerStage(for: tier) != .low
+    case .battery:     return batteryStage(for: tier) == .high
+    case .gauge:       return gaugeStage(for: tier) != .low
+    case .volcano:     return volcanoStage(for: tier) != .dormant
+    }
+}
+
 // statusItem.button.image에 대입할 이미지 — 무드 타이어가 있을 때만 non-nil. 그 외에는 nil을
 // 반환해 호출부가 "무드 아이콘이 꺼진 상태의 잔류 이미지 지우기"에도 그대로 쓸 수 있게 한다.
 func moodImageToApply(tier: MoodTier?) -> NSImage? {
@@ -1099,7 +1422,7 @@ func moodImageToApply(tier: MoodTier?) -> NSImage? {
     // refresh 트리거 시점에도 refreshFlameFlicker()가 매 0.2초마다 그리는 것과 동일한 "지금 시각"
     // 흔들림 프레임을 써야 한다 — elapsed를 0으로 고정하면 매 refresh마다 아이콘이 rest 포즈로
     // 스냅됐다가 최대 0.2초 뒤 흔들림 타이머가 되돌리는 깜빡임이 생긴다.
-    return moodFlameImage(tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
+    return currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
 }
 
 // 순수 함수: 활성 블록 여부 + 경과 비율(예산 미설정 시) + usageWarning 비율(예산 설정 시, 우선)로 tier 산출.
@@ -1309,14 +1632,14 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     }
     for field in TitleSettings.enabledFieldsInOrder() {
         switch field {
-        case .outputTokens:     parts.append(TitlePart(text: formatTokensStable(ctx.outputTokens), color: TitleSettings.color(for: field)))
-        case .totalTokens:      parts.append(TitlePart(text: formatTokensStable(ctx.totalTokens), color: TitleSettings.color(for: field)))
+        case .outputTokens:     parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
+        case .totalTokens:      parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: TitleSettings.color(for: field)))
         case .cost:             parts.append(TitlePart(text: formatCost(ctx.cost), color: TitleSettings.color(for: field)))
         case .remainingTime:    if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: TitleSettings.color(for: field))) }
         case .model:            if let m = ctx.model { parts.append(TitlePart(text: shortModelName(m), color: TitleSettings.color(for: field))) }
-        case .todayTokens:      parts.append(TitlePart(text: formatTokensStable(ctx.todayTokens), color: TitleSettings.color(for: field)))
+        case .todayTokens:      parts.append(TitlePart(text: formatTokens(ctx.todayTokens), color: TitleSettings.color(for: field)))
         case .todayCost:        parts.append(TitlePart(text: formatCost(ctx.todayCost), color: TitleSettings.color(for: field)))
-        case .cumulativeTokens: parts.append(TitlePart(text: formatTokensStable(ctx.cumulativeTokens), color: TitleSettings.color(for: field)))
+        case .cumulativeTokens: parts.append(TitlePart(text: formatTokens(ctx.cumulativeTokens), color: TitleSettings.color(for: field)))
         }
     }
     return parts
@@ -1574,6 +1897,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 아래 4개도 동일한 이유로 유지 — appendFooter()는 이제 obtainMainMenu()가 메인 메뉴 최초
     // 생성 시 딱 1회만 호출하므로 이 weak var들은 그 1회 생성된 인스턴스를 계속 가리킨다.
     weak var separatorSubmenu: NSMenu?
+    weak var moodThemeSubmenu: NSMenu?
     weak var refreshIntervalSubmenu: NSMenu?
     weak var languageSubmenu: NSMenu?
     weak var funModeSubmenu: NSMenu?
@@ -1642,7 +1966,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if moodEnabled {
             // 무드 아이콘이 이미지로 렌더링되므로 텍스트 쪽 고정 글리프(titleIconPrefix())는
             // 빼고 점만 남긴다 — renderIdleTitle()의 동일 컨벤션과 맞춤(이중 아이콘 방지).
-            statusItem?.button?.image = moodFlameImage(tier: MoodTier.allCases[coldStartFlameIndex])
+            statusItem?.button?.image = currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: MoodTier.allCases[coldStartFlameIndex])
             renderTitle(plain: dots, warning: nil)
         } else {
             renderTitle(plain: "\(titleIconPrefix())\(dots)", warning: nil)
@@ -1835,18 +2159,20 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // syncFlameFlickerTimer()가 담당하고, 여기 있는 조건 체크는 그 판단과 어긋나는 상태에서 우연히
     // 한 틱이 더 발생해도(예: invalidate 직후 이미 큐잉된 틱) 안전하게 무시하기 위한 방어적 가드이다.
     private func refreshFlameFlicker() {
+        let theme = TitleSettings.moodGlyphTheme()
         guard TitleSettings.isFunModeFeatureEnabled(.moodIcon),
               let tier = lastMoodTier,
-              flameStage(for: tier) != .ember else { return }
-        statusItem.button?.image = moodFlameImage(tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
+              moodIconAnimates(theme: theme, tier: tier) else { return }
+        statusItem.button?.image = currentMoodImage(theme: theme, tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
     }
 
-    // 무드 아이콘 on + 활성 flame/blaze 단계일 때만 타이머를 돌린다. 그 외 조건에서는 타이머 자체를
-    // 멈춰 무의미한 5Hz 백그라운드 깨어남을 없앤다. refreshFlameFlicker()의 기존 가드는 안전망
-    // (방어적 이중 체크)으로 그대로 둔다.
+    // 무드 아이콘 on + 현재 선택된 테마가 애니메이션 단계일 때만 타이머를 돌린다. 그 외 조건에서는
+    // 타이머 자체를 멈춰 무의미한 5Hz 백그라운드 깨어남을 없앤다. refreshFlameFlicker()의 기존
+    // 가드는 안전망(방어적 이중 체크)으로 그대로 둔다.
     private func syncFlameFlickerTimer() {
+        let theme = TitleSettings.moodGlyphTheme()
         let shouldRun = TitleSettings.isFunModeFeatureEnabled(.moodIcon)
-            && (lastMoodTier.map { flameStage(for: $0) != .ember } ?? false)
+            && (lastMoodTier.map { moodIconAnimates(theme: theme, tier: $0) } ?? false)
         if shouldRun {
             guard flameFlickerTimer == nil else { return }
             flameFlickerTimer = Timer.scheduledTimer(withTimeInterval: flameFlickerInterval, repeats: true) { [weak self] _ in
@@ -1897,7 +2223,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let view = idleHeroIconRow?.view else { return }
         let tier = MoodTier.allCases[idleFlameCycleIndex]
         if let iconView = view.subviews.compactMap({ $0 as? NSImageView }).first {
-            iconView.image = moodFlameImage(tier: tier)
+            iconView.image = currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier)
         }
         if let field = view.subviews.compactMap({ $0 as? NSTextField }).first {
             field.textColor = tier.color.nsColor ?? .labelColor
@@ -1977,7 +2303,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    cumulativeTokens: stats.cumulative?.totalTokens ?? 0)
             renderTitle(parts: titlePartsWithBadge(ctx), warning: warning)
         } else {
-            renderIdleTitle(t("유휴", "idle"))
+            renderIdleTitle(t("쉬는 중", "resting"))
         }
     }
 
@@ -1997,7 +2323,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             applyMood(nil)
             renderTitle(plain: "\(titleIconPrefix())" + t("데이터 없음", "no data"), warning: nil)
         } else if block == nil {
-            renderIdleTitle(t("유휴", "idle"))
+            renderIdleTitle(t("쉬는 중", "resting"))
         } else if let b = block {
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
             applyMood(moodTier)
@@ -2198,9 +2524,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let heroTier = moodTestTierOverride()
                 ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)
             let heroColor = heroTier.color.nsColor ?? .labelColor
-            // hero 줄 앞에 작은 불꽃 아이콘을 붙인다 — 재미 모드(무드 아이콘) on/off와 무관하게
-            // heroColor와 같은 이유로 항상 표시.
-            let heroFlameIcon = moodFlameImage(tier: heroTier)
+            // hero 줄 앞에 작은 무드 아이콘을 붙인다 — 재미 모드(무드 아이콘) on/off와 무관하게
+            // heroColor와 같은 이유로 항상 표시. 현재 선택된 테마를 따른다.
+            let heroFlameIcon = currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: heroTier)
 
             switch b.resetState {
             case .remaining(let text):
@@ -2243,7 +2569,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let tier = b.moodTier {
                 let scopeWord = t(b.warning != nil ? "사용" : "경과", b.warning != nil ? "used" : "elapsed")
                 skeleton ? addSkeletonLabel(menu)
-                         : addLabel(menu, "  \(tier.glyph) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: moodFlameImage(tier: tier))
+                         : addLabel(menu, "  \(tier.glyph) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier))
             }
         } else {
             isCurrentlyIdle = true
@@ -2253,7 +2579,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let cycleTier = MoodTier.allCases[idleFlameCycleIndex % MoodTier.allCases.count]
             idleHeroIconRow = addHeroLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"),
                                             color: cycleTier.color.nsColor ?? .labelColor,
-                                            image: moodFlameImage(tier: cycleTier))
+                                            image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: cycleTier))
             addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
         }
         syncIdleFlameCycleTimer(isIdle: isCurrentlyIdle, menuOpen: mainMenuIsOpen)
@@ -2365,6 +2691,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(funModeItem)
         track(funModeItem, funModeMake)
 
+        // 무드 아이콘의 모양(테마)을 고르는 서브메뉴 — 무드 아이콘과 관련이 깊어 재미 모드 바로 다음에 배치.
+        let moodThemeMake = { "  🎨 " + t("무드 아이콘 모양", "Mood Icon Style") }
+        let moodThemeItem = NSMenuItem(title: moodThemeMake(), action: nil, keyEquivalent: "")
+        moodThemeItem.submenu = obtainMoodThemeSubmenu()
+        menu.addItem(moodThemeItem)
+        track(moodThemeItem, moodThemeMake)
+
         let titleFieldsMake = { "  ⌨ " + t("메뉴바 표시 항목", "Menu Bar Fields") }
         let titleFieldsItem = NSMenuItem(title: titleFieldsMake(), action: nil, keyEquivalent: "")
         titleFieldsItem.submenu = buildTitleFieldsSubmenu()
@@ -2428,6 +2761,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTitleFieldsSubmenu()
         refreshFunModeSubmenu()
         refreshRadioSubmenu(separatorSubmenu, current: TitleSettings.separator(), action: #selector(setSeparatorButton(_:))) { $0.label }
+        refreshRadioSubmenu(moodThemeSubmenu, current: TitleSettings.moodGlyphTheme(), action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
         refreshRadioSubmenu(refreshIntervalSubmenu, current: RefreshSettings.interval(), action: #selector(setRefreshIntervalButton(_:))) { $0.label }
         refreshRadioSubmenu(languageSubmenu, current: TitleSettings.languagePreference(), action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
     }
@@ -2641,6 +2975,27 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         TitleSettings.setSeparator(sep)
         updateStatusBarTitle()
         refreshRadioSubmenu(separatorSubmenu, current: sep, action: #selector(setSeparatorButton(_:))) { $0.label }
+    }
+
+    // ── 무드 아이콘 모양 서브메뉴(라디오 스타일 — 하나만 선택). 무드 아이콘 토글이 꺼져 있어도
+    // 다른 라디오 서브메뉴들과 동일하게 항상 노출한다 — 값을 미리 정해두면 나중에 토글을 켰을 때
+    // 그대로 적용된다. ──
+    private func obtainMoodThemeSubmenu() -> NSMenu {
+        let current = TitleSettings.moodGlyphTheme()
+        if let existing = moodThemeSubmenu {
+            refreshRadioSubmenu(existing, current: current, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
+            return existing
+        }
+        let sub = buildRadioSubmenuView(current: current, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
+        moodThemeSubmenu = sub
+        return sub
+    }
+
+    @objc func setMoodGlyphThemeButton(_ sender: NSButton) {
+        let theme = MoodGlyphTheme.allCases[sender.tag]
+        TitleSettings.setMoodGlyphTheme(theme)
+        applyMood(lastMoodTier)
+        refreshRadioSubmenu(moodThemeSubmenu, current: theme, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
     }
 
     // ── 재미 모드 서브메뉴 행 — titleFieldRowView에서 이동/색상 버튼만 제거한 축소판. 라디오와
@@ -3086,26 +3441,6 @@ func runSelfTests() -> Never {
     check(formatCost(0.005) == "$0.0050", "formatCost 소액 4자리")
     check(formatCost(0.18) == "$0.18", "formatCost 일반")
 
-    // formatTokensStable — 같은 자릿수 구간 내부에서는 항상 동일한 문자 길이(타이틀 폭 고정 검증)
-    check(formatTokensStable(5).count == formatTokensStable(999).count,
-          "formatTokensStable: 0~999 구간 내부 폭 고정")
-    check(formatTokensStable(1_500).count == formatTokensStable(999_900).count,
-          "formatTokensStable: K 구간 내부 폭 고정")
-    check(formatTokensStable(5) != formatTokensStable(5).trimmingCharacters(in: .whitespaces),
-          "formatTokensStable: 짧은 값은 왼쪽 패딩이 실제로 붙음")
-    check(formatTokensStable(999_950).hasSuffix("M"),
-          "formatTokensStable: 반올림으로 999.9K를 넘는 값(999_950)은 K가 아니라 M 단위로 승격")
-    check(formatTokensStable(999_950).count == 7,
-          "formatTokensStable: 승격된 M 표시도 7자 폭 고정 유지")
-    check(formatTokensStable(999_949).hasSuffix("K"),
-          "formatTokensStable: 승격 경계 바로 아래 값은 정상적으로 K 단위 유지")
-    check(formatTokensStable(999_999_999).count == 7,
-          "formatTokensStable: M 상한 근접 값도 7자 폭 유지(999.99M로 클램프)")
-
-    // String.leftPad
-    check("ab".leftPad(to: 5, with: "-") == "---ab", "leftPad: 부족분만큼 왼쪽에 패딩")
-    check("abcde".leftPad(to: 3, with: "-") == "abcde", "leftPad: 이미 길면 그대로 반환")
-
     // FiveHourBlock.active
     let base = Date(timeIntervalSince1970: 1_704_067_200)  // 2024-01-01 00:00:00 UTC
     let h: TimeInterval = 3600
@@ -3423,9 +3758,16 @@ func runSelfTests() -> Never {
         check(false, "mood: buildTitleParts가 아이콘 파트를 반환해야 함")
     }
 
-    // moodImageToApply: tier 존재 여부에 따라서만 이미지 생성 여부가 갈린다(테마 선택 개념 없음).
+    // moodImageToApply: tier 존재 여부에 따라서만 이미지 생성 여부가 갈린다(선택된 테마와 무관).
     check(moodImageToApply(tier: .critical) != nil, "moodImageToApply: tier 있음 → 이미지 생성")
     check(moodImageToApply(tier: nil) == nil, "moodImageToApply: tier가 nil이면(무드 꺼짐) 이미지 없음")
+
+    // 아래 flame 전용 회귀 테스트들은 moodImageToApply()/applyMood() 등을 거치며 실제
+    // UserDefaults.standard의 moodGlyphTheme을 읽는다 — 개발자가 실행 중인 실제 앱에서 다른
+    // 테마를 골라둔 상태로 셀프테스트를 돌리면 이 값이 새어 들어와 flame 전용 단정(assert)이
+    // 우연히 깨질 수 있으므로, 이 구간 동안만 강제로 .flame으로 고정하고 끝나면 원래 값으로 되돌린다.
+    let savedMoodThemeForFlameTest = UserDefaults.standard.string(forKey: "moodGlyphTheme")
+    TitleSettings.setMoodGlyphTheme(.flame)
 
     // FlameStage 그룹핑 불변식 — MoodTier 5단계를 정확히 3개의 아이콘 형태로 묶는지 검증
     check(flameStage(for: .idle) == flameStage(for: .calm), "flameStage: idle과 calm은 같은 불씨 단계")
@@ -3488,6 +3830,60 @@ func runSelfTests() -> Never {
     flickerApp.applyMood(.critical)
     check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: blaze 단계에서도 타이머 시작")
     flickerApp.flameFlickerTimer?.invalidate()
+
+    // flame 전용 구간 종료 — 실제 사용자가 골라둔 테마로 복원(키 자체가 없었다면 제거).
+    if let saved = savedMoodThemeForFlameTest {
+        UserDefaults.standard.set(saved, forKey: "moodGlyphTheme")
+    } else {
+        UserDefaults.standard.removeObject(forKey: "moodGlyphTheme")
+    }
+
+    // MoodGlyphTheme 신규 테마 4종 — 각 테마의 Stage 그룹핑(3단계)과 elapsed 기반 애니메이션
+    // 게이팅(가장 낮은 단계는 정적, 나머지는 동적)이 flame과 동일한 원칙으로 동작하는지 검증.
+    // battery만 예외적으로 high(critical) 단계에서만 애니메이션(깜빡임)된다.
+    check(thermometerStage(for: .idle) == thermometerStage(for: .calm), "thermometerStage: idle과 calm은 같은 low 단계")
+    check(thermometerStage(for: .warm) == thermometerStage(for: .hot), "thermometerStage: warm과 hot은 같은 mid 단계")
+    check(thermometerStage(for: .critical) == .high, "thermometerStage: critical은 high 단계")
+    check(moodThermometerImage(tier: .idle, elapsed: 0).tiffRepresentation == moodThermometerImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
+          "moodThermometerImage: low 단계(idle)는 elapsed와 무관하게 정적")
+    check(moodThermometerImage(tier: .hot, elapsed: 0).tiffRepresentation != moodThermometerImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
+          "moodThermometerImage: mid 단계(hot)는 elapsed에 따라 액면이 출렁임")
+    check(moodThermometerImage(tier: .critical, elapsed: 0).tiffRepresentation != moodThermometerImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
+          "moodThermometerImage: high 단계(critical)는 elapsed에 따라 달라짐")
+
+    check(batteryStage(for: .warm) == .mid, "batteryStage: warm은 mid 단계")
+    check(moodBatteryImage(tier: .idle, elapsed: 0).tiffRepresentation == moodBatteryImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
+          "moodBatteryImage: low 단계(idle)는 elapsed와 무관하게 정적")
+    check(moodBatteryImage(tier: .hot, elapsed: 0).tiffRepresentation == moodBatteryImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
+          "moodBatteryImage: mid 단계(hot)도 elapsed와 무관하게 정적(배터리는 high 전용 깜빡임)")
+    check(moodBatteryImage(tier: .critical, elapsed: 0).tiffRepresentation != moodBatteryImage(tier: .critical, elapsed: 0.175).tiffRepresentation,
+          "moodBatteryImage: high 단계(critical)만 elapsed에 따라 깜빡임")
+
+    check(gaugeStage(for: .idle) == gaugeStage(for: .calm), "gaugeStage: idle과 calm은 같은 low 단계")
+    check(moodGaugeImage(tier: .idle, elapsed: 0).tiffRepresentation == moodGaugeImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
+          "moodGaugeImage: low 단계는 elapsed와 무관하게 정적(바늘 고정)")
+    check(moodGaugeImage(tier: .warm, elapsed: 0).tiffRepresentation != moodGaugeImage(tier: .warm, elapsed: 1.0).tiffRepresentation,
+          "moodGaugeImage: mid 단계는 elapsed에 따라 바늘이 떨림")
+    check(moodGaugeImage(tier: .critical, elapsed: 0).tiffRepresentation != moodGaugeImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
+          "moodGaugeImage: high 단계는 elapsed에 따라 바늘이 떨림")
+
+    check(volcanoStage(for: .idle) == volcanoStage(for: .calm), "volcanoStage: idle과 calm은 같은 dormant 단계")
+    check(moodVolcanoImage(tier: .calm, elapsed: 0).tiffRepresentation == moodVolcanoImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
+          "moodVolcanoImage: dormant 단계는 elapsed와 무관하게 정적(연기 없음)")
+    check(moodVolcanoImage(tier: .hot, elapsed: 0).tiffRepresentation != moodVolcanoImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
+          "moodVolcanoImage: smoking 단계는 elapsed에 따라 연기가 흔들림")
+    check(moodVolcanoImage(tier: .critical, elapsed: 0).tiffRepresentation != moodVolcanoImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
+          "moodVolcanoImage: erupting 단계는 elapsed에 따라 연기가 흔들림")
+
+    // currentMoodImage/moodIconAnimates 디스패처 배선 검증 — 테마별로 실제 다른 렌더러가 호출되는지,
+    // moodIconAnimates가 테마별 특수 규칙(battery는 high 전용)을 정확히 반영하는지 확인.
+    check(currentMoodImage(theme: .flame, tier: .idle).tiffRepresentation == moodFlameImage(tier: .idle).tiffRepresentation,
+          "currentMoodImage: flame 테마는 moodFlameImage로 위임")
+    check(currentMoodImage(theme: .thermometer, tier: .idle).tiffRepresentation != currentMoodImage(theme: .battery, tier: .idle).tiffRepresentation,
+          "currentMoodImage: 테마마다 서로 다른 이미지를 반환")
+    check(moodIconAnimates(theme: .battery, tier: .warm) == false, "moodIconAnimates: battery는 mid 단계에서 애니메이션 없음(high 전용)")
+    check(moodIconAnimates(theme: .battery, tier: .critical) == true, "moodIconAnimates: battery는 high(critical) 단계에서 애니메이션")
+    check(moodIconAnimates(theme: .thermometer, tier: .warm) == true, "moodIconAnimates: thermometer는 mid 단계에서도 애니메이션(battery와 다른 일반 규칙)")
 
     // F6 회귀: syncIdleFlameCycleTimer()는 유휴+메뉴 열림 조합일 때만 타이머를 돌려야 한다.
     let idleCycleApp = ClaudeMonitorApp()
@@ -3556,7 +3952,7 @@ func runSelfTests() -> Never {
     let titleCtx = TitleContext(outputTokens: 12_300, totalTokens: 50_000, cost: 4.2,
                                 remainingText: nil, model: "claude-sonnet-4-5")
     setEnabled([.outputTokens, .cost])
-    check(buildTitleText(titleCtx) == "⌨ \u{2007}12.3K $4.20", "title: outputTokens+cost 조합(formatTokensStable 패딩 반영)")
+    check(buildTitleText(titleCtx) == "⌨ 12.3K $4.20", "title: outputTokens+cost 조합(패딩 없는 formatTokens)")
     setEnabled([.remainingTime])
     check(buildTitleText(titleCtx) == "⌨", "title: 값 없는 필드만 선택 시 ⌨ 단독으로 축소")
     setEnabled([.model])
@@ -3564,8 +3960,8 @@ func runSelfTests() -> Never {
     let todayCumulativeCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil,
                                           todayTokens: 128_000, todayCost: 2.5, cumulativeTokens: 5_200_000)
     setEnabled([.todayTokens, .todayCost, .cumulativeTokens])
-    check(buildTitleText(todayCumulativeCtx) == "⌨ 128.0K $2.50 \u{2007}\u{2007}5.20M",
-          "title: 오늘 토큰+오늘 비용+누적 토큰 조합(formatTokensStable 패딩 반영)")
+    check(buildTitleText(todayCumulativeCtx) == "⌨ 128.0K $2.50 5.20M",
+          "title: 오늘 토큰+오늘 비용+누적 토큰 조합(패딩 없는 formatTokens)")
     for (field, value) in savedTitleDefaults {
         if let v = value { UserDefaults.standard.set(v, forKey: field.defaultsKey) }
         else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
@@ -3622,6 +4018,17 @@ func runSelfTests() -> Never {
     // titleIconPrefix — 고정 문자열(사용자가 고를 수 있는 선택지 없음)
     check(titleIconPrefix() == "⌨ ", "icon: titleIconPrefix는 항상 고정 아이콘")
 
+    // TitleSettings.moodGlyphTheme (전용 suite)
+    let moodThemeSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let mtd = UserDefaults(suiteName: moodThemeSuite) {
+        check(TitleSettings.moodGlyphTheme(defaults: mtd) == .flame, "moodGlyphTheme: 기본값 = flame(기존 사용자 경험 불변)")
+        TitleSettings.setMoodGlyphTheme(.volcano, defaults: mtd)
+        check(TitleSettings.moodGlyphTheme(defaults: mtd) == .volcano, "moodGlyphTheme: 저장/조회 왕복")
+        mtd.removePersistentDomain(forName: moodThemeSuite)
+    } else {
+        check(false, "moodGlyphTheme: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
     // TitleSettings.color (전용 suite)
     let colorSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
     if let cd = UserDefaults(suiteName: colorSuite) {
@@ -3658,10 +4065,10 @@ func runSelfTests() -> Never {
     setEnabled([.outputTokens, .cost, .model])
     UserDefaults.standard.set(["model", "cost", "outputTokens"], forKey: "titleFieldsOrder")
     TitleSettings.setSeparator(.pipe)
-    check(buildTitleText(titleCtx) == "⌨ | Sonnet 4.5 | $4.20 | \u{2007}12.3K",
+    check(buildTitleText(titleCtx) == "⌨ | Sonnet 4.5 | $4.20 | 12.3K",
           "title: 커스텀 순서(model→cost→outputTokens) + 구분자(|) 조합")
     TitleSettings.setSeparator(.none)
-    check(buildTitleText(titleCtx) == "⌨Sonnet 4.5$4.20\u{2007}12.3K", "title: 구분자 없음 조합")
+    check(buildTitleText(titleCtx) == "⌨Sonnet 4.5$4.2012.3K", "title: 구분자 없음 조합")
     TitleSettings.setSeparator(.space)
     TitleSettings.setColor(.blue, for: .cost)
     UserDefaults.standard.removeObject(forKey: "titleColor_model")  // 이 검증은 model이 미지정(defaultColor)임을 전제로 함
