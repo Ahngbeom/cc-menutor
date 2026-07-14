@@ -420,33 +420,65 @@ func migrateLegacyDefaultsIfNeeded(defaults: UserDefaults = .standard,
 }
 
 // MARK: - Model Pricing (USD per million tokens)
-
+//
+// cacheRead/cacheWrite5m/cacheWrite1h는 Anthropic 공식 프롬프트 캐싱 배수(모델 불문 고정:
+// cache read = input×0.1, 5분 캐시 쓰기 = input×1.25, 1시간 캐시 쓰기 = input×2.0 —
+// docs.claude.com/en/docs/about-claude/pricing 2026-07-14 기준)로 input에서 파생한다.
+// 모델별로 이 4개 숫자를 각각 손으로 맞출 필요가 없어 새 모델 추가 시 input/output만
+// 넣으면 캐시 단가도 자동으로 정확해진다.
 struct ModelPricing {
     let input: Double
     let output: Double
-    let cacheRead: Double
-    let cacheWrite: Double
+    var cacheRead: Double { input * 0.1 }
+    var cacheWrite5m: Double { input * 1.25 }
+    var cacheWrite1h: Double { input * 2.0 }
 }
 
 let PRICING: [(pattern: String, pricing: ModelPricing)] = [
-    ("opus-4",    ModelPricing(input: 15.0,  output: 75.0,  cacheRead: 1.5,   cacheWrite: 18.75)),
-    ("opus-3",    ModelPricing(input: 15.0,  output: 75.0,  cacheRead: 1.5,   cacheWrite: 18.75)),
-    ("sonnet-4",  ModelPricing(input: 3.0,   output: 15.0,  cacheRead: 0.30,  cacheWrite: 3.75)),
-    ("sonnet-3-7",ModelPricing(input: 3.0,   output: 15.0,  cacheRead: 0.30,  cacheWrite: 3.75)),
-    ("sonnet-3-5",ModelPricing(input: 3.0,   output: 15.0,  cacheRead: 0.30,  cacheWrite: 3.75)),
-    ("sonnet",    ModelPricing(input: 3.0,   output: 15.0,  cacheRead: 0.30,  cacheWrite: 3.75)),
-    ("haiku-3-5", ModelPricing(input: 0.80,  output: 4.0,   cacheRead: 0.08,  cacheWrite: 1.0)),
-    ("haiku",     ModelPricing(input: 0.25,  output: 1.25,  cacheRead: 0.03,  cacheWrite: 0.30)),
+    // Opus 4.5~4.8는 legacy Opus 4/4.1(아래 "opus-4" 패턴, $15/$75)과 단가가 다르므로
+    // 반드시 그보다 앞서 매칭되어야 한다 — 더 구체적인 패턴을 앞에 두는 규칙.
+    ("opus-4-8",  ModelPricing(input: 5.0,   output: 25.0)),
+    ("opus-4-7",  ModelPricing(input: 5.0,   output: 25.0)),
+    ("opus-4-6",  ModelPricing(input: 5.0,   output: 25.0)),
+    ("opus-4-5",  ModelPricing(input: 5.0,   output: 25.0)),
+    ("opus-4",    ModelPricing(input: 15.0,  output: 75.0)),
+    ("opus-3",    ModelPricing(input: 15.0,  output: 75.0)),
+    ("sonnet-4",  ModelPricing(input: 3.0,   output: 15.0)),
+    ("sonnet-3-7",ModelPricing(input: 3.0,   output: 15.0)),
+    ("sonnet-3-5",ModelPricing(input: 3.0,   output: 15.0)),
+    ("sonnet",    ModelPricing(input: 3.0,   output: 15.0)),
+    ("haiku-3-5", ModelPricing(input: 0.80,  output: 4.0)),
+    ("haiku",     ModelPricing(input: 0.25,  output: 1.25)),
 ]
 
-let DEFAULT_PRICING = ModelPricing(input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75)
+let DEFAULT_PRICING = ModelPricing(input: 3.0, output: 15.0)
 
 // Family-level fallback단가 (정밀 패턴 미매칭 시 Sonnet 일괄 폴백 대신 family 기준 적용)
 let FAMILY_PRICING: [String: ModelPricing] = [
-    "opus":   ModelPricing(input: 15.0, output: 75.0, cacheRead: 1.5,  cacheWrite: 18.75),
-    "sonnet": ModelPricing(input: 3.0,  output: 15.0, cacheRead: 0.30, cacheWrite: 3.75),
-    "haiku":  ModelPricing(input: 0.80, output: 4.0,  cacheRead: 0.08, cacheWrite: 1.0),
+    "opus":   ModelPricing(input: 15.0, output: 75.0),
+    "sonnet": ModelPricing(input: 3.0,  output: 15.0),
+    "haiku":  ModelPricing(input: 0.80, output: 4.0),
 ]
+
+// MARK: - Sonnet 5 도입가 (시간 한정)
+//
+// Sonnet 5는 2026-08-31까지 도입가(input $2/output $10)이고 2026-09-01부터 표준가(input
+// $3/output $15)로 전환된다(docs.claude.com/en/docs/about-claude/pricing, 2026-07-14 확인).
+// 실제 청구는 "그 요청이 발생한 시점"의 단가를 따르므로, 조회 시각(now)이 아니라 각
+// UsageEntry.timestamp로 판정해야 한다 — getPricing(at:)이 이 값을 받는다.
+// PRICING 정적 배열에 넣지 않고 별도 분기로 둔 이유: 시간에 따라 값이 바뀌는 유일한 케이스라
+// 정적 테이블에 억지로 끼워 넣기보다 이렇게 두는 편이 만료 후 통째로 걷어내기 쉽다.
+// 2026-09-01 이후엔 이 분기가 항상 표준가(= SONNET_5_STANDARD_PRICING = 일반 "sonnet" 패턴과
+// 동일값)로 귀결되므로 정확성 손실 없이 안전하게 제거 가능.
+private let sonnet5IntroPricingCutoffUTC: Date = {
+    var comps = DateComponents()
+    comps.year = 2026; comps.month = 9; comps.day = 1
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "UTC")!
+    return cal.date(from: comps)!
+}()
+private let SONNET_5_INTRO_PRICING = ModelPricing(input: 2.0, output: 10.0)
+private let SONNET_5_STANDARD_PRICING = ModelPricing(input: 3.0, output: 15.0)
 
 // 원본 모델 문자열의 대괄호 접미사(예: [1m])와 날짜 접미사(6자리 이상 연속 숫자)를 제거한
 // 정규화 문자열. getPricing의 정밀 패턴 매칭과 parseModel의 family/버전 매칭이 모두 이 함수를
@@ -459,8 +491,14 @@ private func sanitizedModelString(_ model: String) -> String {
 }
 
 // 정밀 패턴이 매칭되면 matched=true, family/DEFAULT 폴백이면 matched=false.
-func getPricing(for model: String) -> (pricing: ModelPricing, matched: Bool) {
+// date: 단가 판정 기준 시점 — 기본값은 호출 시각이지만, 실제 청구 시점 기준으로 계산해야 하는
+// 호출부(UsageEntry.cost 등)는 반드시 해당 엔트리의 timestamp를 넘겨야 한다(Sonnet 5 도입가처럼
+// 시간에 따라 값이 바뀌는 모델이 있기 때문).
+func getPricing(for model: String, at date: Date = Date()) -> (pricing: ModelPricing, matched: Bool) {
     let s = sanitizedModelString(model)
+    if s.contains("sonnet-5") {
+        return (date < sonnet5IntroPricingCutoffUTC ? SONNET_5_INTRO_PRICING : SONNET_5_STANDARD_PRICING, true)
+    }
     for (pattern, pricing) in PRICING {
         if s.contains(pattern) { return (pricing, true) }
     }
@@ -529,22 +567,78 @@ struct UsageEntry {
     let inputTokens: Int
     let outputTokens: Int
     let cacheReadTokens: Int
-    let cacheWriteTokens: Int
+    let cacheWriteTokens: Int  // 캐시 생성(쓰기) 전체 합계 — 5분분 + 1시간분
+    // 위 합계 중 1시간 캐시 쓰기분(usage.cache_creation.ephemeral_1h_input_tokens가 있을 때만 채움).
+    // 없는 구버전 로그는 기본값 0 → 전량 5분 캐시로 간주(기존 동작과 동일, 스키마 드리프트 내성).
+    let cacheWrite1hTokens: Int
+    // 전역 중복 제거 키: "message.id:requestId" 우선, 없으면 "msg:{id}", 그것도 없으면
+    // "uuid:{uuid}", 전부 없으면 nil(기존 "빈 uuid는 dedupe 대상 아님"과 동일한 폴백).
+    // 세션 fork/resume 시 Claude Code가 이전 턴을 새 세션ID의 새 파일로 복사하는데, uuid는
+    // "보통 있지만 항상 보존되진 않는" 반면 message.id/requestId는 항상 함께 다니므로 uuid
+    // 단독보다 이 계층 구조가 이중 집계에 더 견고하다.
+    let dedupeKey: String?
     let sessionId: String  // JSONL file name as session identifier
-    let uuid: String       // 전역 중복 제거용
+    let uuid: String       // 원본 uuid 보존(참고용 — dedupe는 dedupeKey가 담당)
+
+    // 커스텀 init: cacheWrite1hTokens/dedupeKey에 기본값을 주기 위함 — Swift의 synthesized
+    // memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
+    init(timestamp: Date, model: String, inputTokens: Int, outputTokens: Int,
+         cacheReadTokens: Int, cacheWriteTokens: Int, cacheWrite1hTokens: Int = 0,
+         dedupeKey: String? = nil, sessionId: String, uuid: String) {
+        self.timestamp = timestamp
+        self.model = model
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.cacheWrite1hTokens = cacheWrite1hTokens
+        self.dedupeKey = dedupeKey
+        self.sessionId = sessionId
+        self.uuid = uuid
+    }
 
     var cost: Double {
-        let p = getPricing(for: model).pricing
+        let p = getPricing(for: model, at: timestamp).pricing
         let m = 1_000_000.0
+        let cacheWrite5mTokens = cacheWriteTokens - cacheWrite1hTokens
         return Double(inputTokens) / m * p.input
              + Double(outputTokens) / m * p.output
              + Double(cacheReadTokens) / m * p.cacheRead
-             + Double(cacheWriteTokens) / m * p.cacheWrite
+             + Double(cacheWrite5mTokens) / m * p.cacheWrite5m
+             + Double(cacheWrite1hTokens) / m * p.cacheWrite1h
     }
 
     var totalTokens: Int {
         inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
     }
+}
+
+// message.id + requestId 우선, 그중 하나만 있으면 message.id, 둘 다 없으면 uuid, 전부 없으면
+// nil(dedupe 미대상). Claude Code가 세션을 fork/resume할 때 이전 턴을 새 세션ID의 새 파일로
+// 복사하며 uuid는 "보통 있지만 항상 보존되진 않는" 반면 message.id/requestId는 항상 함께
+// 다니므로, uuid 단독 키보다 견고하다.
+func buildUsageDedupeKey(messageId: String?, requestId: String?, uuid: String) -> String? {
+    if let mid = messageId, !mid.isEmpty {
+        if let rid = requestId, !rid.isEmpty { return "\(mid):\(rid)" }
+        return "msg:\(mid)"
+    }
+    if !uuid.isEmpty { return "uuid:\(uuid)" }
+    return nil
+}
+
+// 같은 dedupeKey를 가진 두 엔트리를 하나로 병합한다. 토큰 필드는 각각 max를 취해(스트리밍 중
+// partial usage → 최종 usage로 갱신되는 케이스, 혹은 fork/resume로 복제된 동일 턴이 서로 다른
+// 파일에서 다른 시점에 관측되는 케이스 모두 대응) discard-first보다 견고하게 만든다. 그 외
+// 필드(timestamp/model/sessionId/uuid)는 a(먼저 관측된 쪽) 값을 유지 — 두 엔트리는 논리적으로
+// 같은 턴이라 이 필드들이 달라질 일은 없다고 가정한다.
+func mergeUsageEntriesByMaxTokens(_ a: UsageEntry, _ b: UsageEntry) -> UsageEntry {
+    UsageEntry(timestamp: a.timestamp, model: a.model,
+               inputTokens: max(a.inputTokens, b.inputTokens),
+               outputTokens: max(a.outputTokens, b.outputTokens),
+               cacheReadTokens: max(a.cacheReadTokens, b.cacheReadTokens),
+               cacheWriteTokens: max(a.cacheWriteTokens, b.cacheWriteTokens),
+               cacheWrite1hTokens: max(a.cacheWrite1hTokens, b.cacheWrite1hTokens),
+               dedupeKey: a.dedupeKey, sessionId: a.sessionId, uuid: a.uuid)
 }
 
 // MARK: - Data Reader (증분 파싱)
@@ -634,16 +728,23 @@ class UsageDataReader {
         // readAll() 호출마다 항상 실행된다.
         guard didChange else { return cachedEntries }
 
-        // 전역 병합 + UUID 중복 제거 (빈 uuid는 dedupe 대상 아님)
-        var seen = Set<String>()
+        // 전역 병합 + dedupeKey 기준 중복 제거(키 없으면 dedupe 대상 아님). 같은 키가 재등장하면
+        // discard-first가 아니라 토큰 필드 max 병합 — 스트리밍 partial usage 갱신이나 세션
+        // fork/resume로 다른 파일에 복제된 동일 턴을 모두 견고하게 처리한다(mergeUsageEntriesByMaxTokens 참고).
+        var indexByKey: [String: Int] = [:]
         var merged: [UsageEntry] = []
         for state in fileCache.values {
             for e in state.entries {
-                if !e.uuid.isEmpty {
-                    if seen.contains(e.uuid) { continue }
-                    seen.insert(e.uuid)
+                guard let key = e.dedupeKey else {
+                    merged.append(e)
+                    continue
                 }
-                merged.append(e)
+                if let idx = indexByKey[key] {
+                    merged[idx] = mergeUsageEntriesByMaxTokens(merged[idx], e)
+                } else {
+                    indexByKey[key] = merged.count
+                    merged.append(e)
+                }
             }
         }
         merged.sort { $0.timestamp < $1.timestamp }
@@ -685,6 +786,17 @@ class UsageDataReader {
             // 타임스탬프 파싱 실패 시 줄 자체를 건너뜀 (집계 오염 방지)
             guard let timestamp = parseTimestamp(json["timestamp"]) else { continue }
 
+            // usage.cache_creation.ephemeral_1h_input_tokens — 있으면 1시간 캐시 쓰기분을 분리해
+            // 5분/1시간 단가를 각각 적용한다(cost 계산). 필드 자체가 없는 구버전 로그는 0으로
+            // 남아 전량 5분 캐시로 간주(하위 호환).
+            let cacheCreationBreakdown = usage["cache_creation"] as? [String: Any]
+            let cacheWrite1h = cacheCreationBreakdown?["ephemeral_1h_input_tokens"] as? Int ?? 0
+
+            let uuidStr = json["uuid"] as? String ?? ""
+            let messageId = message["id"] as? String
+            let requestId = json["requestId"] as? String
+            let dedupeKey = buildUsageDedupeKey(messageId: messageId, requestId: requestId, uuid: uuidStr)
+
             let entry = UsageEntry(
                 timestamp: timestamp,
                 model: model,
@@ -692,8 +804,10 @@ class UsageDataReader {
                 outputTokens:     usage["output_tokens"] as? Int ?? 0,
                 cacheReadTokens:  usage["cache_read_input_tokens"] as? Int ?? 0,
                 cacheWriteTokens: usage["cache_creation_input_tokens"] as? Int ?? 0,
+                cacheWrite1hTokens: cacheWrite1h,
+                dedupeKey: dedupeKey,
                 sessionId: sessionId,
-                uuid: json["uuid"] as? String ?? ""
+                uuid: uuidStr
             )
             result.append(entry)
         }
@@ -796,7 +910,7 @@ struct UsageStats {
     // 정밀 단가 미매칭(추정 단가 적용) 모델 목록
     var unknownModels: [String] {
         var set = Set<String>()
-        for e in entries where !getPricing(for: e.model).matched { set.insert(e.model) }
+        for e in entries where !getPricing(for: e.model, at: e.timestamp).matched { set.insert(e.model) }
         return Array(set).sorted()
     }
 }
@@ -3423,16 +3537,73 @@ func runSelfTests() -> Never {
 
     // getPricing
     check(getPricing(for: "claude-opus-4-1").matched == true, "opus-4-1 정밀 매칭")
-    check(getPricing(for: "claude-opus-4-1").pricing.output == 75.0, "opus 출력 단가 75")
+    check(getPricing(for: "claude-opus-4-1").pricing.output == 75.0, "opus 출력 단가 75(legacy)")
+    check(getPricing(for: "claude-opus-4-8[1m]").pricing.output == 25.0,
+          "opus-4-8은 legacy(75)가 아니라 현행 단가(25) — opus-4보다 먼저 매칭돼야 함")
+    check(getPricing(for: "claude-opus-4-5-20251101").pricing.input == 5.0,
+          "opus-4-5도 현행 단가(input 5)로 매칭")
     let unknown = getPricing(for: "gpt-4o")
     check(unknown.matched == false, "비-claude 모델 미매칭")
     check(unknown.pricing.output == DEFAULT_PRICING.output, "미상 모델 DEFAULT 단가")
+
+    // getPricing(at:) — Sonnet 5 도입가(2026-08-31까지 $2/$10) → 표준가(2026-09-01부터 $3/$15)
+    // 전환. 실제 커트오프 상수(sonnet5IntroPricingCutoffUTC) 기준 상대 오프셋으로 날짜를 만들어,
+    // 하드코딩한 epoch 값의 오프바이원/계산 실수 없이 항상 정확히 경계 양쪽을 가리키게 한다.
+    let wellBeforeCutoff = sonnet5IntroPricingCutoffUTC.addingTimeInterval(-86_400 * 30)  // 커트오프 30일 전
+    let wellAfterCutoff  = sonnet5IntroPricingCutoffUTC.addingTimeInterval(86_400 * 30)   // 커트오프 30일 후
+    check(getPricing(for: "claude-sonnet-5", at: wellBeforeCutoff).pricing.input == 2.0,
+          "sonnet-5: 커트오프 이전엔 도입가(input $2)")
+    check(getPricing(for: "claude-sonnet-5", at: wellBeforeCutoff).pricing.output == 10.0,
+          "sonnet-5: 커트오프 이전엔 도입가(output $10)")
+    check(getPricing(for: "claude-sonnet-5", at: wellAfterCutoff).pricing.input == 3.0,
+          "sonnet-5: 커트오프 이후엔 표준가(input $3)")
+    check(getPricing(for: "claude-sonnet-5", at: wellAfterCutoff).pricing.output == 15.0,
+          "sonnet-5: 커트오프 이후엔 표준가(output $15)")
+    check(getPricing(for: "claude-sonnet-5", at: sonnet5IntroPricingCutoffUTC).pricing.input == 3.0,
+          "sonnet-5: 커트오프 정각(2026-09-01 00:00 UTC)부터 표준가(경계값은 표준가 쪽에 포함)")
+    check(getPricing(for: "claude-sonnet-4-5", at: wellBeforeCutoff).pricing.input == 3.0,
+          "sonnet-4-5(Sonnet 4.5)는 sonnet-5 특수 분기를 타지 않고 기존 표준가 유지(오검출 방지)")
+
+    // ModelPricing 캐시 배수 파생(공식 고정 배수: read=0.1x, 5분 쓰기=1.25x, 1시간 쓰기=2.0x)
+    let sonnetPricing = getPricing(for: "claude-sonnet-4-5").pricing
+    check(abs(sonnetPricing.cacheRead - 0.30) < 1e-9, "sonnet cacheRead = input×0.1 = 0.30")
+    check(abs(sonnetPricing.cacheWrite5m - 3.75) < 1e-9, "sonnet 5분 캐시 쓰기 = input×1.25 = 3.75")
+    check(abs(sonnetPricing.cacheWrite1h - 6.0) < 1e-9, "sonnet 1시간 캐시 쓰기 = input×2.0 = 6.0")
 
     // cost
     let e = UsageEntry(timestamp: Date(), model: "claude-sonnet-4-5",
                        inputTokens: 1_000_000, outputTokens: 1_000_000,
                        cacheReadTokens: 0, cacheWriteTokens: 0, sessionId: "s", uuid: "")
     check(abs(e.cost - 18.0) < 1e-6, "비용 = input 3 + output 15 = $18")
+
+    // cost: 캐시 쓰기가 5분/1시간 혼합일 때 각각 다른 단가가 적용되는지
+    let eCacheMixed = UsageEntry(timestamp: Date(), model: "claude-sonnet-4-5",
+                                  inputTokens: 0, outputTokens: 0,
+                                  cacheReadTokens: 0, cacheWriteTokens: 1_000_000,
+                                  cacheWrite1hTokens: 400_000, sessionId: "s", uuid: "")
+    // 5분분 600K × 3.75/M + 1시간분 400K × 6.0/M = 2.25 + 2.4 = 4.65
+    check(abs(eCacheMixed.cost - 4.65) < 1e-6,
+          "cost: 캐시 쓰기 합계 중 1시간분은 2배, 나머지 5분분은 1.25배 단가로 각각 계산")
+
+    // buildUsageDedupeKey — message.id:requestId 계층 (순수 함수)
+    check(buildUsageDedupeKey(messageId: "msg_1", requestId: "req_1", uuid: "u") == "msg_1:req_1",
+          "dedupeKey: message.id+requestId 둘 다 있으면 그 조합이 우선")
+    check(buildUsageDedupeKey(messageId: "msg_1", requestId: nil, uuid: "u") == "msg:msg_1",
+          "dedupeKey: requestId 없으면 msg:{id}로 폴백")
+    check(buildUsageDedupeKey(messageId: nil, requestId: "req_1", uuid: "u") == "uuid:u",
+          "dedupeKey: requestId만 있고 messageId 없으면 uuid로 폴백(requestId 단독 신뢰 안 함)")
+    check(buildUsageDedupeKey(messageId: nil, requestId: nil, uuid: "u") == "uuid:u",
+          "dedupeKey: message.id도 없으면 uuid로 최종 폴백")
+    check(buildUsageDedupeKey(messageId: nil, requestId: nil, uuid: "") == nil,
+          "dedupeKey: 전부 없으면 nil(기존 '빈 uuid는 dedupe 대상 아님'과 동일)")
+
+    // mergeUsageEntriesByMaxTokens — 토큰 필드는 max, 그 외 필드는 첫 엔트리 유지 (순수 함수)
+    let mergeA = entry(Date(timeIntervalSince1970: 0), "claude-sonnet-4-5", out: 100)
+    let mergeB = entry(Date(timeIntervalSince1970: 100), "claude-sonnet-4-5", out: 300)
+    let mergedEntry = mergeUsageEntriesByMaxTokens(mergeA, mergeB)
+    check(mergedEntry.outputTokens == 300, "mergeUsageEntriesByMaxTokens: 토큰 필드는 max로 병합")
+    check(mergedEntry.timestamp == mergeA.timestamp,
+          "mergeUsageEntriesByMaxTokens: 토큰 아닌 필드(timestamp 등)는 먼저 본 엔트리 값을 유지")
 
     // formatters
     check(formatTokens(999) == "999", "formatTokens 999")
@@ -4135,6 +4306,43 @@ func runSelfTests() -> Never {
         check(reader.lastReadChanged, "readAll: 파일이 바뀌면 lastReadChanged가 다시 true로 복귀")
 
         try? FileManager.default.removeItem(at: readerHome)
+    }
+
+    // UsageDataReader.readAll() — 세션 fork/resume 시나리오: 같은 턴(message.id+requestId 공유)이
+    // 서로 다른 세션 파일(fork 복사본)에 uuid 없이 나타나도 dedupeKey로 1개만 남고, 그중 더
+    // 완전한(큰) usage 값이 max 병합으로 남는지 검증. discard-first였던 예전 로직이면 uuid가
+    // 비어 dedupe 대상에서 아예 빠져 2개로 이중 집계됐을 케이스.
+    do {
+        let forkHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeMonitorSelfTest.fork.\(UUID().uuidString)")
+        let projectDir = forkHome.appendingPathComponent(".claude/projects/proj1")
+        try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+
+        func lineWithIds(uuid: String, ts: String, outputTokens: Int, messageId: String, requestId: String) -> String {
+            "{\"type\":\"assistant\",\"uuid\":\"\(uuid)\",\"timestamp\":\"\(ts)\",\"requestId\":\"\(requestId)\"," +
+            "\"message\":{\"id\":\"\(messageId)\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":\(outputTokens)}}}\n"
+        }
+
+        // 원본 세션: 부분 usage(output 100)만 관측된 상태
+        let originalFile = projectDir.appendingPathComponent("session-original.jsonl")
+        try? lineWithIds(uuid: "orig-uuid", ts: "2026-01-01T00:00:00Z", outputTokens: 100,
+                          messageId: "msg_shared", requestId: "req_shared")
+            .write(to: originalFile, atomically: true, encoding: .utf8)
+
+        // fork/resume로 복사된 세션: 같은 턴이 uuid 없이(유실 시뮬레이션) 더 완전한 usage(300)로 재등장
+        let forkedFile = projectDir.appendingPathComponent("session-forked.jsonl")
+        try? lineWithIds(uuid: "", ts: "2026-01-01T00:00:00Z", outputTokens: 300,
+                          messageId: "msg_shared", requestId: "req_shared")
+            .write(to: forkedFile, atomically: true, encoding: .utf8)
+
+        let forkReader = UsageDataReader(homeDir: forkHome)
+        let forkEntries = forkReader.readAll()
+        check(forkEntries.count == 1,
+              "readAll: fork로 다른 파일에 복제된 동일 턴(message.id+requestId 공유, uuid 유실)은 1개로만 집계")
+        check(forkEntries.first?.outputTokens == 300,
+              "readAll: 복제된 턴 중 더 완전한(큰) usage 값이 max 병합으로 남는다")
+
+        try? FileManager.default.removeItem(at: forkHome)
     }
 
     // F1 회귀: refresh()가 entriesChanged와 무관하게 updateGamificationRecord()/
