@@ -310,18 +310,58 @@ enum RefreshSettings {
 // 간격으로 반복되는 그리드)를 따른다. 사용자가 지우기 전까지 영구 유지되는 설정 —
 // 1회성 보정이 아니다.)
 
+// 앵커 값이 어떻게 설정됐는지 — 상태 표시용(메뉴 라벨이 "수동 입력됨"/"자동 보정됨"을 구분하기 위함).
+enum ResetAnchorSource: String { case manual, auto }
+
 enum ResetAnchorSettings {
     private static let anchorKey = "resetAnchorInstant"
+    private static let sourceKey = "resetAnchorSource"
     static func anchor(defaults: UserDefaults = .standard) -> Date? {
         guard let raw = defaults.object(forKey: anchorKey) as? Double else { return nil }
         return Date(timeIntervalSince1970: raw)
     }
-    static func setAnchor(_ date: Date, defaults: UserDefaults = .standard) {
+    static func source(defaults: UserDefaults = .standard) -> ResetAnchorSource? {
+        defaults.string(forKey: sourceKey).flatMap(ResetAnchorSource.init(rawValue:))
+    }
+    // source 기본값 .manual — 대다수 호출부(사용자 직접 입력)는 명시할 필요 없고, 자동 동기화
+    // 경로(applyAutoResetAnchorIfNeeded)만 .auto를 명시적으로 넘긴다.
+    static func setAnchor(_ date: Date, source: ResetAnchorSource = .manual, defaults: UserDefaults = .standard) {
         defaults.set(date.timeIntervalSince1970, forKey: anchorKey)
+        defaults.set(source.rawValue, forKey: sourceKey)
     }
     static func clearAnchor(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: anchorKey)
+        defaults.removeObject(forKey: sourceKey)  // 앵커가 없으면 출처도 무의미
     }
+
+    // rate-limits-cache.json(있다면)의 서버 실측 리셋 시각으로 앵커를 자동 동기화할지 여부.
+    // 기본값 true. 사용자가 "지우기"로 수동 해제하면 false로도 함께 내려가 — 그렇지 않으면 다음
+    // refresh 때 신선한 캐시가 즉시 같은 앵커를 재적용해 "지우기" 의도를 무시하게 된다.
+    private static let autoSyncKey = "resetAnchorAutoSyncEnabled"
+    static func autoSyncEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: autoSyncKey) == nil ? true : defaults.bool(forKey: autoSyncKey)
+    }
+    static func setAutoSyncEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: autoSyncKey)
+    }
+}
+
+// 리셋 기준 시각 메뉴 상태 라벨 — 순수 함수(테스트 용이성). source가 nil인데 anchor가 있는 경우는
+// source 필드 도입 이전에 저장된 앵커와의 하위 호환 — "수동 입력됨"으로 안전하게 폴백한다.
+func resetAnchorStatusText(anchor: Date?, source: ResetAnchorSource?) -> String {
+    guard anchor != nil else { return t("자동 계산", "Automatic") }
+    return source == .auto ? t("자동 보정됨 (서버 실측)", "Auto-synced (server)")
+                            : t("수동 입력됨", "Manually set")
+}
+
+// 서버 실측 five_hour.resetsAt이 유효(아직 미래)하면 그 시각을 그대로 새 앵커 후보로 반환한다.
+// anchoredWindow는 절대시각 산술(anchor + 5h×n)이라 "다음 리셋 시각"을 앵커로 써도 "현재 윈도우
+// 시작 시각"을 앵커로 써도 동일한 그리드가 나오므로(두 값은 정확히 5시간 배수만큼만 차이 나
+// 모듈로 결과가 같다) 5시간을 빼는 보정이 필요 없다. rateLimits 자체가 없거나 stale이면 nil —
+// 호출부가 기존 앵커/자동 계산을 그대로 유지할 근거.
+func autoResetAnchor(from rateLimits: RateLimitsCache?, now: Date = Date()) -> Date? {
+    guard let window = rateLimits?.fiveHour, !window.isStale(now: now) else { return nil }
+    return window.resetsAtDate
 }
 
 // "HH:mm"(24시간제, 로케일 무관 고정 포맷)을 now의 로컬 날짜에 적용해 Date로 변환한다.
@@ -1903,6 +1943,64 @@ final class StatsCacheReader {
     }
 }
 
+// MARK: - Rate Limits Cache (선택적 3rd 데이터 소스, ~/.claude/rate-limits-cache.json)
+//
+// Claude Code CLI는 statusLine 스크립트 실행 시 stdin JSON에 rate_limits.five_hour/seven_day
+// (used_percentage, resets_at epoch초 — Claude.ai Pro/Max 구독자, 세션 첫 API 응답 이후에만)를
+// 전달하지만 디스크에는 저장하지 않는다. 이 파일은 어떤 statusLine 스크립트든 그 rate_limits
+// 객체를 변형 없이 그대로 떨궈 두면(예: jq '.rate_limits' <<< "$input" > 이 경로) cc-menutor가
+// 읽어 "⚓ 리셋 기준 시각"을 자동으로 채우는 데 쓰는, cc-menutor가 직접 쓰지는 않는 선택적 입력이다.
+// StatsCache와 동일한 이유로 전 필드 옵셔널(작성자 부재/구버전 등 부분 드리프트에 견딘다).
+
+struct RateLimitWindow: Codable {
+    let usedPercentage: Double?
+    let resetsAt: Int?  // epoch seconds
+
+    var resetsAtDate: Date? { resetsAt.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
+
+    // resetsAt이 이미 과거면 statusLine이 한동안 갱신되지 않은 stale 캐시로 간주한다
+    // (StatsBlock.isExpired와 동일한 사고방식 — 캐시가 남아 있어도 시각으로 교차검증).
+    func isStale(now: Date = Date()) -> Bool {
+        guard let d = resetsAtDate else { return true }
+        return now >= d
+    }
+}
+
+struct RateLimitsCache: Codable {
+    let fiveHour: RateLimitWindow?
+    let sevenDay: RateLimitWindow?
+}
+
+final class RateLimitsCacheReader {
+    let url: URL
+    private var lastMTime: Date?
+    private var cached: RateLimitsCache?
+
+    init(homeDir: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        url = homeDir.appendingPathComponent(".claude/rate-limits-cache.json")
+    }
+
+    // 파일 없거나 파싱 실패 시 nil → 호출부가 기존 동작(수동 앵커/자동 계산)을 그대로 유지.
+    // mtime 동일하면 직전 디코드 결과 재사용(디코드 생략) — StatsCacheReader.load()와 동일 패턴.
+    func load() -> RateLimitsCache? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let mtime = attrs[.modificationDate] as? Date else {
+            cached = nil; lastMTime = nil
+            return nil
+        }
+        if let last = lastMTime, last == mtime, let c = cached { return c }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase  // five_hour → fiveHour, used_percentage → usedPercentage 등
+        guard let data = try? Data(contentsOf: url),
+              let decoded = try? decoder.decode(RateLimitsCache.self, from: data) else {
+            return nil   // 디코드 실패 시 캐시 오염 방지
+        }
+        cached = decoded
+        lastMTime = mtime
+        return decoded
+    }
+}
+
 // MARK: - Block Menu Display Model
 //
 // buildMenu(fromCache:)/buildMenuFromEntries() 공유 뷰모델. 두 데이터 소스(StatsCache 1차 경로
@@ -1964,6 +2062,10 @@ struct BlockSectionData {
 
 struct BlockDisplayData {
     let isEstimate: Bool              // 폴백 경로에서만 true → "추정 모드" 배너
+    // 1차(stats-cache) 경로에서 리셋 앵커가 활성화돼 이 블록의 토큰/비용을 CLI의 costUSD 대신
+    // JSONL 기반 추정치로 재계산했을 때만 true → "⚓ 앵커 적용 중 — 비용 추정치" 배너(isEstimate와
+    // 별개 조건 — 둘 다 true일 일은 없다. isEstimate는 stats-cache 자체가 없을 때만이므로).
+    let anchorIsEstimating: Bool
     enum State {
         case noData                   // 폴백 경로 전용
         // 메뉴가 열려 있는 동안 refresh가 진행 중일 때만 쓰는 스켈레톤 상태 — 연관값은 .ready와
@@ -1973,6 +2075,14 @@ struct BlockDisplayData {
         case ready(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData, allTime: AllTimeSectionData?)
     }
     let state: State
+
+    // 커스텀 init: anchorIsEstimating에 기본값(false)을 주기 위함 — Swift의 synthesized
+    // memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
+    init(isEstimate: Bool, anchorIsEstimating: Bool = false, state: State) {
+        self.isEstimate = isEstimate
+        self.anchorIsEstimating = anchorIsEstimating
+        self.state = state
+    }
 }
 
 extension BlockDisplayData {
@@ -1980,7 +2090,8 @@ extension BlockDisplayData {
     // 없으므로 nil을 반환한다(호출부가 이 경우 단순 "로딩 중" placeholder로 대체).
     func asLoadingSkeleton() -> BlockDisplayData? {
         guard case .ready(let block, let model, let today, let allTime) = state else { return nil }
-        return BlockDisplayData(isEstimate: isEstimate, state: .loading(block: block, model: model, today: today, allTime: allTime))
+        return BlockDisplayData(isEstimate: isEstimate, anchorIsEstimating: anchorIsEstimating,
+                                 state: .loading(block: block, model: model, today: today, allTime: allTime))
     }
 }
 
@@ -1991,6 +2102,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var timer: Timer?
     let reader = UsageDataReader()
     let statsReader = StatsCacheReader()
+    let rateLimitsReader = RateLimitsCacheReader()
     var lastUpdateTime = Date(timeIntervalSince1970: 0)
     var cachedAll: [UsageEntry] = []
     var cachedStats: StatsCache?
@@ -2015,6 +2127,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     weak var refreshIntervalSubmenu: NSMenu?
     weak var languageSubmenu: NSMenu?
     weak var funModeSubmenu: NSMenu?
+    weak var resetAnchorSubmenu: NSMenu?
     // 메인 5시간 블록 메뉴 — refresh마다 새 NSMenu()로 교체하지 않고 재사용한다. 매번 새 인스턴스를
     // 만들어 statusItem.menu에 재대입하면, 이미 열려(트래킹) 있는 메뉴 인스턴스는 그 재대입의
     // 영향을 받지 않아 사용자가 보는 중엔 갱신되지 않던 문제가 있었다 — 인스턴스를 재사용하고
@@ -2025,7 +2138,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var bodyItemCount = 0  // replaceBody(with:)가 이 개수만큼만 메인 메뉴 맨 앞에서 교체한다
     private var footerLocalizedItems: [(NSMenuItem, () -> String)] = []  // 언어 전환 시 footer title 패치용
     private weak var refreshButtonRow: NSMenuItem?  // "지금 새로고침"의 커스텀 뷰 항목 — 언어 전환 시 버튼 타이틀만 따로 patch
-    private weak var resetAnchorButtonRow: NSMenuItem?  // "리셋 기준 시각"의 커스텀 뷰 항목 — 언어 전환/앵커 변경 시 버튼 타이틀만 따로 patch
+    private weak var resetAnchorItem: NSMenuItem?  // "⚓ 리셋 기준 시각" 서브메뉴 부모 항목 — 언어 전환/앵커 변경 시 타이틀만 따로 patch
+    private weak var resetAnchorStatusRow: NSMenuItem?  // 서브메뉴 안의 상태 정보 행(비활성 라벨) — 상태 변경 시 재생성해 patch
+    private weak var resetAnchorAutoSyncRow: NSMenuItem?  // 서브메뉴 안의 "서버 실측으로 자동 보정" 체크박스 행 — 상태 변경 시 재생성해 patch
     private var coldStartTimer: Timer?  // 콜드 스타트(앱 최초 실행) 전용 로딩 점 순환 애니메이션 — 이후 refresh에는 관여하지 않음
     private var coldStartDotPhase = 0  // 0...3, 표시 폭 고정을 위해 미표시 구간은 공백으로 패딩
     private var coldStartFlameIndex = 0  // MoodTier.allCases(5개) 순환 인덱스 — coldStartDotPhase(mod 4)와 별개로 둬야 critical(인덱스 4)에도 도달한다
@@ -2132,6 +2247,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self = self else { return }
             let stats = self.statsReader.load()
             let entries = self.reader.readAll()
+            let rateLimits = self.rateLimitsReader.load()
             DispatchQueue.main.async {
                 self.cachedStats = stats
                 self.cachedAll = entries
@@ -2145,6 +2261,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // 돌아가는 자기소멸 설계라 게이팅하면 "🎉 마일스톤" 배지가 영구 고정된다.
                 self.updateGamificationRecord()
                 self.updateEasterEggState()
+                self.applyAutoResetAnchorIfNeeded(rateLimits: rateLimits)
                 self.buildMenu()
                 if manual { self.statusItem.button?.alphaValue = 1.0 }
                 self.isRefreshing = false
@@ -2509,7 +2626,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // ── 1차 경로: Claude Code stats-cache.json (권위 비용·실제 5시간 블록) ──
     func buildMenu(fromCache stats: StatsCache) {
         updateStatusBarTitle(fromCache: stats)
-        let data = makeBlockDisplayData(fromCache: stats)
+        let data = makeBlockDisplayData(fromCache: stats, cachedAll: cachedAll)
         lastBlockDisplayData = data
         replaceBody { menu in
             self.renderBlockMenu(data, into: menu)
@@ -2517,17 +2634,31 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // ── 1차 경로(stats-cache.json) 뷰모델 어댑터 — 캐시가 노출하지 않는 필드(블록 내 모델별
-    // 토큰/비용 분해)는 fromEntries 쪽과 인위적으로 맞추지 않고 있는 그대로(namesOnly) 반영한다. ──
-    func makeBlockDisplayData(fromCache stats: StatsCache) -> BlockDisplayData {
-        let active = stats.activeBlock()
-        let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
-        // 앵커가 설정돼 있으면 표시용 윈도우(시간창·진행률·리셋 텍스트·무드)를 앵커 그리드
-        // 기준으로 바꾼다. 토큰/비용(b.tokenCounts, b.costUSD)은 앵커 유무와 무관하게 CLI가
-        // 집계한 값 그대로 쓴다 — 표시 창과 CLI 집계 창이 살짝 어긋날 수 있다는 한계는
-        // README/CLAUDE.md에 문서화.
+    // ── 1차 경로(stats-cache.json) 뷰모델 어댑터 ──
+    // now: 테스트 용이성을 위한 주입 지점(FiveHourBlock.active(from:now:)/anchoredWindow(containing:)와
+    // 동일한 패턴) — 프로덕션에서는 항상 기본값(현재 시각) 사용.
+    func makeBlockDisplayData(fromCache stats: StatsCache, cachedAll: [UsageEntry], now: Date = Date()) -> BlockDisplayData {
+        let active = stats.activeBlock(now: now)
+        // 앵커가 설정돼 있으면 표시용 윈도우(시간창·진행률·리셋 텍스트·무드)를 앵커 그리드 기준으로
+        // 바꾼다.
         let anchorWindow: FiveHourBlock? = ResetAnchorSettings.anchor()
-            .map { FiveHourBlock.anchoredWindow(containing: Date(), anchor: $0) }
+            .map { FiveHourBlock.anchoredWindow(containing: now, anchor: $0) }
+
+        // 앵커가 켜져 있으면 토큰/비용/모델분해도 CLI의 "자연" 블록(b.tokenCounts/costUSD/models —
+        // 첫 활동 기준 floor 같은 휴리스틱이라 유휴 후 재시작 시 앵커 그리드와 어긋나기 쉽다) 대신
+        // 앵커 창으로 JSONL을 직접 재필터링해 재계산한다. 그렇지 않으면 시간창 라벨은 앵커를
+        // 따르는데 그 아래 숫자는 여전히 어긋난 CLI 블록 것이라 "표시 창과 숫자가 안 맞는"(그리고
+        // 유휴 재개 시 이전 블록과 섞인 듯 보이는) 버그가 생긴다. 대가: 이 블록의 비용은 CLI의
+        // 정확한 costUSD가 아니라 PRICING 기반 추정치가 된다(토큰 수 자체는 JSONL 원본이라 정확).
+        let anchorStats: UsageStats? = anchorWindow.map { w in
+            UsageStats(entries: cachedAll.filter { $0.timestamp >= w.start && $0.timestamp < w.end })
+        }
+        let anchorIsEstimating = anchorWindow != nil
+
+        let warning = active.flatMap { b in
+            if let s = anchorStats { return usageWarning(tokens: s.totalTokens, cost: s.totalCost) }
+            return usageWarning(tokens: b.totalTokens, cost: b.costUSD)
+        }
 
         let block: BlockSectionData?
         if let b = active {
@@ -2542,7 +2673,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let w = anchorWindow { return w.progress }
                 guard let s = start, let e = end else { return 0 }
                 let total = e.timeIntervalSince(s)
-                let elapsed = max(0, min(total, Date().timeIntervalSince(s)))
+                let elapsed = max(0, min(total, now.timeIntervalSince(s)))
                 return total > 0 ? elapsed / total : 0
             }()
             let resetState: BlockSectionData.ResetState = {
@@ -2556,15 +2687,15 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }()
             block = BlockSectionData(
                 windowText: windowText,
-                outputTokens: b.tokenCounts.outputTokens,
-                totalTokens: b.totalTokens,
-                cost: b.costUSD,
-                messageCount: b.entries,
+                outputTokens: anchorStats?.outputTokens ?? b.tokenCounts.outputTokens,
+                totalTokens: anchorStats?.totalTokens ?? b.totalTokens,
+                cost: anchorStats?.totalCost ?? b.costUSD,
+                messageCount: anchorStats?.count ?? b.entries,
                 showProgressBar: anchorWindow != nil || (start != nil && end != nil),
                 progressRatio: progressRatio,
                 resetState: resetState,
                 warningResetText: anchorWindow.map { formatTime($0.remaining) } ?? resetCountdownText(for: b),
-                burnRateText: b.burnRate?.costPerHour.map { formatCost($0) },
+                burnRateText: anchorWindow != nil ? nil : b.burnRate?.costPerHour.map { formatCost($0) },
                 warning: warning,
                 moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: progressRatio, warning: warning),
                 moodRatio: warning?.ratio ?? progressRatio,
@@ -2575,7 +2706,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let model: ModelSectionData?
-        if let b = active, !b.models.isEmpty {
+        if let s = anchorStats, !s.modelBreakdown.isEmpty {
+            // 앵커 재계산 중엔 fromEntries 경로와 동일한 모양(토큰/비용 분해)을 쓴다 — CLI가 주는
+            // 이름 목록만으로는 앵커 창 기준 분해를 표현할 수 없다.
+            model = ModelSectionData(headerKo: "🤖  모델별 (현재 블록)", headerEn: "🤖  By Model (Current Block)",
+                                      shape: .breakdown(s.modelBreakdown, unknownCount: s.unknownModels.count))
+        } else if let b = active, !b.models.isEmpty {
             model = ModelSectionData(headerKo: "🤖  모델 (현재 블록)", headerEn: "🤖  Model (Current Block)",
                                       shape: .namesOnly(b.models))
         } else {
@@ -2595,7 +2731,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let allTime = stats.cumulative.map { AllTimeSectionData(totalTokens: $0.totalTokens ?? 0, totalCost: $0.totalCost ?? 0) }
 
-        return BlockDisplayData(isEstimate: false, state: .ready(block: block, model: model, today: today, allTime: allTime))
+        return BlockDisplayData(isEstimate: false, anchorIsEstimating: anchorIsEstimating,
+                                 state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
     // ── BlockDisplayData → NSMenu 렌더러. 1차/폴백 경로가 공유하는 유일한 렌더 코드. ──
@@ -2609,11 +2746,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         case .loading(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
-                                 isEstimate: data.isEstimate, skeleton: true, into: menu)
+                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating, skeleton: true, into: menu)
 
         case .ready(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
-                                 isEstimate: data.isEstimate, skeleton: false, into: menu)
+                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating, skeleton: false, into: menu)
         }
     }
 
@@ -2621,9 +2758,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 그린다. 섹션 헤더와 "데이터 없음"류 정적 안내문은 skeleton 여부와 무관하게 항상 실제
     // 텍스트를 쓴다(refresh마다 안 바뀌는 텍스트를 흐리게 하면 레이아웃 점프만 커짐). ──
     private func renderBlockSections(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData,
-                                      allTime: AllTimeSectionData?, isEstimate: Bool, skeleton: Bool, into menu: NSMenu) {
+                                      allTime: AllTimeSectionData?, isEstimate: Bool, anchorIsEstimating: Bool,
+                                      skeleton: Bool, into menu: NSMenu) {
         if isEstimate {
             addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
+            menu.addItem(.separator())
+        } else if anchorIsEstimating {
+            addSectionHeader(menu, t("⚓ 리셋 앵커 적용 중 — 이 블록 비용은 추정치", "⚓ Reset anchor active — this block's cost is estimated"))
             menu.addItem(.separator())
         }
 
@@ -2830,13 +2971,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(refreshIntervalItem)
         track(refreshIntervalItem, refreshIntervalMake)
 
-        // 클릭 시 NSAlert로 실제 리셋 시각을 입력받는 액션 행 — 라디오 서브메뉴가 아니라
-        // "지금 새로고침"과 동일한 .view 기반 버튼 행이라 refreshButtonRow와 같은 이유로
-        // footerLocalizedItems(title 패치)가 아닌 resetAnchorButtonRow로 별도 추적한다.
-        let resetAnchorItem = NSMenuItem()
-        resetAnchorItem.view = actionRowView(title: resetAnchorButtonTitle(), action: #selector(openResetAnchorAlert(_:)))
-        menu.addItem(resetAnchorItem)
-        resetAnchorButtonRow = resetAnchorItem
+        // "리셋 기준 시각" 수동 입력 + "서버 실측 자동 보정"을 하나의 서브메뉴로 통합(다른 서브메뉴
+        // 부모 항목들과 동일한 평범한 NSMenuItem — 타이틀에 요약 상태를 계속 보여준다).
+        let resetAnchorMenuItem = NSMenuItem(title: resetAnchorMenuTitle(), action: nil, keyEquivalent: "")
+        resetAnchorMenuItem.submenu = obtainResetAnchorSubmenu()
+        menu.addItem(resetAnchorMenuItem)
+        resetAnchorItem = resetAnchorMenuItem
 
         let languageMake = { "  🌐 " + t("표시 언어", "Display Language") }
         let languageItem = NSMenuItem(title: languageMake(), action: nil, keyEquivalent: "")
@@ -2871,7 +3011,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let button = refreshButtonRow?.view?.subviews.first as? NSButton {
             button.title = "  🔄 " + t("지금 새로고침", "Refresh Now")
         }
-        refreshResetAnchorButton()
+        refreshResetAnchorUI()
         refreshTitleFieldsSubmenu()
         refreshFunModeSubmenu()
         refreshRadioSubmenu(separatorSubmenu, current: TitleSettings.separator(), action: #selector(setSeparatorButton(_:))) { $0.label }
@@ -2880,15 +3020,106 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshRadioSubmenu(languageSubmenu, current: TitleSettings.languagePreference(), action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
     }
 
-    private func resetAnchorButtonTitle() -> String {
-        let state = ResetAnchorSettings.anchor() != nil ? t("설정됨", "On") : t("자동", "Automatic")
-        return "  ⚓ " + t("리셋 기준 시각: \(state)", "Reset Anchor: \(state)")
+    // 서브메뉴 부모 항목 타이틀 — 서브메뉴를 열지 않고도 요약 상태를 보여준다.
+    private func resetAnchorMenuTitle() -> String {
+        let status = resetAnchorStatusText(anchor: ResetAnchorSettings.anchor(), source: ResetAnchorSettings.source())
+        return "  ⚓ " + t("리셋 기준 시각: \(status)", "Reset Anchor: \(status)")
     }
 
-    private func refreshResetAnchorButton() {
-        if let button = resetAnchorButtonRow?.view?.subviews.first as? NSButton {
-            button.title = resetAnchorButtonTitle()
+    // 서브메뉴의 상태 정보 행 — infoRowItem/addLabel과 같은 의도(호버 하이라이트 없는 정적 텍스트)지만
+    // NSView만 반환해 resetAnchorStatusRow.view = ...로 patch-in-place할 수 있게 한다(infoRowItem은
+    // NSMenuItem 통째를 반환해 이 용도엔 맞지 않는다).
+    private func resetAnchorStatusRowView() -> NSView {
+        let field = NSTextField(labelWithString: "  " + resetAnchorStatusText(anchor: ResetAnchorSettings.anchor(),
+                                                                                source: ResetAnchorSettings.source()))
+        field.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        field.textColor = .secondaryLabelColor
+        field.sizeToFit()
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: field.frame.width + 12, height: max(18, field.frame.height + 2)))
+        field.frame.origin = NSPoint(x: 8, y: (row.frame.height - field.frame.height) / 2)
+        row.addSubview(field)
+        return row
+    }
+
+    // ── "리셋 기준 시각" 서브메뉴 — 상태 라벨 + 수동 입력 + 서버 실측 자동 보정을 한곳에 모은다.
+    // funMode/refreshInterval/separator/language와 동일한 weak var + obtain/build 캐시 패턴. ──
+    private func buildResetAnchorSubmenuView() -> NSMenu {
+        let sub = NSMenu()
+
+        let statusItem = NSMenuItem()
+        statusItem.view = resetAnchorStatusRowView()
+        statusItem.isEnabled = false  // 정보 표시 전용 — infoRowItem과 동일하게 호버 하이라이트 억제
+        sub.addItem(statusItem)
+        resetAnchorStatusRow = statusItem
+
+        sub.addItem(.separator())
+
+        let inputItem = NSMenuItem()
+        inputItem.view = actionRowView(title: "  " + t("입력...", "Enter..."), action: #selector(openResetAnchorAlert(_:)))
+        sub.addItem(inputItem)
+
+        let autoSyncItem = NSMenuItem()
+        autoSyncItem.view = resetAnchorAutoSyncRowView()
+        sub.addItem(autoSyncItem)
+        resetAnchorAutoSyncRow = autoSyncItem
+
+        return sub
+    }
+
+    private func obtainResetAnchorSubmenu() -> NSMenu {
+        if let existing = resetAnchorSubmenu {
+            refreshResetAnchorSubmenuRows()
+            return existing
         }
+        let sub = buildResetAnchorSubmenuView()
+        resetAnchorSubmenu = sub
+        return sub
+    }
+
+    // 상태 라벨/자동 동기화 체크박스 행을 재생성해 patch(텍스트 폭이 달라질 수 있어 in-place 텍스트
+    // 교체 대신 행 전체를 새로 만든다 — addLabel/resetAnchorAutoSyncRowView와 동일한 이유).
+    private func refreshResetAnchorSubmenuRows() {
+        resetAnchorStatusRow?.view = resetAnchorStatusRowView()
+        resetAnchorAutoSyncRow?.view = resetAnchorAutoSyncRowView()
+    }
+
+    // ── rate-limits-cache.json 자동 동기화 체크박스 (funModeRowView와 동일한 커스텀 체크박스 행 패턴).
+    // 파일이 없으면(아직 어떤 statusLine도 이 계약을 구현하지 않았으면) 체크박스는 계속 보이되
+    // 켜도 아무 효과가 없다는 것을 알리는 힌트를 덧붙인다 — 숨기거나 비활성화하지 않는다. ──
+    private func resetAnchorAutoSyncRowView() -> NSView {
+        let hasCache = FileManager.default.fileExists(atPath: rateLimitsReader.url.path)
+        let hint = hasCache ? "" : t(" (statusLine 연동 필요)", " (needs statusLine integration)")
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
+        let checkbox = NSButton(checkboxWithTitle: t("서버 실측으로 자동 보정", "Auto-sync from server data") + hint,
+                                target: self, action: #selector(toggleResetAnchorAutoSyncCheckbox(_:)))
+        checkbox.frame = NSRect(x: 14, y: 2, width: 240, height: 18)
+        checkbox.state = ResetAnchorSettings.autoSyncEnabled() ? .on : .off
+        row.addSubview(checkbox)
+        return row
+    }
+
+    @objc func toggleResetAnchorAutoSyncCheckbox(_ sender: NSButton) {
+        ResetAnchorSettings.setAutoSyncEnabled(sender.state == .on)
+        manualRefresh()
+    }
+
+    // 리셋 기준 시각 관련 UI 3곳(부모 타이틀 + 서브메뉴 상태 라벨 + 자동 동기화 체크박스)을 한 번에
+    // patch한다 — 이전엔 두 함수로 나뉘어 있어 상태가 바뀌는 경로(입력 적용/지우기/체크박스 토글/
+    // 자동 동기화 틱/언어 전환) 중 한 곳에서 patch를 빠뜨리기 쉬웠다.
+    private func refreshResetAnchorUI() {
+        resetAnchorItem?.title = resetAnchorMenuTitle()
+        refreshResetAnchorSubmenuRows()
+    }
+
+    // rate-limits-cache.json에서 읽은 서버 실측값으로 앵커를 자동 적용한다. 자동 동기화가 꺼져
+    // 있거나(사용자가 명시적으로 껐거나 "지우기"로 함께 꺼진 경우) 신선한 값이 없으면 아무 것도
+    // 하지 않고 기존 앵커/자동 계산을 그대로 둔다. 실제로 앵커가 바뀔 때만 UI를 patch.
+    private func applyAutoResetAnchorIfNeeded(rateLimits: RateLimitsCache?) {
+        guard ResetAnchorSettings.autoSyncEnabled(),
+              let newAnchor = autoResetAnchor(from: rateLimits),
+              ResetAnchorSettings.anchor() != newAnchor else { return }
+        ResetAnchorSettings.setAnchor(newAnchor, source: .auto)
+        refreshResetAnchorUI()
     }
 
     // 현재 표시 중인 블록의 유효 종료 시각(자연 계산이든 이미 설정된 앵커 기준이든)을
@@ -2928,7 +3159,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let text = field.stringValue.trimmingCharacters(in: .whitespaces)
         if text.isEmpty {
             ResetAnchorSettings.clearAnchor()
-            refreshResetAnchorButton()
+            // "지우기"는 자동 계산으로 되돌리려는 의도다 — 자동 동기화를 켜 둔 채로 두면 다음
+            // refresh 때 신선한 rate-limits-cache.json이 즉시 같은 앵커를 재적용해 이 의도를
+            // 무시하게 되므로 함께 끈다. 다시 켜고 싶으면 체크박스를 직접 토글하면 된다.
+            ResetAnchorSettings.setAutoSyncEnabled(false)
+            refreshResetAnchorUI()
             manualRefresh()
             return
         }
@@ -2940,7 +3175,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         ResetAnchorSettings.setAnchor(corrected)
-        refreshResetAnchorButton()
+        refreshResetAnchorUI()
         manualRefresh()
     }
 
@@ -3691,10 +3926,66 @@ func runSelfTests() -> Never {
               "resetAnchor: 저장/조회 왕복")
         ResetAnchorSettings.clearAnchor(defaults: rad)
         check(ResetAnchorSettings.anchor(defaults: rad) == nil, "resetAnchor: 해제 후 다시 nil")
+
+        // source(provenance) — 기본값 nil, 저장/조회 왕복, clearAnchor가 함께 지움
+        check(ResetAnchorSettings.source(defaults: rad) == nil, "resetAnchor: source 기본값 = nil")
+        ResetAnchorSettings.setAnchor(sample, source: .manual, defaults: rad)
+        check(ResetAnchorSettings.source(defaults: rad) == .manual, "resetAnchor: source 저장/조회 왕복(.manual)")
+        ResetAnchorSettings.setAnchor(sample, source: .auto, defaults: rad)
+        check(ResetAnchorSettings.source(defaults: rad) == .auto, "resetAnchor: source 저장/조회 왕복(.auto)")
+        ResetAnchorSettings.clearAnchor(defaults: rad)
+        check(ResetAnchorSettings.source(defaults: rad) == nil, "resetAnchor: clearAnchor는 source도 함께 지움")
+        // setAnchor(_:defaults:)를 source 생략하고 호출하면 기본값 .manual로 저장됨
+        ResetAnchorSettings.setAnchor(sample, defaults: rad)
+        check(ResetAnchorSettings.source(defaults: rad) == .manual, "resetAnchor: source 생략 시 기본값 .manual")
+        ResetAnchorSettings.clearAnchor(defaults: rad)
+
+        check(ResetAnchorSettings.autoSyncEnabled(defaults: rad) == true, "resetAnchor: autoSync 기본값 = true")
+        ResetAnchorSettings.setAutoSyncEnabled(false, defaults: rad)
+        check(ResetAnchorSettings.autoSyncEnabled(defaults: rad) == false, "resetAnchor: autoSync 저장/조회 왕복(false)")
+        ResetAnchorSettings.setAutoSyncEnabled(true, defaults: rad)
+        check(ResetAnchorSettings.autoSyncEnabled(defaults: rad) == true, "resetAnchor: autoSync 저장/조회 왕복(true)")
+
         rad.removePersistentDomain(forName: resetAnchorSuite)
     } else {
         check(false, "resetAnchor: 전용 UserDefaults suite 생성 성공해야 함")
     }
+
+    // RateLimitWindow.isStale / autoResetAnchor — 순수 함수
+    let rlNow = Date(timeIntervalSince1970: 1_800_000_000)
+    let freshWindow = RateLimitWindow(usedPercentage: 23.5, resetsAt: Int(rlNow.timeIntervalSince1970) + 3600)
+    let staleWindow = RateLimitWindow(usedPercentage: 90.0, resetsAt: Int(rlNow.timeIntervalSince1970) - 3600)
+    let noResetWindow = RateLimitWindow(usedPercentage: 50.0, resetsAt: nil)
+    check(!freshWindow.isStale(now: rlNow), "RateLimitWindow.isStale: resetsAt이 미래면 신선함")
+    check(staleWindow.isStale(now: rlNow), "RateLimitWindow.isStale: resetsAt이 과거면 stale")
+    check(noResetWindow.isStale(now: rlNow), "RateLimitWindow.isStale: resetsAt이 nil이면 stale 취급")
+
+    let freshCache = RateLimitsCache(fiveHour: freshWindow, sevenDay: nil)
+    let staleCache = RateLimitsCache(fiveHour: staleWindow, sevenDay: nil)
+    check(autoResetAnchor(from: freshCache, now: rlNow) == freshWindow.resetsAtDate,
+          "autoResetAnchor: 신선한 fiveHour가 있으면 그 resetsAt을 앵커 후보로 반환")
+    check(autoResetAnchor(from: staleCache, now: rlNow) == nil,
+          "autoResetAnchor: fiveHour가 stale이면 nil(기존 앵커/자동계산 유지 근거)")
+    check(autoResetAnchor(from: nil, now: rlNow) == nil,
+          "autoResetAnchor: rateLimits 자체가 nil이면 nil")
+    check(autoResetAnchor(from: RateLimitsCache(fiveHour: nil, sevenDay: nil), now: rlNow) == nil,
+          "autoResetAnchor: fiveHour 필드가 없으면 nil")
+
+    // resetAnchorStatusText — 순수 함수(메뉴 상태 라벨). t(ko, en)을 쓰므로 시스템/이전 테스트가 남긴
+    // 언어 설정과 무관하게 결정론적이도록 .korean으로 명시 고정한 뒤 복원한다.
+    let savedLangPref = TitleSettings.languagePreference()
+    TitleSettings.setLanguagePreference(.korean)
+    check(resetAnchorStatusText(anchor: nil, source: nil) == "자동 계산",
+          "resetAnchorStatusText: 앵커 없음 → 자동 계산")
+    check(resetAnchorStatusText(anchor: nil, source: .manual) == "자동 계산",
+          "resetAnchorStatusText: 앵커 없으면 source값과 무관하게 자동 계산")
+    check(resetAnchorStatusText(anchor: rlNow, source: .manual) == "수동 입력됨",
+          "resetAnchorStatusText: 앵커+.manual → 수동 입력됨")
+    check(resetAnchorStatusText(anchor: rlNow, source: .auto) == "자동 보정됨 (서버 실측)",
+          "resetAnchorStatusText: 앵커+.auto → 자동 보정됨(서버 실측)")
+    check(resetAnchorStatusText(anchor: rlNow, source: nil) == "수동 입력됨",
+          "resetAnchorStatusText: 앵커는 있는데 source가 nil(도입 전 저장된 값과의 하위 호환) → 수동 입력됨으로 안전 폴백")
+    TitleSettings.setLanguagePreference(savedLangPref)
 
     // parseLocalClockTime / formatLocalClockTime
     let clockCal: Calendar = { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "Asia/Seoul")!; return c }()
@@ -3762,6 +4053,70 @@ func runSelfTests() -> Never {
         check(sc2.cumulative?.totalTokens == 5, "stats: monthly 없으면 daily.totals 폴백")
     } else {
         check(false, "부분 캐시 디코드 성공해야 함")
+    }
+
+    // makeBlockDisplayData(fromCache:) — 앵커 활성 시 토큰/비용은 CLI의 "자연" 블록이 아니라
+    // 앵커 창 기준 JSONL 재계산 값을 써야 한다(버그: 예전엔 라벨만 앵커를 따르고 숫자는 CLI
+    // 블록 그대로였음). CLI 블록 = [05:00,10:00)Z, 앵커 = 06:00Z → 앵커 창 = [06:00,11:00)Z로
+    // 일부러 어긋나게 구성해, 두 창이 다를 때만 드러나는 이 버그를 결정론적으로 재현한다.
+    let anchorBugJSON = """
+    {
+      "blocks": { "blocks": [
+        { "id":"b1","startTime":"2026-06-30T05:00:00.000Z","endTime":"2026-06-30T10:00:00.000Z",
+          "actualEndTime":null,"isActive":true,"isGap":false,"entries":3,
+          "tokenCounts":{"inputTokens":100,"outputTokens":100,"cacheCreationInputTokens":0,"cacheReadInputTokens":0},
+          "totalTokens":200,"costUSD":84.77,"models":["claude-sonnet-4-5"] }
+      ]}
+    }
+    """
+    if let scAnchor = try? JSONDecoder().decode(StatsCache.self, from: Data(anchorBugJSON.utf8)) {
+        let testNow = parseISO8601("2026-06-30T07:00:00.000Z")!       // CLI 블록 [05:00,10:00) 안
+        let testAnchor = parseISO8601("2026-06-30T06:00:00.000Z")!    // 앵커 창 = [06:00,11:00)
+        func rlEntry(_ ts: String, out: Int) -> UsageEntry {
+            UsageEntry(timestamp: parseISO8601(ts)!, model: "claude-sonnet-4-5",
+                       inputTokens: 0, outputTokens: out, cacheReadTokens: 0, cacheWriteTokens: 0,
+                       sessionId: "s", uuid: "")
+        }
+        let anchorEntries = [
+            rlEntry("2026-06-30T05:30:00.000Z", out: 1000),  // CLI 블록 안, 앵커 창 밖(전) — 제외돼야 함
+            rlEntry("2026-06-30T07:00:00.000Z", out: 2000),  // 둘 다 안
+            rlEntry("2026-06-30T10:30:00.000Z", out: 3000),  // CLI 블록 밖(이후), 앵커 창 안 — 포함돼야 함
+        ]
+
+        // makeBlockDisplayData(fromCache:)는 ResetAnchorSettings.anchor()를 항상 .standard에서
+        // 읽는다(fromEntries 자매 함수와 동일한 기존 관례 — anchor를 파라미터로 주입받지 않음).
+        // 격리된 suite로는 이 앵커를 주입할 수 없으므로, 이 파일의 다른 .standard-직접 테스트들
+        // (buildTitleText 커스텀 조합 테스트 등)과 동일하게 실제 값을 save/restore한다.
+        let savedAnchor = ResetAnchorSettings.anchor()
+
+        ResetAnchorSettings.setAnchor(testAnchor)
+        let app = ClaudeMonitorApp()
+        let anchoredData = app.makeBlockDisplayData(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow)
+        if case .ready(let block, _, _, _) = anchoredData.state, let b = block {
+            check(b.totalTokens == 5000,
+                  "makeBlockDisplayData(fromCache:): 앵커 활성 시 토큰 합계는 앵커 창(JSONL) 기준 — CLI 블록의 200이 아니라 2000+3000=5000")
+            check(abs(b.cost - 84.77) > 1e-6,
+                  "makeBlockDisplayData(fromCache:): 앵커 활성 시 비용은 CLI costUSD(84.77)가 아니라 JSONL 추정치로 대체됨")
+        } else {
+            check(false, "makeBlockDisplayData(fromCache:): 앵커+활성 블록 조합은 .ready(block: non-nil)이어야 함")
+        }
+        check(anchoredData.anchorIsEstimating, "makeBlockDisplayData(fromCache:): 앵커 활성 시 anchorIsEstimating == true(배너 노출 근거)")
+
+        // 회귀: 앵커 미설정 시엔 기존과 완전히 동일 — CLI의 costUSD/totalTokens를 그대로 쓰고
+        // anchorIsEstimating도 false.
+        ResetAnchorSettings.clearAnchor()
+        let noAnchorData = app.makeBlockDisplayData(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow)
+        if case .ready(let block, _, _, _) = noAnchorData.state, let b = block {
+            check(b.totalTokens == 200, "makeBlockDisplayData(fromCache:): 앵커 미설정 시 회귀 — CLI totalTokens(200) 그대로")
+            check(abs(b.cost - 84.77) < 1e-6, "makeBlockDisplayData(fromCache:): 앵커 미설정 시 회귀 — CLI costUSD(84.77) 그대로")
+        } else {
+            check(false, "makeBlockDisplayData(fromCache:): 앵커 미설정+활성 블록 조합도 .ready(block: non-nil)이어야 함")
+        }
+        check(!noAnchorData.anchorIsEstimating, "makeBlockDisplayData(fromCache:): 앵커 미설정 시 anchorIsEstimating == false")
+
+        if let s = savedAnchor { ResetAnchorSettings.setAnchor(s) } else { ResetAnchorSettings.clearAnchor() }
+    } else {
+        check(false, "anchorBugJSON 디코드 성공해야 함")
     }
 
     // 사용량 경고 (computeUsageWarning 순수 함수)
@@ -4306,6 +4661,35 @@ func runSelfTests() -> Never {
         check(reader.lastReadChanged, "readAll: 파일이 바뀌면 lastReadChanged가 다시 true로 복귀")
 
         try? FileManager.default.removeItem(at: readerHome)
+    }
+
+    // RateLimitsCacheReader — 파일 없음/정상 파싱(snake_case → camelCase)/mtime 불변 시 재디코드
+    // 스킵을 UsageDataReader와 동일한 homeDir 주입 방식으로 검증.
+    do {
+        let rlHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeMonitorSelfTest.ratelimits.\(UUID().uuidString)")
+        let claudeDir = rlHome.appendingPathComponent(".claude")
+        try? FileManager.default.createDirectory(at: claudeDir, withIntermediateDirectories: true)
+
+        let missingReader = RateLimitsCacheReader(homeDir: rlHome)
+        check(missingReader.load() == nil, "RateLimitsCacheReader: 파일 없으면 nil")
+
+        let cacheFile = claudeDir.appendingPathComponent("rate-limits-cache.json")
+        let fixture = #"{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}"#
+        try? fixture.write(to: cacheFile, atomically: true, encoding: .utf8)
+
+        let reader2 = RateLimitsCacheReader(homeDir: rlHome)
+        if let decoded = reader2.load() {
+            check(decoded.fiveHour?.usedPercentage == 23.5, "RateLimitsCacheReader: five_hour.used_percentage → fiveHour.usedPercentage")
+            check(decoded.fiveHour?.resetsAt == 1_738_425_600, "RateLimitsCacheReader: five_hour.resets_at → fiveHour.resetsAt")
+            check(decoded.sevenDay?.usedPercentage == 41.2, "RateLimitsCacheReader: seven_day도 함께 파싱됨(UI 노출은 안 하지만 스키마엔 존재)")
+        } else {
+            check(false, "RateLimitsCacheReader: 정상 JSON은 디코드에 성공해야 함")
+        }
+        // mtime 불변 2차 호출도 동일 결과(디코드 스킵 여부는 내부 구현이라 결과 동일성만 확인)
+        check(reader2.load()?.fiveHour?.resetsAt == 1_738_425_600, "RateLimitsCacheReader: 재호출도 동일 결과")
+
+        try? FileManager.default.removeItem(at: rlHome)
     }
 
     // UsageDataReader.readAll() — 세션 fork/resume 시나리오: 같은 턴(message.id+requestId 공유)이
