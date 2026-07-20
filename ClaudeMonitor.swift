@@ -9,7 +9,7 @@ import Cocoa
 import Foundation
 import QuartzCore
 
-let APP_VERSION = "1.10"
+let APP_VERSION = "1.11"
 
 // MARK: - Usage Warning Config (로컬 임계값 기반 — 서버 실제 %와 무관한 근사)
 //
