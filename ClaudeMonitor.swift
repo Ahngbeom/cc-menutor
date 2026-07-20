@@ -364,6 +364,15 @@ func autoResetAnchor(from rateLimits: RateLimitsCache?, now: Date = Date()) -> D
     return window.resetsAtDate
 }
 
+// five_hour 사용률이 100%에 도달했고(도달/초과) 그 창이 아직 신선(만료 전)하면 리셋 시각을 반환.
+// 신선하지 않거나(stale) 사용률 정보가 없으면 nil — 호출부는 기존 "그냥 유휴" 표시로 폴백한다.
+func rateLimitResetIfExceeded(_ rateLimits: RateLimitsCache?, now: Date = Date()) -> Date? {
+    guard let window = rateLimits?.fiveHour,
+          let pct = window.usedPercentage, pct >= 100,
+          !window.isStale(now: now) else { return nil }
+    return window.resetsAtDate
+}
+
 // "HH:mm"(24시간제, 로케일 무관 고정 포맷)을 now의 로컬 날짜에 적용해 Date로 변환한다.
 // 결과가 now 이전/같으면 자정을 넘긴 입력으로 보고 다음 날로 굴린다. 형식이 틀리면 nil.
 func parseLocalClockTime(_ text: String, relativeTo now: Date, calendar: Calendar = .current) -> Date? {
@@ -2066,6 +2075,10 @@ struct BlockDisplayData {
     // JSONL 기반 추정치로 재계산했을 때만 true → "⚓ 앵커 적용 중 — 비용 추정치" 배너(isEstimate와
     // 별개 조건 — 둘 다 true일 일은 없다. isEstimate는 stats-cache 자체가 없을 때만이므로).
     let anchorIsEstimating: Bool
+    // 활성 블록이 없을 때(idle)만 채워진다 — rate-limits-cache.json이 신선하고 five_hour 사용률이
+    // 100%에 도달했으면 그 리셋 시각. 그 외(데이터 없음/stale/블록 활성 중)에는 nil — 호출부가
+    // 기존 "그냥 유휴" 표시로 폴백할 근거(rateLimitResetIfExceeded() 참고).
+    let rateLimitReset: Date?
     enum State {
         case noData                   // 폴백 경로 전용
         // 메뉴가 열려 있는 동안 refresh가 진행 중일 때만 쓰는 스켈레톤 상태 — 연관값은 .ready와
@@ -2076,11 +2089,12 @@ struct BlockDisplayData {
     }
     let state: State
 
-    // 커스텀 init: anchorIsEstimating에 기본값(false)을 주기 위함 — Swift의 synthesized
+    // 커스텀 init: anchorIsEstimating/rateLimitReset에 기본값을 주기 위함 — Swift의 synthesized
     // memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
-    init(isEstimate: Bool, anchorIsEstimating: Bool = false, state: State) {
+    init(isEstimate: Bool, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil, state: State) {
         self.isEstimate = isEstimate
         self.anchorIsEstimating = anchorIsEstimating
+        self.rateLimitReset = rateLimitReset
         self.state = state
     }
 }
@@ -2091,6 +2105,7 @@ extension BlockDisplayData {
     func asLoadingSkeleton() -> BlockDisplayData? {
         guard case .ready(let block, let model, let today, let allTime) = state else { return nil }
         return BlockDisplayData(isEstimate: isEstimate, anchorIsEstimating: anchorIsEstimating,
+                                 rateLimitReset: rateLimitReset,
                                  state: .loading(block: block, model: model, today: today, allTime: allTime))
     }
 }
@@ -2106,6 +2121,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastUpdateTime = Date(timeIntervalSince1970: 0)
     var cachedAll: [UsageEntry] = []
     var cachedStats: StatsCache?
+    var cachedRateLimits: RateLimitsCache?
     private(set) var gamificationTodayTokens: Int = 0
     private(set) var gamificationTodayCost: Double = 0
     private(set) var gamificationNewRecordToday: Bool = false
@@ -2251,6 +2267,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self.cachedStats = stats
                 self.cachedAll = entries
+                self.cachedRateLimits = rateLimits
                 self.lastUpdateTime = Date()
                 self.stopColdStartAnimation()  // 콜드 스타트 첫 refresh 완료 — 이후 buildMenu()가 실데이터로 덮어씀
                 // 게이미피케이션 기록/이스터에그 워터마크는 항상 재계산한다 — readAll()의 O(N log N)
@@ -2534,8 +2551,19 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    cumulativeTokens: stats.cumulative?.totalTokens ?? 0)
             renderTitle(parts: titlePartsWithBadge(ctx), warning: warning)
         } else {
-            renderIdleTitle(t("쉬는 중", "resting"))
+            renderIdleTitle(idleTitleLabel())
         }
+    }
+
+    // 유휴 상태 타이틀 라벨 — rate-limits-cache.json이 신선하고 five_hour 사용률이 100%에
+    // 도달했으면 "그냥 유휴"와 구분해 리셋까지 남은 시간을 보여준다(updateStatusBarTitle(fromCache:)/
+    // updateStatusBarTitleFromEntries() 공유 — renderBlockSections의 동일 판단과 같은 근거).
+    private func idleTitleLabel() -> String {
+        if let reset = rateLimitResetIfExceeded(cachedRateLimits), reset > Date() {
+            let remaining = formatTime(reset.timeIntervalSinceNow)
+            return t("한도 도달 · \(remaining) 후 리셋", "Limit reached · resets in \(remaining)")
+        }
+        return t("쉬는 중", "resting")
     }
 
     func updateStatusBarTitleFromEntries() {
@@ -2554,7 +2582,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             applyMood(nil)
             renderTitle(plain: "\(titleIconPrefix())" + t("데이터 없음", "no data"), warning: nil)
         } else if block == nil {
-            renderIdleTitle(t("쉬는 중", "resting"))
+            renderIdleTitle(idleTitleLabel())
         } else if let b = block {
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
             applyMood(moodTier)
@@ -2731,7 +2759,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let allTime = stats.cumulative.map { AllTimeSectionData(totalTokens: $0.totalTokens ?? 0, totalCost: $0.totalCost ?? 0) }
 
+        let rateLimitReset = active == nil ? rateLimitResetIfExceeded(cachedRateLimits, now: now) : nil
+
         return BlockDisplayData(isEstimate: false, anchorIsEstimating: anchorIsEstimating,
+                                 rateLimitReset: rateLimitReset,
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -2746,11 +2777,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         case .loading(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
-                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating, skeleton: true, into: menu)
+                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
+                                 rateLimitReset: data.rateLimitReset, skeleton: true, into: menu)
 
         case .ready(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
-                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating, skeleton: false, into: menu)
+                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
+                                 rateLimitReset: data.rateLimitReset, skeleton: false, into: menu)
         }
     }
 
@@ -2759,7 +2792,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 텍스트를 쓴다(refresh마다 안 바뀌는 텍스트를 흐리게 하면 레이아웃 점프만 커짐). ──
     private func renderBlockSections(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData,
                                       allTime: AllTimeSectionData?, isEstimate: Bool, anchorIsEstimating: Bool,
-                                      skeleton: Bool, into menu: NSMenu) {
+                                      rateLimitReset: Date?, skeleton: Bool, into menu: NSMenu) {
         if isEstimate {
             addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
             menu.addItem(.separator())
@@ -2832,10 +2865,22 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 팔레트를 유휴 상태에서도 보여준다 — 실제 순환은 tickIdleFlameCycle()이 idleHeroIconRow를
             // 직접 patch하며 진행하고, 여기서는 매 렌더 시점의 현재 프레임만 반영한다.
             let cycleTier = MoodTier.allCases[idleFlameCycleIndex % MoodTier.allCases.count]
-            idleHeroIconRow = addHeroLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"),
-                                            color: cycleTier.color.nsColor ?? .labelColor,
-                                            image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: cycleTier))
-            addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
+            // rateLimitReset이 있으면(rate-limits-cache.json이 신선하고 five_hour 사용률 100% 도달)
+            // "그냥 유휴"와 구분해 한도 도달 + 리셋까지 남은 시간을 보여준다 — 그렇지 않으면
+            // "다음 메시지부터 새 블록 시작"이 사실과 다른 오해를 준다(리셋 전엔 메시지를 보내도
+            // 새 블록이 정상 동작하지 않는다).
+            if let reset = rateLimitReset, reset > Date() {
+                let remaining = formatTime(reset.timeIntervalSinceNow)
+                idleHeroIconRow = addHeroLabel(menu, "  " + t("⛔ 한도 도달 — \(remaining) 후 리셋", "⛔ Limit reached — resets in \(remaining)"),
+                                                color: .systemRed,
+                                                image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: cycleTier))
+                addLabel(menu, "  " + t("리셋 후 새 블록을 시작할 수 있습니다.", "A new block can start after the reset."))
+            } else {
+                idleHeroIconRow = addHeroLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"),
+                                                color: cycleTier.color.nsColor ?? .labelColor,
+                                                image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: cycleTier))
+                addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
+            }
         }
         syncIdleFlameCycleTimer(isIdle: isCurrentlyIdle, menuOpen: mainMenuIsOpen)
         menu.addItem(.separator())
@@ -3446,14 +3491,15 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // ── 폴백 경로(JSONL 직접 파싱, 추정 단가) 뷰모델 어댑터 ──
-    func makeBlockDisplayData(fromEntries cachedAll: [UsageEntry], reader: UsageDataReader) -> BlockDisplayData {
+    // now: 테스트 용이성을 위한 주입 지점(다른 makeBlockDisplayData 오버로드와 동일한 패턴).
+    func makeBlockDisplayData(fromEntries cachedAll: [UsageEntry], reader: UsageDataReader, now: Date = Date()) -> BlockDisplayData {
         let noData = cachedAll.isEmpty && !FileManager.default.fileExists(atPath: reader.projectsDir.path)
         if noData {
             return BlockDisplayData(isEstimate: true, state: .noData)
         }
 
         let anchor = ResetAnchorSettings.anchor()
-        let activeBlock = FiveHourBlock.active(from: cachedAll, anchor: anchor)
+        let activeBlock = FiveHourBlock.active(from: cachedAll, now: now, anchor: anchor)
         let blockEntries: [UsageEntry]
         if let activeBlock = activeBlock {
             blockEntries = cachedAll.filter { $0.timestamp >= activeBlock.start && $0.timestamp < activeBlock.end }
@@ -3504,7 +3550,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let allStats = UsageStats(entries: cachedAll)
         let allTime = AllTimeSectionData(totalTokens: allStats.totalTokens, totalCost: allStats.totalCost)
 
-        return BlockDisplayData(isEstimate: true, state: .ready(block: block, model: model, today: today, allTime: allTime))
+        let rateLimitReset = activeBlock == nil ? rateLimitResetIfExceeded(self.cachedRateLimits, now: now) : nil
+
+        return BlockDisplayData(isEstimate: true, rateLimitReset: rateLimitReset,
+                                 state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
     // NSMenuItem.isEnabled == false인 표준 아이템은 attributedTitle의 foregroundColor를 무시하고
@@ -3970,6 +4019,21 @@ func runSelfTests() -> Never {
           "autoResetAnchor: rateLimits 자체가 nil이면 nil")
     check(autoResetAnchor(from: RateLimitsCache(fiveHour: nil, sevenDay: nil), now: rlNow) == nil,
           "autoResetAnchor: fiveHour 필드가 없으면 nil")
+
+    // rateLimitResetIfExceeded — 순수 함수(유휴 화면의 "한도 도달" 구분 근거)
+    let exceededWindow = RateLimitWindow(usedPercentage: 100.0, resetsAt: Int(rlNow.timeIntervalSince1970) + 3600)
+    let almostExceededWindow = RateLimitWindow(usedPercentage: 99.9, resetsAt: Int(rlNow.timeIntervalSince1970) + 3600)
+    let staleExceededWindow = RateLimitWindow(usedPercentage: 100.0, resetsAt: Int(rlNow.timeIntervalSince1970) - 3600)
+    check(rateLimitResetIfExceeded(RateLimitsCache(fiveHour: exceededWindow, sevenDay: nil), now: rlNow) == exceededWindow.resetsAtDate,
+          "rateLimitResetIfExceeded: 신선 + 사용률 100%면 리셋 시각 반환")
+    check(rateLimitResetIfExceeded(RateLimitsCache(fiveHour: almostExceededWindow, sevenDay: nil), now: rlNow) == nil,
+          "rateLimitResetIfExceeded: 사용률이 100% 미만이면 nil(아직 도달 아님)")
+    check(rateLimitResetIfExceeded(RateLimitsCache(fiveHour: staleExceededWindow, sevenDay: nil), now: rlNow) == nil,
+          "rateLimitResetIfExceeded: 사용률 100%여도 stale이면 nil")
+    check(rateLimitResetIfExceeded(nil, now: rlNow) == nil,
+          "rateLimitResetIfExceeded: rateLimits 자체가 nil이면 nil")
+    check(rateLimitResetIfExceeded(RateLimitsCache(fiveHour: nil, sevenDay: nil), now: rlNow) == nil,
+          "rateLimitResetIfExceeded: fiveHour 필드가 없으면 nil")
 
     // resetAnchorStatusText — 순수 함수(메뉴 상태 라벨). t(ko, en)을 쓰므로 시스템/이전 테스트가 남긴
     // 언어 설정과 무관하게 결정론적이도록 .korean으로 명시 고정한 뒤 복원한다.
@@ -4754,6 +4818,27 @@ func runSelfTests() -> Never {
         gamApp.updateEasterEggState(defaults: gd)  // 동일 상태로 재호출
         check(gamApp.justCrossedTokenMilestone == nil,
               "updateEasterEggState: 재호출 시 자기소멸(nil로 복귀) — entriesChanged 게이팅이 되살아나면 이 회귀가 깨짐")
+    }
+
+    // 유휴 화면 "한도 도달" 배선 회귀: makeBlockDisplayData(fromEntries:) 어댑터가 활성 블록이
+    // 없을 때만 cachedRateLimits로부터 rateLimitReset을 채우는지, 활성 블록이 있을 때는 채우지
+    // 않는지(이번 개선 범위 밖) 실제 ClaudeMonitorApp 인스턴스로 검증한다.
+    do {
+        let wireApp = ClaudeMonitorApp()
+        let wireNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let wireExceeded = RateLimitWindow(usedPercentage: 100.0, resetsAt: Int(wireNow.timeIntervalSince1970) + 3600)
+        wireApp.cachedRateLimits = RateLimitsCache(fiveHour: wireExceeded, sevenDay: nil)
+        wireApp.cachedAll = []
+        let idleData = wireApp.makeBlockDisplayData(fromEntries: [], reader: wireApp.reader, now: wireNow)
+        check(idleData.rateLimitReset == wireExceeded.resetsAtDate,
+              "makeBlockDisplayData(fromEntries:): 활성 블록 없음 + 한도 도달 캐시 신선 → rateLimitReset 채워짐")
+
+        let activeEntry = UsageEntry(timestamp: wireNow, model: "claude-sonnet-5",
+                                      inputTokens: 0, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0,
+                                      sessionId: "s1", uuid: "u1")
+        let activeData = wireApp.makeBlockDisplayData(fromEntries: [activeEntry], reader: wireApp.reader, now: wireNow)
+        check(activeData.rateLimitReset == nil,
+              "makeBlockDisplayData(fromEntries:): 활성 블록이 있으면 한도 도달 캐시가 신선해도 rateLimitReset은 nil")
     }
 
     // migrateLegacyDefaultsIfNeeded (전용 legacy/new suite 쌍으로 격리 — 실제 ClaudeMonitor 도메인은 건드리지 않음)
