@@ -25,7 +25,14 @@ brew services start cc-menutor      # 지금 시작 + 로그인 시 자동 시�
 curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/install.sh | bash
 ```
 
+최신 릴리스가 자동으로 선택됩니다. 특정 버전을 원하면 `CC_MENUTOR_VERSION`을 지정하세요:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/install.sh | CC_MENUTOR_VERSION=1.11 bash
+```
+
 제거: `curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/uninstall.sh | bash`
+(사용자 설정까지 지우려면 끝에 `-s -- --purge`를 붙입니다.)
 
 > 두 방식 모두 **사용자 기계에서 소스를 직접 빌드**합니다(Xcode Command Line Tools 필요). 미리 빌드된
 > 바이너리를 받지 않으므로 코드서명·Gatekeeper 이슈가 없습니다.
@@ -110,7 +117,13 @@ brew services stop cc-menutor && brew uninstall cc-menutor
 
 # 스크립트/직접 빌드 설치 시
 ./uninstall.sh
+
+# 사용자 설정(리셋 앵커·연속 사용 기록·메뉴바 표시 항목)까지 완전히 삭제
+./uninstall.sh --purge
 ```
+
+기본 제거는 LaunchAgent·프로세스·로그·잠금 파일만 정리하고 설정은 남깁니다 — 재설치 시 그대로
+이어집니다. 설정까지 지우려면 `--purge`를 쓰세요.
 
 ## 5시간 블록 계산 방식
 

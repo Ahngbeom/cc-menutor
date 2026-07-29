@@ -31,4 +31,20 @@ pkill -x "cc-menutor" 2>/dev/null && { echo "✅ 프로세스 종료됨"; killed
 pkill -x "ClaudeMonitor" 2>/dev/null && { echo "✅ 프로세스 종료됨(구버전)"; killed=true; } || true
 [ "$killed" = true ] || echo "실행 중인 프로세스 없음"
 
+# 런타임 부산물 정리 — 남겨두면 재설치 시 옛 상태(앵커/스트릭/자동보정 설정)를 그대로 물려받아
+# "새로 설치했는데 예전 값이 보인다"가 된다. 설정까지 지우려면 --purge를 준다.
+rm -f "$HOME/.cc-menutor.lock" "$HOME/.cc-menutor.log"
+
+if [ "${1:-}" = "--purge" ]; then
+  # 번들 ID 없는 bare 실행 파일이라 UserDefaults 도메인이 바이너리명에서 파생된다
+  # (구버전 ClaudeMonitor 도메인도 함께 정리 — migrateLegacyDefaultsIfNeeded 참고).
+  for domain in cc-menutor ClaudeMonitor; do
+    defaults delete "$domain" 2>/dev/null || true
+    rm -f "$HOME/Library/Preferences/${domain}.plist"
+  done
+  echo "✅ 사용자 설정(앵커·스트릭·표시 항목)까지 삭제됨"
+else
+  echo "ℹ️  사용자 설정은 보존했습니다. 완전히 지우려면: ./uninstall.sh --purge"
+fi
+
 echo "완료."
