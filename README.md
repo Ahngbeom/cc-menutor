@@ -171,11 +171,19 @@ jq -c '.rate_limits // {}' <<< "$input" > ~/.claude/rate-limits-cache.json
 
 폴백(JSONL) 경로에서는 아래 단가 테이블로 **추정**합니다:
 
-| 모델 | Input | Output | Cache Read | Cache Write |
-|------|-------|--------|------------|-------------|
-| Claude Opus 4 | $15/M | $75/M | $1.5/M | $18.75/M |
-| Claude Sonnet 4 | $3/M | $15/M | $0.30/M | $3.75/M |
-| Claude Haiku 3.5 | $0.80/M | $4/M | $0.08/M | $1.00/M |
+| 모델 | Input | Output | Cache Read | Cache Write (5m) |
+|------|-------|--------|------------|------------------|
+| Claude Fable / Mythos 5 | $10/M | $50/M | $1/M | $12.50/M |
+| Claude Opus 5 · 4.5~4.8 | $5/M | $25/M | $0.50/M | $6.25/M |
+| Claude Opus 4.1 · 4 (은퇴) | $15/M | $75/M | $1.50/M | $18.75/M |
+| Claude Sonnet 5 (~2026-08-31 도입가) | $2/M | $10/M | $0.20/M | $2.50/M |
+| Claude Sonnet 5 (2026-09-01~) · 4.x · 3.x | $3/M | $15/M | $0.30/M | $3.75/M |
+| Claude Haiku 4.5 | $1/M | $5/M | $0.10/M | $1.25/M |
+| Claude Haiku 3.5 (은퇴) | $0.80/M | $4/M | $0.08/M | $1.00/M |
+
+캐시 단가는 공식 배수(읽기 = input×0.1, 5분 쓰기 = ×1.25, 1시간 쓰기 = ×2.0)로 input에서 파생하므로
+새 모델을 추가할 땐 input/output만 넣으면 됩니다. 테이블에 없는 모델은 같은 family의 **현행 단가**로
+추정하고 드롭다운에 `⚠ 미상 모델` 로 고지합니다.
 
 > 어느 경로든 표시 금액은 **사용량 환산 비용**이며, Pro/Max 플랜의 실제 청구액이 아닙니다.
 
