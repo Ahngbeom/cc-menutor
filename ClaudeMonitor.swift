@@ -483,30 +483,64 @@ struct ModelPricing {
     var cacheWrite1h: Double { input * 2.0 }
 }
 
-let PRICING: [(pattern: String, pricing: ModelPricing)] = [
-    // Opus 4.5~4.8는 legacy Opus 4/4.1(아래 "opus-4" 패턴, $15/$75)과 단가가 다르므로
-    // 반드시 그보다 앞서 매칭되어야 한다 — 더 구체적인 패턴을 앞에 두는 규칙.
-    ("opus-4-8",  ModelPricing(input: 5.0,   output: 25.0)),
-    ("opus-4-7",  ModelPricing(input: 5.0,   output: 25.0)),
-    ("opus-4-6",  ModelPricing(input: 5.0,   output: 25.0)),
-    ("opus-4-5",  ModelPricing(input: 5.0,   output: 25.0)),
-    ("opus-4",    ModelPricing(input: 15.0,  output: 75.0)),
-    ("opus-3",    ModelPricing(input: 15.0,  output: 75.0)),
-    ("sonnet-4",  ModelPricing(input: 3.0,   output: 15.0)),
-    ("sonnet-3-7",ModelPricing(input: 3.0,   output: 15.0)),
-    ("sonnet-3-5",ModelPricing(input: 3.0,   output: 15.0)),
-    ("sonnet",    ModelPricing(input: 3.0,   output: 15.0)),
-    ("haiku-3-5", ModelPricing(input: 0.80,  output: 4.0)),
-    ("haiku",     ModelPricing(input: 0.25,  output: 1.25)),
+// 모델 식별자에서 뽑아낸 (family, major, minor). minor는 없을 수 있다(claude-opus-5).
+// parseModelVersion()이 만들고 단가 조회와 표시명이 함께 쓴다 — 두 로직이 서로 다른 정규화
+// 기준으로 드리프트하지 않게 하는 단일 진실 공급원.
+struct ModelVersionKey: Hashable {
+    let family: String
+    let major: Int
+    let minor: Int?
+}
+
+// 버전별 정밀 단가 — 공식 가격표(platform.claude.com/docs/en/about-claude/pricing, 2026-07-29 확인).
+//
+// 과거엔 이 테이블이 `[(pattern, pricing)]` 배열이고 `s.contains(pattern)`을 순서대로 훑었다.
+// 그 방식은 실제 모델 ID가 두 표기를 오간다는 사실과 어긋났다 — 신형 `claude-haiku-4-5`(버전이
+// family 뒤)와 구형 `claude-3-5-haiku`(버전이 family 앞). 그래서 "haiku-3-5"/"sonnet-3-5"/
+// "sonnet-3-7" 패턴은 **어떤 실제 모델에도 매칭되지 않는 죽은 코드**였고, 모든 Haiku가 뒤의
+// 포괄 패턴 "haiku"($0.25/$1.25)로 떨어져 Haiku 4.5가 4배 과소 청구됐다. 게다가 그 매칭은
+// matched=true라 "⚠ 미상 모델" 경고조차 뜨지 않아 조용히 틀렸다.
+//
+// 이제 parseModelVersion()이 두 표기를 모두 정규화하므로 순서 의존 없는 딕셔너리 조회로 끝난다.
+// 새 모델 추가 시 input/output만 넣으면 캐시 단가는 ModelPricing이 공식 배수로 파생한다.
+let VERSIONED_PRICING: [ModelVersionKey: ModelPricing] = [
+    // Fable / Mythos 5
+    ModelVersionKey(family: "fable",  major: 5, minor: nil): ModelPricing(input: 10.0, output: 50.0),
+    ModelVersionKey(family: "mythos", major: 5, minor: nil): ModelPricing(input: 10.0, output: 50.0),
+    // Opus 5 및 4.5~4.8 (현행 티어)
+    ModelVersionKey(family: "opus", major: 5, minor: nil):   ModelPricing(input: 5.0,  output: 25.0),
+    ModelVersionKey(family: "opus", major: 4, minor: 8):     ModelPricing(input: 5.0,  output: 25.0),
+    ModelVersionKey(family: "opus", major: 4, minor: 7):     ModelPricing(input: 5.0,  output: 25.0),
+    ModelVersionKey(family: "opus", major: 4, minor: 6):     ModelPricing(input: 5.0,  output: 25.0),
+    ModelVersionKey(family: "opus", major: 4, minor: 5):     ModelPricing(input: 5.0,  output: 25.0),
+    // Opus 4.1(deprecated) / 4(retired) / 3 — legacy 티어
+    ModelVersionKey(family: "opus", major: 4, minor: 1):     ModelPricing(input: 15.0, output: 75.0),
+    ModelVersionKey(family: "opus", major: 4, minor: nil):   ModelPricing(input: 15.0, output: 75.0),
+    ModelVersionKey(family: "opus", major: 3, minor: nil):   ModelPricing(input: 15.0, output: 75.0),
+    // Sonnet 4.x / 3.x (Sonnet 5는 시간 의존 도입가라 아래 별도 분기)
+    ModelVersionKey(family: "sonnet", major: 4, minor: 6):   ModelPricing(input: 3.0,  output: 15.0),
+    ModelVersionKey(family: "sonnet", major: 4, minor: 5):   ModelPricing(input: 3.0,  output: 15.0),
+    ModelVersionKey(family: "sonnet", major: 4, minor: nil): ModelPricing(input: 3.0,  output: 15.0),
+    ModelVersionKey(family: "sonnet", major: 3, minor: 7):   ModelPricing(input: 3.0,  output: 15.0),
+    ModelVersionKey(family: "sonnet", major: 3, minor: 5):   ModelPricing(input: 3.0,  output: 15.0),
+    // Haiku 4.5(현행) / 3.5(retired) / 3
+    ModelVersionKey(family: "haiku", major: 4, minor: 5):    ModelPricing(input: 1.0,  output: 5.0),
+    ModelVersionKey(family: "haiku", major: 3, minor: 5):    ModelPricing(input: 0.80, output: 4.0),
+    ModelVersionKey(family: "haiku", major: 3, minor: nil):  ModelPricing(input: 0.25, output: 1.25),
 ]
 
 let DEFAULT_PRICING = ModelPricing(input: 3.0, output: 15.0)
 
-// Family-level fallback단가 (정밀 패턴 미매칭 시 Sonnet 일괄 폴백 대신 family 기준 적용)
+// family 단위 폴백 — VERSIONED_PRICING에 없는 새 버전이 나왔을 때 적용된다. 반드시 **그 family의
+// 현행 티어**를 가리켜야 한다: 예전엔 opus=$15/$75(은퇴한 Opus 4.1 티어), haiku=$0.80/$4(은퇴한
+// 3.5 티어)를 써서 claude-opus-5가 3배 과대 추정됐다. 폴백은 matched=false이므로 사용자에겐
+// "⚠ 미상 모델 N종 (추정 단가 적용)" 배너로 고지된다.
 let FAMILY_PRICING: [String: ModelPricing] = [
-    "opus":   ModelPricing(input: 15.0, output: 75.0),
+    "fable":  ModelPricing(input: 10.0, output: 50.0),
+    "mythos": ModelPricing(input: 10.0, output: 50.0),
+    "opus":   ModelPricing(input: 5.0,  output: 25.0),
     "sonnet": ModelPricing(input: 3.0,  output: 15.0),
-    "haiku":  ModelPricing(input: 0.80, output: 4.0),
+    "haiku":  ModelPricing(input: 1.0,  output: 5.0),
 ]
 
 // MARK: - Sonnet 5 도입가 (시간 한정)
@@ -529,30 +563,69 @@ private let sonnet5IntroPricingCutoffUTC: Date = {
 private let SONNET_5_INTRO_PRICING = ModelPricing(input: 2.0, output: 10.0)
 private let SONNET_5_STANDARD_PRICING = ModelPricing(input: 3.0, output: 15.0)
 
-// 원본 모델 문자열의 대괄호 접미사(예: [1m])와 날짜 접미사(6자리 이상 연속 숫자)를 제거한
-// 정규화 문자열. getPricing의 정밀 패턴 매칭과 parseModel의 family/버전 매칭이 모두 이 함수를
-// 거친 동일한 기준으로 판단하게 해, 두 분류 로직이 서로 다른 정규화 기준으로 드리프트하지 않게 한다.
-private func sanitizedModelString(_ model: String) -> String {
+// 실제 모델이 아닌 의사(pseudo) 모델 식별자 — 집계에서 제외한다(parseLines 참고).
+let SYNTHETIC_MODEL_NAMES: Set<String> = ["<synthetic>"]
+
+let MODEL_FAMILIES = ["opus", "sonnet", "haiku", "fable", "mythos"]
+
+// 모델 식별자를 (family, major, minor)로 정규화한다. 버전 숫자가 family 뒤에 오는 신형
+// 표기(claude-opus-4-8)와 앞에 오는 구형 표기(claude-3-5-haiku)를 모두 처리한다 — 이 두 표기를
+// 한 기준으로 모으는 것이 이 함수의 존재 이유다(VERSIONED_PRICING 주석의 버그 이력 참고).
+//
+//   "claude-opus-4-8[1m]"        → ("opus", 4, 8)
+//   "claude-3-5-haiku-20241022"  → ("haiku", 3, 5)
+//   "claude-opus-5"              → ("opus", 5, nil)
+//   "gpt-4o" / "<synthetic>"     → ("", nil, nil)
+//
+// 정규식을 쓰지 않는다: 이전 구현은 호출마다 NSRegularExpression을 새로 컴파일하고
+// replacingOccurrences(options:.regularExpression)를 2회 돌아, 프로파일러상 메인 스레드 최대
+// CPU 소비원이었다. 토큰 스캔이 같은 일을 훨씬 싸게 한다.
+//
+// 날짜 접미사(20241022)는 "3자리 이상 숫자는 버전이 아니다" 규칙으로 자연히 걸러지므로 별도
+// 제거 단계가 필요 없다. 대괄호 접미사([1m])는 잘라낸다 — 1M 컨텍스트는 공식적으로 표준 단가라
+// 단가 판정에 영향이 없다("Claude 4.6 이후 모델은 1M 컨텍스트를 표준 단가로 제공").
+func parseModelVersion(_ model: String) -> (family: String, major: Int?, minor: Int?) {
     var s = model.lowercased()
-    s = s.replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression)
-    s = s.replacingOccurrences(of: "[0-9]{6,}", with: "", options: .regularExpression)
-    return s
+    if let open = s.firstIndex(of: "[") { s = String(s[s.startIndex..<open]) }
+    let tokens = s.split(separator: "-", omittingEmptySubsequences: true).map(String.init)
+    guard let famIdx = tokens.firstIndex(where: { MODEL_FAMILIES.contains($0) }) else {
+        return ("", nil, nil)
+    }
+    let family = tokens[famIdx]
+    // 버전 숫자는 1~2자리 — 8자리 날짜(20241022)나 "4o" 같은 토큰은 여기서 걸러진다.
+    func versionNumber(_ token: String) -> Int? {
+        guard token.count <= 2, let n = Int(token) else { return nil }
+        return n
+    }
+    // 신형: family 뒤에 major[-minor]
+    if famIdx + 1 < tokens.count, let major = versionNumber(tokens[famIdx + 1]) {
+        let minor = famIdx + 2 < tokens.count ? versionNumber(tokens[famIdx + 2]) : nil
+        return (family, major, minor)
+    }
+    // 구형: family 앞에 major[-minor]
+    if famIdx >= 1, let trailing = versionNumber(tokens[famIdx - 1]) {
+        if famIdx >= 2, let leading = versionNumber(tokens[famIdx - 2]) {
+            return (family, leading, trailing)   // 3-5-haiku → (3, 5)
+        }
+        return (family, trailing, nil)           // 3-haiku → (3, nil)
+    }
+    return (family, nil, nil)
 }
 
-// 정밀 패턴이 매칭되면 matched=true, family/DEFAULT 폴백이면 matched=false.
+// 정밀(버전별) 단가가 매칭되면 matched=true, family/DEFAULT 폴백이면 matched=false.
 // date: 단가 판정 기준 시점 — 기본값은 호출 시각이지만, 실제 청구 시점 기준으로 계산해야 하는
 // 호출부(UsageEntry.cost 등)는 반드시 해당 엔트리의 timestamp를 넘겨야 한다(Sonnet 5 도입가처럼
 // 시간에 따라 값이 바뀌는 모델이 있기 때문).
 func getPricing(for model: String, at date: Date = Date()) -> (pricing: ModelPricing, matched: Bool) {
-    let s = sanitizedModelString(model)
-    if s.contains("sonnet-5") {
+    let v = parseModelVersion(model)
+    if v.family == "sonnet", v.major == 5 {
         return (date < sonnet5IntroPricingCutoffUTC ? SONNET_5_INTRO_PRICING : SONNET_5_STANDARD_PRICING, true)
     }
-    for (pattern, pricing) in PRICING {
-        if s.contains(pattern) { return (pricing, true) }
+    if let major = v.major,
+       let p = VERSIONED_PRICING[ModelVersionKey(family: v.family, major: major, minor: v.minor)] {
+        return (p, true)
     }
-    let fam = parseModel(model).family
-    if let fp = FAMILY_PRICING[fam] { return (fp, false) }
+    if let fp = FAMILY_PRICING[v.family] { return (fp, false) }
     return (DEFAULT_PRICING, false)
 }
 
@@ -561,51 +634,25 @@ func getPricing(for model: String, at date: Date = Date()) -> (pricing: ModelPri
 // "claude-opus-4-1-20250805" → ("opus", "Opus 4.1")
 // "claude-3-5-sonnet-20241022" → ("sonnet", "Sonnet 3.5")
 // "claude-opus-4-8[1m]" → ("opus", "Opus 4.8")
+// "claude-fable-5" → ("fable", "Fable 5")
 // 미상 family는 ("", 축약명) 반환.
+//
+// 단가 조회(getPricing)와 동일한 parseModelVersion() 결과에서 표시명을 만든다 — 분류 기준이
+// 하나뿐이라 "단가는 Opus로 쳤는데 화면엔 다른 이름"같은 드리프트가 원천적으로 불가능하다.
 func parseModel(_ model: String) -> (family: String, display: String) {
-    let s = sanitizedModelString(model)
-
-    let families = ["opus", "sonnet", "haiku"]
-    guard let fam = families.first(where: { s.contains($0) }) else {
+    let v = parseModelVersion(model)
+    guard !v.family.isEmpty else {
         let short = model.components(separatedBy: "-").prefix(3).joined(separator: "-")
         return ("", short)
     }
-    let cap = fam.prefix(1).uppercased() + fam.dropFirst()
-
-    // 버전이 family 뒤에 오는 신형 표기: opus-4-1
-    if let g = regexGroups(s, "\(fam)-(\\d{1,2})(?:-(\\d{1,2}))?"), !(g.first ?? "").isEmpty {
-        return (fam, "\(cap) \(versionString(g))")
-    }
-    // 버전이 family 앞에 오는 구형 표기: 3-5-sonnet
-    if let g = regexGroups(s, "(\\d{1,2})(?:-(\\d{1,2}))?-\(fam)"), !(g.first ?? "").isEmpty {
-        return (fam, "\(cap) \(versionString(g))")
-    }
-    return (fam, cap)
+    let cap = v.family.prefix(1).uppercased() + v.family.dropFirst()
+    guard let major = v.major else { return (v.family, cap) }
+    if let minor = v.minor { return (v.family, "\(cap) \(major).\(minor)") }
+    return (v.family, "\(cap) \(major)")
 }
 
 func shortModelName(_ model: String) -> String {
     parseModel(model).display
-}
-
-private func regexGroups(_ string: String, _ pattern: String) -> [String]? {
-    guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
-    let range = NSRange(string.startIndex..., in: string)
-    guard let m = re.firstMatch(in: string, range: range) else { return nil }
-    var groups: [String] = []
-    for i in 1..<m.numberOfRanges {
-        if let r = Range(m.range(at: i), in: string) {
-            groups.append(String(string[r]))
-        } else {
-            groups.append("")
-        }
-    }
-    return groups
-}
-
-private func versionString(_ groups: [String]) -> String {
-    let major = groups.first ?? ""
-    let minor = groups.count > 1 ? groups[1] : ""
-    return minor.isEmpty ? major : "\(major).\(minor)"
 }
 
 // MARK: - Usage Entry
@@ -629,6 +676,12 @@ struct UsageEntry {
     let sessionId: String  // JSONL file name as session identifier
     let uuid: String       // 원본 uuid 보존(참고용 — dedupe는 dedupeKey가 담당)
 
+    // 비용은 init에서 1회 계산해 저장한다. 예전엔 computed 프로퍼티라 접근할 때마다 모델 문자열
+    // 파싱 + 단가 조회를 다시 했는데, UsageStats의 여러 프로퍼티가 연달아 .cost를 훑는 구조라
+    // 프로파일러상 메인 스레드 최대 CPU 소비원이었다(전 생애 95K 엔트리를 매 refresh마다 재계산).
+    // timestamp/model 모두 init 시점에 확정되므로 값은 이전과 완전히 동일하다.
+    let cost: Double
+
     // 커스텀 init: cacheWrite1hTokens/dedupeKey에 기본값을 주기 위함 — Swift의 synthesized
     // memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
     init(timestamp: Date, model: String, inputTokens: Int, outputTokens: Int,
@@ -644,17 +697,15 @@ struct UsageEntry {
         self.dedupeKey = dedupeKey
         self.sessionId = sessionId
         self.uuid = uuid
-    }
 
-    var cost: Double {
         let p = getPricing(for: model, at: timestamp).pricing
         let m = 1_000_000.0
         let cacheWrite5mTokens = cacheWriteTokens - cacheWrite1hTokens
-        return Double(inputTokens) / m * p.input
-             + Double(outputTokens) / m * p.output
-             + Double(cacheReadTokens) / m * p.cacheRead
-             + Double(cacheWrite5mTokens) / m * p.cacheWrite5m
-             + Double(cacheWrite1hTokens) / m * p.cacheWrite1h
+        self.cost = Double(inputTokens) / m * p.input
+                  + Double(outputTokens) / m * p.output
+                  + Double(cacheReadTokens) / m * p.cacheRead
+                  + Double(cacheWrite5mTokens) / m * p.cacheWrite5m
+                  + Double(cacheWrite1hTokens) / m * p.cacheWrite1h
     }
 
     var totalTokens: Int {
@@ -832,6 +883,13 @@ class UsageDataReader {
                   let model = message["model"] as? String
             else { continue }
 
+            // rate-limit 거부 응답은 model="<synthetic>" + usage 전부 0으로 기록된다. 이걸
+            // 엔트리로 만들면 ① "⚠ 미상 모델"에 잡히고 ② mostUsedModel의 알파벳 타이브레이크상
+            // "<"가 "c"보다 앞서 0토큰 블록에서 메뉴바 모델명이 <synthetic>으로 표시되며
+            // ③ 무엇보다 FiveHourBlock.active가 이를 활동으로 세어 실사용 0인 5시간 블록을
+            // 시작시킨다. 실제 사용이 아니므로 파싱 단계에서 제외한다.
+            guard !SYNTHETIC_MODEL_NAMES.contains(model) else { continue }
+
             // 타임스탬프 파싱 실패 시 줄 자체를 건너뜀 (집계 오염 방지)
             guard let timestamp = parseTimestamp(json["timestamp"]) else { continue }
 
@@ -962,6 +1020,23 @@ struct UsageStats {
         for e in entries where !getPricing(for: e.model, at: e.timestamp).matched { set.insert(e.model) }
         return Array(set).sorted()
     }
+}
+
+// 리셋 앵커가 설정돼 있을 때, 표시용 윈도우와 **그 구간의 JSONL 재집계**를 함께 돌려준다.
+// 앵커가 없으면 nil — 호출부는 그때 CLI 자연 블록 값을 그대로 쓴다(기존 동작 유지).
+//
+// 드롭다운(makeBlockDisplayData)과 메뉴바 타이틀(updateStatusBarTitle)이 **반드시 이 함수를
+// 공유**해야 한다. 예전엔 드롭다운만 앵커 창으로 재계산하고 타이틀은 CLI 자연 블록의
+// tokenCounts/costUSD를 그대로 써서, 같은 블록인데 메뉴바와 드롭다운이 서로 다른 토큰·비용을
+// 보여주고 경고 색까지 엇갈렸다(타이틀은 주황인데 드롭다운은 40%). 앵커 도입 커밋이 드롭다운
+// 쪽만 고치고 타이틀을 놓친 자리다 — 두 호출부가 각자 계산하지 못하게 하나로 묶어 재발을 막는다.
+func anchoredWindowStats(cachedAll: [UsageEntry], now: Date = Date(),
+                         anchor: Date? = ResetAnchorSettings.anchor())
+        -> (window: FiveHourBlock, stats: UsageStats)? {
+    guard let anchor = anchor else { return nil }
+    let window = FiveHourBlock.anchoredWindow(containing: now, anchor: anchor)
+    let stats = UsageStats(entries: cachedAll.filter { $0.timestamp >= window.start && $0.timestamp < window.end })
+    return (window, stats)
 }
 
 // 블록 내 엔트리들 중 "토큰 수(총합) 기준"으로 가장 많이 쓴 모델의 원본 모델 문자열을 반환한다.
@@ -2615,49 +2690,66 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         renderTitle(parts: parts, warning: nil)
     }
 
-    func updateStatusBarTitle(fromCache stats: StatsCache) {
-        let active = stats.activeBlock()
-        let warning = active.flatMap { usageWarning(tokens: $0.totalTokens, cost: $0.costUSD) }
-        let anchor = ResetAnchorSettings.anchor()
-        if let b = active {
-            // 블록 구간의 실제 JSONL 엔트리(cachedAll)에서 토큰 수 기준으로 가장 많이 쓴 모델을
-            // 채택한다. b.models 배열은 CLI가 모델을 처음 발견한 순서라 "최다 사용 모델"이 아닐 수
-            // 있으므로 신뢰하지 않는다. 이 필터는 CLI가 실제로 집계한 자연 윈도우를 그대로 쓴다
-            // (앵커는 표시용 창/카운트다운/무드만 바꾸고, 토큰·비용 집계 창은 건드리지 않는다).
-            let start = parseISO8601(b.startTime)
-            let end = parseISO8601(b.endTime)
-            let topModel: String? = {
-                guard let s = start, let e = end else { return nil }
-                return mostUsedModel(in: cachedAll.filter { $0.timestamp >= s && $0.timestamp < e })
-            }()
-            // 앵커가 설정돼 있으면 표시용 윈도우(카운트다운·무드)를 앵커 그리드 기준으로 바꾼다.
-            // 앵커가 없으면 기존 CLI 자연 윈도우 계산(b.elapsedRatio()/resetCountdownText)을
-            // 그대로 써서 동작 변화가 없게 한다.
-            let resetText: String
-            let elapsedRatio: Double
-            if let anchor = anchor {
-                let window = FiveHourBlock.anchoredWindow(containing: Date(), anchor: anchor)
-                resetText = formatTime(window.remaining)
-                elapsedRatio = window.progress
-            } else {
-                resetText = resetCountdownText(for: b)
-                elapsedRatio = b.elapsedRatio()
-            }
-            let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: elapsedRatio, warning: warning)
-            applyMood(moodTier)
-            let ctx = TitleContext(outputTokens: b.tokenCounts.outputTokens,
-                                   totalTokens: b.totalTokens,
-                                   cost: b.costUSD,
-                                   remainingText: resetText.isEmpty ? nil : resetText,
-                                   model: topModel ?? b.models.last,
-                                   moodTier: moodTier,
-                                   todayTokens: gamificationTodayTokens,
-                                   todayCost: gamificationTodayCost,
-                                   cumulativeTokens: stats.cumulative?.totalTokens ?? 0)
-            renderTitle(parts: titlePartsWithBadge(ctx), warning: warning)
-        } else {
-            renderIdleTitle(idleTitleLabel())
+    // ── 1차 경로(stats-cache.json) 메뉴바 타이틀 뷰모델 어댑터 ──
+    // 순수 계산만 담당하고 렌더링은 하지 않는다 — makeBlockDisplayData(fromCache:)와 같은 패턴이다.
+    // 분리한 이유 두 가지: ① updateStatusBarTitle 자체는 statusItem(강제 언랩)에 의존해 셀프테스트가
+    // 호출할 수 없어 이 경로 전체가 오래 테스트 공백이었다 ② 드롭다운과 같은 anchoredWindowStats()를
+    // 공유한다는 사실을 테스트로 고정할 수 있다.
+    // 활성 블록이 없으면 nil(호출부가 idle 타이틀을 그린다).
+    // now: 테스트 주입 지점. 프로덕션은 항상 기본값.
+    func makeTitleContext(fromCache stats: StatsCache, cachedAll: [UsageEntry], now: Date = Date())
+            -> (ctx: TitleContext, warning: UsageWarning?)? {
+        guard let b = stats.activeBlock(now: now) else { return nil }
+        // 앵커가 켜져 있으면 토큰·비용·경고·최다사용모델 전부를 앵커 창 재집계 기준으로 쓴다 —
+        // 드롭다운과 같은 헬퍼를 공유하므로 두 화면이 어긋날 수 없다.
+        let anchored = anchoredWindowStats(cachedAll: cachedAll, now: now)
+        let warning: UsageWarning? = {
+            if let s = anchored?.stats { return usageWarning(tokens: s.totalTokens, cost: s.totalCost) }
+            return usageWarning(tokens: b.totalTokens, cost: b.costUSD)
+        }()
+        // 블록 구간의 실제 JSONL 엔트리(cachedAll)에서 토큰 수 기준으로 가장 많이 쓴 모델을
+        // 채택한다. b.models 배열은 CLI가 모델을 처음 발견한 순서라 "최다 사용 모델"이 아닐 수
+        // 있으므로 신뢰하지 않는다. 집계 구간은 실제로 화면에 표시 중인 창과 같아야 하므로
+        // 앵커가 있으면 앵커 창, 없으면 CLI 자연 윈도우를 쓴다.
+        let modelWindow: (start: Date, end: Date)? = {
+            if let w = anchored?.window { return (w.start, w.end) }
+            guard let s = parseISO8601(b.startTime), let e = parseISO8601(b.endTime) else { return nil }
+            return (s, e)
+        }()
+        let topModel: String? = modelWindow.flatMap { w in
+            mostUsedModel(in: cachedAll.filter { $0.timestamp >= w.start && $0.timestamp < w.end })
         }
+        // 앵커가 없으면 기존 CLI 자연 윈도우 계산(b.elapsedRatio()/resetCountdownText)을
+        // 그대로 써서 동작 변화가 없게 한다.
+        let resetText: String
+        let elapsedRatio: Double
+        if let w = anchored?.window {
+            resetText = formatTime(w.remaining)
+            elapsedRatio = w.progress
+        } else {
+            resetText = resetCountdownText(for: b)
+            elapsedRatio = b.elapsedRatio()
+        }
+        let ctx = TitleContext(outputTokens: anchored?.stats.outputTokens ?? b.tokenCounts.outputTokens,
+                               totalTokens: anchored?.stats.totalTokens ?? b.totalTokens,
+                               cost: anchored?.stats.totalCost ?? b.costUSD,
+                               remainingText: resetText.isEmpty ? nil : resetText,
+                               model: topModel ?? b.models.last,
+                               moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: elapsedRatio, warning: warning),
+                               todayTokens: gamificationTodayTokens,
+                               todayCost: gamificationTodayCost,
+                               cumulativeTokens: stats.cumulative?.totalTokens ?? 0)
+        return (ctx, warning)
+    }
+
+    // now: 테스트 주입 지점(makeBlockDisplayData와 동일 패턴). 프로덕션은 항상 기본값.
+    func updateStatusBarTitle(fromCache stats: StatsCache, now: Date = Date()) {
+        guard let r = makeTitleContext(fromCache: stats, cachedAll: cachedAll, now: now) else {
+            renderIdleTitle(idleTitleLabel())
+            return
+        }
+        applyMood(r.ctx.moodTier)
+        renderTitle(parts: titlePartsWithBadge(r.ctx), warning: r.warning)
     }
 
     // 유휴 상태 타이틀 라벨 — rate-limits-cache.json이 신선하고 five_hour 사용률이 100%에
@@ -2772,20 +2864,17 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 동일한 패턴) — 프로덕션에서는 항상 기본값(현재 시각) 사용.
     func makeBlockDisplayData(fromCache stats: StatsCache, cachedAll: [UsageEntry], now: Date = Date()) -> BlockDisplayData {
         let active = stats.activeBlock(now: now)
-        // 앵커가 설정돼 있으면 표시용 윈도우(시간창·진행률·리셋 텍스트·무드)를 앵커 그리드 기준으로
-        // 바꾼다.
-        let anchorWindow: FiveHourBlock? = ResetAnchorSettings.anchor()
-            .map { FiveHourBlock.anchoredWindow(containing: now, anchor: $0) }
-
-        // 앵커가 켜져 있으면 토큰/비용/모델분해도 CLI의 "자연" 블록(b.tokenCounts/costUSD/models —
-        // 첫 활동 기준 floor 같은 휴리스틱이라 유휴 후 재시작 시 앵커 그리드와 어긋나기 쉽다) 대신
-        // 앵커 창으로 JSONL을 직접 재필터링해 재계산한다. 그렇지 않으면 시간창 라벨은 앵커를
-        // 따르는데 그 아래 숫자는 여전히 어긋난 CLI 블록 것이라 "표시 창과 숫자가 안 맞는"(그리고
-        // 유휴 재개 시 이전 블록과 섞인 듯 보이는) 버그가 생긴다. 대가: 이 블록의 비용은 CLI의
-        // 정확한 costUSD가 아니라 PRICING 기반 추정치가 된다(토큰 수 자체는 JSONL 원본이라 정확).
-        let anchorStats: UsageStats? = anchorWindow.map { w in
-            UsageStats(entries: cachedAll.filter { $0.timestamp >= w.start && $0.timestamp < w.end })
-        }
+        // 앵커가 켜져 있으면 표시용 윈도우(시간창·진행률·리셋 텍스트·무드)뿐 아니라 토큰/비용/
+        // 모델분해까지 앵커 창으로 JSONL을 재필터링해 재계산한다. CLI의 "자연" 블록
+        // (b.tokenCounts/costUSD/models)은 첫 활동 기준 floor 같은 휴리스틱이라 유휴 후 재시작 시
+        // 앵커 그리드와 어긋나기 쉽고, 그러면 시간창 라벨은 앵커를 따르는데 그 아래 숫자는 여전히
+        // 어긋난 CLI 블록 것이라 "표시 창과 숫자가 안 맞는"(유휴 재개 시 이전 블록과 섞인 듯 보이는)
+        // 버그가 된다. 대가: 이 블록의 비용은 CLI의 정확한 costUSD가 아니라 PRICING 기반 추정치가
+        // 된다(토큰 수 자체는 JSONL 원본이라 정확).
+        // 메뉴바 타이틀(updateStatusBarTitle)도 같은 헬퍼를 쓴다 — 두 화면이 어긋나지 않게 하는 핵심.
+        let anchored = anchoredWindowStats(cachedAll: cachedAll, now: now)
+        let anchorWindow: FiveHourBlock? = anchored?.window
+        let anchorStats: UsageStats? = anchored?.stats
         let anchorIsEstimating = anchorWindow != nil
 
         let warning = active.flatMap { b in
@@ -3325,6 +3414,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         ResetAnchorSettings.setAnchor(corrected)
+        // 사용자가 직접 입력한 값은 자동 보정보다 우선한다 — 자동 동기화를 켜 둔 채로 두면 다음
+        // refresh(기본 30초) 때 applyAutoResetAnchorIfNeeded가 신선한 rate-limits-cache.json의
+        // resets_at으로 방금 입력한 값을 덮어써, 상태 라벨이 "수동 입력됨"에서 "자동 보정됨"으로
+        // 바뀌며 수동 앵커를 아예 유지할 수 없게 된다. 위 "지우기" 경로가 같은 이유로 이미 끄고
+        // 있었는데 입력 경로만 빠져 있었다. 다시 켜려면 "서버 실측으로 자동 보정" 체크박스를 쓰면 된다.
+        ResetAnchorSettings.setAutoSyncEnabled(false)
         refreshResetAnchorUI()
         manualRefresh()
     }
@@ -3935,6 +4030,68 @@ func runSelfTests() -> Never {
     check(unknown.matched == false, "비-claude 모델 미매칭")
     check(unknown.pricing.output == DEFAULT_PRICING.output, "미상 모델 DEFAULT 단가")
 
+    // 실측 모델 ID → 공식 단가 대조표(platform.claude.com/docs/en/about-claude/pricing, 2026-07-29).
+    // 이 표가 이번 회귀의 핵심이다: 예전 부분 문자열 테이블은 실제 로그에 등장하는 모델 ID 형태와
+    // 어긋나 Haiku 4.5를 4배 과소($0.25/$1.25), Opus 5를 3배 과대($15/$75) 계산했고 Haiku 쪽은
+    // matched=true라 "⚠ 미상 모델" 경고조차 뜨지 않았다. 실제 ID 문자열을 그대로 넣어야
+    // 의미가 있으므로 날짜 접미사가 붙은 형태까지 그대로 쓴다.
+    let officialPrices: [(model: String, input: Double, output: Double, matched: Bool)] = [
+        ("claude-fable-5",            10.0, 50.0, true),
+        ("claude-mythos-5",           10.0, 50.0, true),
+        ("claude-opus-5",              5.0, 25.0, true),
+        ("claude-opus-4-8",            5.0, 25.0, true),
+        ("claude-opus-4-7",            5.0, 25.0, true),
+        ("claude-opus-4-1-20250805",  15.0, 75.0, true),
+        ("claude-sonnet-4-6",          3.0, 15.0, true),
+        ("claude-sonnet-4-5",          3.0, 15.0, true),
+        ("claude-3-5-sonnet-20241022", 3.0, 15.0, true),
+        ("claude-haiku-4-5-20251001",  1.0,  5.0, true),
+        ("claude-3-5-haiku-20241022",  0.80, 4.0, true),
+    ]
+    for row in officialPrices {
+        let got = getPricing(for: row.model)
+        check(got.pricing.input == row.input && got.pricing.output == row.output,
+              "공식 단가: \(row.model) = $\(row.input)/$\(row.output) (실제 $\(got.pricing.input)/$\(got.pricing.output))")
+        check(got.matched == row.matched,
+              "공식 단가: \(row.model)의 matched == \(row.matched)")
+    }
+
+    // 캐시 단가 파생 배수(공식: 5분 쓰기 ×1.25, 1시간 쓰기 ×2.0, 읽기 ×0.1)를 실제 표 값으로 확인
+    let haiku45 = getPricing(for: "claude-haiku-4-5-20251001").pricing
+    check(haiku45.cacheWrite5m == 1.25 && haiku45.cacheWrite1h == 2.0 && haiku45.cacheRead == 0.1,
+          "Haiku 4.5 캐시 단가가 공식값($1.25/$2/$0.10)과 일치")
+
+    // family 폴백은 반드시 **현행** 티어를 가리켜야 한다 — 은퇴 티어를 가리키면 새 모델이
+    // 나올 때마다 조용히 틀린 쪽으로 떨어진다(Opus 5가 legacy $15/$75로 계산되던 버그).
+    let futureOpus = getPricing(for: "claude-opus-9")
+    check(futureOpus.matched == false, "미등록 Opus 버전은 폴백(matched=false)이라 ⚠배너로 고지됨")
+    check(futureOpus.pricing.input == 5.0 && futureOpus.pricing.output == 25.0,
+          "Opus family 폴백 = 현행 티어($5/$25), 은퇴한 legacy($15/$75) 아님")
+    let futureHaiku = getPricing(for: "claude-haiku-9")
+    check(futureHaiku.pricing.input == 1.0 && futureHaiku.pricing.output == 5.0,
+          "Haiku family 폴백 = 현행 티어($1/$5), 은퇴한 3.5($0.80/$4) 아님")
+
+    // parseModelVersion: 신형(family 뒤 버전)/구형(family 앞 버전) 두 표기와 날짜 접미사 정규화.
+    // 예전 패턴 테이블이 이 차이를 놓쳐 "haiku-3-5" 패턴이 죽은 코드가 됐던 지점이다.
+    check(parseModelVersion("claude-haiku-4-5-20251001") == ("haiku", 4, 5),
+          "parseModelVersion: 신형 표기 + 날짜 접미사 → (haiku, 4, 5)")
+    check(parseModelVersion("claude-3-5-haiku-20241022") == ("haiku", 3, 5),
+          "parseModelVersion: 구형 표기(버전이 family 앞) → (haiku, 3, 5)")
+    check(parseModelVersion("claude-opus-5") == ("opus", 5, nil),
+          "parseModelVersion: minor 없는 버전 → (opus, 5, nil)")
+    check(parseModelVersion("claude-opus-4-8[1m]") == ("opus", 4, 8),
+          "parseModelVersion: [1m] 접미사는 무시(1M 컨텍스트는 표준 단가)")
+    check(parseModelVersion("gpt-4o").family == "",
+          "parseModelVersion: 비-claude 모델은 family 미상")
+
+    // shortModelName은 모델 컬럼 폭(paddedModelColumn, 12자) 안에 들어와야 잘리지 않는다.
+    // claude-fable-5가 family 미인식으로 "claude-fable-5"(14자)가 돼 잘리던 회귀 가드.
+    for model in ["claude-fable-5", "claude-opus-5", "claude-haiku-4-5-20251001", "claude-sonnet-5"] {
+        check(shortModelName(model).count <= 12,
+              "shortModelName(\(model)) = \"\(shortModelName(model))\"가 모델 컬럼 폭(12자) 이내")
+    }
+    check(shortModelName("claude-fable-5") == "Fable 5", "shortModelName: fable family 인식")
+
     // getPricing(at:) — Sonnet 5 도입가(2026-08-31까지 $2/$10) → 표준가(2026-09-01부터 $3/$15)
     // 전환. 실제 커트오프 상수(sonnet5IntroPricingCutoffUTC) 기준 상대 오프셋으로 날짜를 만들어,
     // 하드코딩한 epoch 값의 오프바이원/계산 실수 없이 항상 정확히 경계 양쪽을 가리키게 한다.
@@ -4271,6 +4428,24 @@ func runSelfTests() -> Never {
         }
         check(anchoredData.anchorIsEstimating, "makeBlockDisplayData(fromCache:): 앵커 활성 시 anchorIsEstimating == true(배너 노출 근거)")
 
+        // B1 회귀: 같은 앵커·같은 입력에서 **메뉴바 타이틀도 드롭다운과 동일한 숫자**여야 한다.
+        // 예전엔 앵커가 드롭다운에만 적용되고 타이틀은 CLI 자연 블록(200토큰/$84.77)을 그대로 써서
+        // 같은 블록인데 위아래가 다른 값을 보여줬다(경고 색까지 엇갈림). 두 어댑터가 공유하는
+        // anchoredWindowStats()가 실제로 양쪽에 적용되는지 고정한다.
+        if let titleResult = app.makeTitleContext(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow),
+           case .ready(let dropBlock, _, _, _) = anchoredData.state, let db = dropBlock {
+            check(titleResult.ctx.totalTokens == 5000,
+                  "makeTitleContext: 앵커 활성 시 타이틀 토큰도 앵커 창 기준(5000) — CLI 블록의 200이 아님")
+            check(titleResult.ctx.totalTokens == db.totalTokens,
+                  "makeTitleContext: 타이틀 토큰 == 드롭다운 토큰(두 화면이 같은 창을 봄)")
+            check(abs(titleResult.ctx.cost - db.cost) < 1e-9,
+                  "makeTitleContext: 타이틀 비용 == 드롭다운 비용")
+            check(abs(titleResult.ctx.cost - 84.77) > 1e-6,
+                  "makeTitleContext: 앵커 활성 시 타이틀 비용도 CLI costUSD(84.77)가 아닌 JSONL 추정치")
+        } else {
+            check(false, "makeTitleContext: 앵커+활성 블록 조합은 non-nil이어야 함")
+        }
+
         // 회귀: 앵커 미설정 시엔 기존과 완전히 동일 — CLI의 costUSD/totalTokens를 그대로 쓰고
         // anchorIsEstimating도 false.
         ResetAnchorSettings.clearAnchor()
@@ -4282,6 +4457,16 @@ func runSelfTests() -> Never {
             check(false, "makeBlockDisplayData(fromCache:): 앵커 미설정+활성 블록 조합도 .ready(block: non-nil)이어야 함")
         }
         check(!noAnchorData.anchorIsEstimating, "makeBlockDisplayData(fromCache:): 앵커 미설정 시 anchorIsEstimating == false")
+
+        // 회귀: 앵커 미설정 시 타이틀도 기존과 완전히 동일 — CLI 값 그대로.
+        if let titleNoAnchor = app.makeTitleContext(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow) {
+            check(titleNoAnchor.ctx.totalTokens == 200,
+                  "makeTitleContext: 앵커 미설정 시 회귀 — CLI totalTokens(200) 그대로")
+            check(abs(titleNoAnchor.ctx.cost - 84.77) < 1e-6,
+                  "makeTitleContext: 앵커 미설정 시 회귀 — CLI costUSD(84.77) 그대로")
+        } else {
+            check(false, "makeTitleContext: 앵커 미설정+활성 블록 조합도 non-nil이어야 함")
+        }
 
         if let s = savedAnchor { ResetAnchorSettings.setAnchor(s) } else { ResetAnchorSettings.clearAnchor() }
     } else {
