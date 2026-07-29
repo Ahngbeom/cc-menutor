@@ -2160,6 +2160,37 @@ struct RateLimitsCache: Codable {
     let sevenDay: RateLimitWindow?
 }
 
+// statusLine이 떨궈 둔 rate-limits-cache.json의 **서버 실측** 사용률을 표시하기 위한 뷰모델.
+//
+// 이 값은 이 앱이 토큰을 세어 만든 추정치가 아니라 Claude 서버가 계산해 내려준 진짜 사용률이다.
+// README가 오래 "이 앱은 진짜 %를 재현할 수 없다"고 안내해 왔는데, statusLine 연동이 된 사용자에겐
+// 사실 그 값이 이미 디스크에 있었고 앱도 파싱까지 하고 있었다 — 다만 `>= 100`인지 확인하는 데만
+// 쓰고 화면에는 한 번도 안 그렸다. 특히 seven_day(주간 한도)는 파싱만 되고 읽는 코드가 아예 없었다.
+struct ServerLimitsSectionData {
+    struct Row {
+        let labelKo: String
+        let labelEn: String
+        let percent: Double
+        let resetsAt: Date?
+    }
+    let rows: [Row]
+}
+
+// 신선한(아직 리셋 시각이 지나지 않은) 창만 골라 표시용 행을 만든다. stale하거나 값이 없으면
+// 그 행은 빠지고, 표시할 게 하나도 없으면 nil — 호출부는 섹션 자체를 그리지 않는다.
+// 순수 함수라 셀프테스트가 신선/stale/부재 조합을 직접 검증할 수 있다.
+func makeServerLimitsSection(from rateLimits: RateLimitsCache?, now: Date = Date()) -> ServerLimitsSectionData? {
+    guard let limits = rateLimits else { return nil }
+    var rows: [ServerLimitsSectionData.Row] = []
+    func appendIfFresh(_ window: RateLimitWindow?, labelKo: String, labelEn: String) {
+        guard let w = window, let pct = w.usedPercentage, !w.isStale(now: now) else { return }
+        rows.append(.init(labelKo: labelKo, labelEn: labelEn, percent: pct, resetsAt: w.resetsAtDate))
+    }
+    appendIfFresh(limits.fiveHour, labelKo: "5시간", labelEn: "5-hour")
+    appendIfFresh(limits.sevenDay, labelKo: "주간",  labelEn: "Weekly")
+    return rows.isEmpty ? nil : ServerLimitsSectionData(rows: rows)
+}
+
 final class RateLimitsCacheReader {
     let url: URL
     private var lastMTime: Date?
@@ -2268,13 +2299,18 @@ struct BlockDisplayData {
         case ready(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData, allTime: AllTimeSectionData?)
     }
     let state: State
+    // 서버 실측 사용률(5시간/주간) — rate-limits-cache.json이 있고 신선할 때만 non-nil.
+    // 이 앱의 블록 추정치와 독립적인 별개 소스라 활성 블록 유무와 무관하게 표시한다.
+    let serverLimits: ServerLimitsSectionData?
 
-    // 커스텀 init: anchorIsEstimating/rateLimitReset에 기본값을 주기 위함 — Swift의 synthesized
-    // memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
-    init(isEstimate: Bool, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil, state: State) {
+    // 커스텀 init: anchorIsEstimating/rateLimitReset/serverLimits에 기본값을 주기 위함 — Swift의
+    // synthesized memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
+    init(isEstimate: Bool, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil,
+         serverLimits: ServerLimitsSectionData? = nil, state: State) {
         self.isEstimate = isEstimate
         self.anchorIsEstimating = anchorIsEstimating
         self.rateLimitReset = rateLimitReset
+        self.serverLimits = serverLimits
         self.state = state
     }
 }
@@ -2285,7 +2321,7 @@ extension BlockDisplayData {
     func asLoadingSkeleton() -> BlockDisplayData? {
         guard case .ready(let block, let model, let today, let allTime) = state else { return nil }
         return BlockDisplayData(isEstimate: isEstimate, anchorIsEstimating: anchorIsEstimating,
-                                 rateLimitReset: rateLimitReset,
+                                 rateLimitReset: rateLimitReset, serverLimits: serverLimits,
                                  state: .loading(block: block, model: model, today: today, allTime: allTime))
     }
 }
@@ -3030,6 +3066,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         return BlockDisplayData(isEstimate: false, anchorIsEstimating: anchorIsEstimating,
                                  rateLimitReset: rateLimitReset,
+                                 serverLimits: makeServerLimitsSection(from: cachedRateLimits, now: now),
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -3045,12 +3082,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .loading(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
-                                 rateLimitReset: data.rateLimitReset, skeleton: true, into: menu)
+                                 rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
+                                 skeleton: true, into: menu)
 
         case .ready(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
-                                 rateLimitReset: data.rateLimitReset, skeleton: false, into: menu)
+                                 rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
+                                 skeleton: false, into: menu)
         }
     }
 
@@ -3059,7 +3098,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 텍스트를 쓴다(refresh마다 안 바뀌는 텍스트를 흐리게 하면 레이아웃 점프만 커짐). ──
     private func renderBlockSections(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData,
                                       allTime: AllTimeSectionData?, isEstimate: Bool, anchorIsEstimating: Bool,
-                                      rateLimitReset: Date?, skeleton: Bool, into menu: NSMenu) {
+                                      rateLimitReset: Date?, serverLimits: ServerLimitsSectionData? = nil,
+                                      skeleton: Bool, into menu: NSMenu) {
         if isEstimate {
             addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
             menu.addItem(.separator())
@@ -3151,6 +3191,27 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         syncIdleFlameCycleTimer(isIdle: isCurrentlyIdle, menuOpen: mainMenuIsOpen)
         menu.addItem(.separator())
+
+        // ── Server-Measured Limits Section ──
+        // 위 5시간 블록은 이 앱이 메시지 타임스탬프로 만든 **추정**이고, 여기는 Claude 서버가
+        // 직접 계산해 내려준 **실측** 사용률이다. 둘은 기준도 리셋 시각도 다르므로 나란히 두되
+        // 어느 쪽이 무엇인지 분명히 라벨링한다. rate-limits-cache.json이 없거나 stale이면
+        // serverLimits가 nil이라 이 섹션 자체가 사라진다(기존 사용자 화면 불변).
+        if let limits = serverLimits {
+            addSectionHeader(menu, t("🎯  서버 실측 사용률", "🎯  Server-Measured Usage"))
+            for row in limits.rows {
+                let label = t(row.labelKo, row.labelEn)
+                let pct = String(format: "%.0f%%", row.percent)
+                let reset = row.resetsAt.map { d -> String in
+                    let remaining = d.timeIntervalSinceNow
+                    return remaining > 0
+                        ? t(" · \(formatTime(remaining)) 후 리셋", " · resets in \(formatTime(remaining))")
+                        : ""
+                } ?? ""
+                skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  \(label): \(pct)\(reset)")
+            }
+            menu.addItem(.separator())
+        }
 
         // ── Model Section ──
         if let model = model {
@@ -3826,6 +3887,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let rateLimitReset = activeBlock == nil ? rateLimitResetIfExceeded(self.cachedRateLimits, now: now) : nil
 
         return BlockDisplayData(isEstimate: true, rateLimitReset: rateLimitReset,
+                                 serverLimits: makeServerLimitsSection(from: self.cachedRateLimits, now: now),
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -4352,6 +4414,34 @@ func runSelfTests() -> Never {
           "autoResetAnchor: fiveHour가 stale이면 nil(기존 앵커/자동계산 유지 근거)")
     check(autoResetAnchor(from: nil, now: rlNow) == nil,
           "autoResetAnchor: rateLimits 자체가 nil이면 nil")
+
+    // makeServerLimitsSection — 서버 실측 사용률 섹션. 신선한 창만 표시하고, 표시할 게 없으면
+    // 섹션 자체가 사라져야 한다(rate-limits-cache.json이 없는 사용자 화면 불변).
+    check(makeServerLimitsSection(from: nil, now: rlNow) == nil,
+          "makeServerLimitsSection: rateLimits 자체가 nil이면 섹션 없음")
+    check(makeServerLimitsSection(from: staleCache, now: rlNow) == nil,
+          "makeServerLimitsSection: stale한 창만 있으면 섹션 없음")
+    if let onlyFiveHour = makeServerLimitsSection(from: freshCache, now: rlNow) {
+        check(onlyFiveHour.rows.count == 1, "makeServerLimitsSection: sevenDay가 없으면 5시간 행만")
+        check(onlyFiveHour.rows[0].percent == 23.5, "makeServerLimitsSection: 서버 실측 %를 그대로 전달")
+    } else {
+        check(false, "makeServerLimitsSection: 신선한 fiveHour가 있으면 섹션이 있어야 함")
+    }
+    // 주간(seven_day)은 오래도록 파싱만 되고 읽는 코드가 아예 없었다 — 이제 표시되는지 고정한다.
+    let freshWeekly = RateLimitWindow(usedPercentage: 50.0, resetsAt: Int(rlNow.timeIntervalSince1970) + 86_400)
+    if let both = makeServerLimitsSection(from: RateLimitsCache(fiveHour: freshWindow, sevenDay: freshWeekly), now: rlNow) {
+        check(both.rows.count == 2, "makeServerLimitsSection: 5시간 + 주간 둘 다 신선하면 2행")
+        check(both.rows[1].percent == 50.0, "makeServerLimitsSection: seven_day(주간) 사용률이 실제로 표시됨")
+    } else {
+        check(false, "makeServerLimitsSection: 둘 다 신선하면 섹션이 있어야 함")
+    }
+    // 5시간은 stale인데 주간만 신선한 경우 — 주간 행만 남아야 한다(부분 표시).
+    if let weeklyOnly = makeServerLimitsSection(from: RateLimitsCache(fiveHour: staleWindow, sevenDay: freshWeekly), now: rlNow) {
+        check(weeklyOnly.rows.count == 1 && weeklyOnly.rows[0].percent == 50.0,
+              "makeServerLimitsSection: stale한 창은 빠지고 신선한 창만 남음")
+    } else {
+        check(false, "makeServerLimitsSection: 주간만 신선해도 섹션이 있어야 함")
+    }
     check(autoResetAnchor(from: RateLimitsCache(fiveHour: nil, sevenDay: nil), now: rlNow) == nil,
           "autoResetAnchor: fiveHour 필드가 없으면 nil")
 
