@@ -71,6 +71,41 @@ let iso8601BasicFormatter: ISO8601DateFormatter = {
 func parseISO8601(_ s: String) -> Date? {
     iso8601FullFormatter.date(from: s) ?? iso8601BasicFormatter.date(from: s)
 }
+
+// MARK: - "yyyy-MM-dd" 날짜 키 (그레고리력 고정)
+//
+// `DateFormatter`는 지정하지 않으면 `Locale.current`를, 따라서 **사용자의 달력 체계**를 따라간다.
+// 시스템 설정에서 불교력(태국)이나 일본 연호를 고르면 같은 순간이 "2569-07-29"/"0008-07-29"로
+// 찍힌다. 이 앱에서 "yyyy-MM-dd" 문자열은 ① Claude Code CLI가 stats-cache.json에 쓴 **그레고리력**
+// 키와 비교하거나 ② UserDefaults에 영속화해 나중에 다시 파싱하는 용도로만 쓰이므로, 표시가 아니라
+// **데이터 키**다. 키는 사용자 달력과 무관하게 항상 같은 문자열이어야 한다.
+//
+// (표시용 시각 포매팅인 `formatTimeShort`는 반대로 로케일을 따라가는 게 맞으므로 여기 해당 없음.
+//  `ISO8601DateFormatter`는 정의상 그레고리력·POSIX 고정이라 애초에 안전하다.)
+//
+// timeZone별로 인스턴스를 만들어 캐시한다 — `DateFormatter` 생성은 비싸고, todayPeriod()는
+// buildMenu()마다 호출된다.
+private let gregorianDayFormatterCache = NSCache<NSString, DateFormatter>()
+private let gregorianDayFormatterLock = NSLock()
+
+func gregorianDayFormatter(timeZone: TimeZone) -> DateFormatter {
+    let key = timeZone.identifier as NSString
+    gregorianDayFormatterLock.lock()
+    defer { gregorianDayFormatterLock.unlock() }
+    if let cached = gregorianDayFormatterCache.object(forKey: key) { return cached }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")   // 달력·숫자 체계를 사용자 로케일에서 분리
+    f.calendar = Calendar(identifier: .gregorian)
+    f.dateFormat = "yyyy-MM-dd"
+    f.timeZone = timeZone
+    gregorianDayFormatterCache.setObject(f, forKey: key)
+    return f
+}
+
+// 그레고리력 기준 "yyyy-MM-dd" 문자열. 사용자가 어떤 달력을 쓰든 같은 순간은 같은 키가 된다.
+func gregorianDayString(_ date: Date, timeZone: TimeZone = .current) -> String {
+    gregorianDayFormatter(timeZone: timeZone).string(from: date)
+}
 func parseISO8601(_ s: String?) -> Date? {
     guard let s = s else { return nil }
     return parseISO8601(s)
@@ -1835,15 +1870,22 @@ enum GamificationSettings {
     }
 }
 
+// 스트릭 판정용 날짜 키. 결과가 UserDefaults(gamLastActiveDay)에 **영속화**되므로 반드시
+// 그레고리력이어야 한다 — 로케일 기본 포매터를 쓰면 사용자가 시스템 달력을 바꾸는 순간 저장된
+// 키("2569-07-28")와 새 키("2026-07-29")의 파싱 결과가 543년 차이가 나 daysBetween이 1을
+// 반환하지 못하고 스트릭이 리셋된다. localDayString/daysBetween이 짝으로 같은 달력을 쓰는 한
+// 일상 동작은 정확했지만, 그 "짝"이 시스템 설정 변경으로 깨질 수 있다는 게 문제였다.
 func localDayString(_ date: Date, timeZone: TimeZone = .current) -> String {
-    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.timeZone = timeZone
-    return f.string(from: date)
+    gregorianDayString(date, timeZone: timeZone)
 }
 
 private func daysBetween(_ a: String, _ b: String) -> Int? {
-    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.timeZone = TimeZone.current
+    let f = gregorianDayFormatter(timeZone: .current)
     guard let da = f.date(from: a), let db = f.date(from: b) else { return nil }
-    return Calendar.current.dateComponents([.day], from: da, to: db).day
+    // 일수 차이도 그레고리력으로 센다(Calendar.current는 사용자 달력이라 월/연 경계 계산이 다를 수 있음).
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = .current
+    return cal.dateComponents([.day], from: da, to: db).day
 }
 
 // 이전 기록 + 오늘 날짜(yyyy-MM-dd, 로컬) + 오늘 누적 토큰/비용 → 새 기록.
@@ -2089,14 +2131,18 @@ struct StatsCache: Codable {
         blocks?.blocks.first(where: { $0.isActive && !$0.isExpired(now: now) })
     }
 
-    func todayPeriod() -> PeriodStats? {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"   // 1차: 로컬 기준 날짜 매칭
-        let local = f.string(from: Date())
+    // CLI가 stats-cache.json에 쓰는 daily 키는 **그레고리력** "yyyy-MM-dd"다. 따라서 비교용
+    // 문자열도 반드시 그레고리력으로 만들어야 한다(gregorianDayString 주석 참고) — 예전엔 로케일
+    // 기본 DateFormatter를 써서, 시스템 달력이 불교력/일본 연호면 "2569-07-29" 같은 키가 나와
+    // **1차와 UTC 폴백이 둘 다 영구히 빗나갔다**(드롭다운 "오늘" 섹션이 항상 0). UTC 폴백도
+    // 같은 포매터의 timeZone만 바꿔 재사용했기 때문에 달력 결함이 그대로 따라갔다.
+    // now는 테스트 주입 지점 — 프로덕션은 항상 기본값.
+    func todayPeriod(now: Date = Date()) -> PeriodStats? {
+        let local = gregorianDayString(now)   // 1차: 로컬 기준 날짜 매칭
         if let hit = daily?.daily?.first(where: { $0.date == local }) { return hit }
         // 폴백: CLI가 daily를 UTC 키로 저장하는 경우 자정 전후 경계 보정
-        f.timeZone = TimeZone(identifier: "UTC")
-        let utc = f.string(from: Date())
+        guard let utcZone = TimeZone(identifier: "UTC") else { return nil }
+        let utc = gregorianDayString(now, timeZone: utcZone)
         return daily?.daily?.first(where: { $0.date == utc })
     }
 
@@ -4498,9 +4544,18 @@ func runSelfTests() -> Never {
     check(parseLocalClockTime("10:61", relativeTo: clockNow) == nil, "parseLocalClockTime: 범위 밖 분(61) → nil")
 
     // StatsCache 디코드 (실제 stats-cache.json 구조 픽스처)
-    let todayStr: String = {
-        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f.string(from: Date())
+    // 픽스처 날짜는 CLI가 쓰는 것과 같은 **그레고리력**으로 하드코딩 생성한다. 예전엔 이걸
+    // 프로덕션과 정확히 동일한(로케일 의존) 포매터로 만들어서, 사용자 달력이 불교력이면 픽스처와
+    // 프로덕션이 나란히 "2569-07-29"가 되어 **테스트는 통과하고 프로덕션만 깨지는** 자기충족적
+    // 테스트였다. 이제 양쪽 기준이 분리돼 실제 검증이 된다.
+    let gregorianFixtureFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
     }()
+    let todayStr: String = gregorianFixtureFormatter.string(from: Date())
     let cacheJSON = """
     {
       "timestamp": 1782808979,
@@ -4531,6 +4586,24 @@ func runSelfTests() -> Never {
         check(sc.todayPeriod()?.totalCost == 1.5, "stats: todayPeriod 날짜 매칭")
         check(sc.todayPeriod()?.modelBreakdowns?.first?.tokens == 10, "stats: modelBreakdown 토큰 합")
         check(sc.cumulative?.totalTokens == 12345, "stats: cumulative = monthly.totals")
+
+        // 로케일 회귀: CLI가 쓴 그레고리력 daily 키를 사용자 달력과 무관하게 매칭해야 한다.
+        // 픽스처는 그레고리력으로 고정돼 있고 프로덕션 경로는 gregorianDayString을 쓰므로, 아래
+        // 단정은 "달력이 무엇이든 같은 키가 나온다"를 실제로 시험한다. 예전 구현(로케일 기본
+        // DateFormatter)이라면 불교력 환경에서 "2569-.." 키가 나와 여기서 nil이 됐다.
+        let buddhistDayString: String = {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "th_TH")
+            f.calendar = Calendar(identifier: .buddhist)
+            f.dateFormat = "yyyy-MM-dd"
+            return f.string(from: Date())
+        }()
+        check(buddhistDayString != todayStr,
+              "로케일 픽스처 전제: 불교력 날짜 문자열은 그레고리력과 실제로 다름(\(buddhistDayString) != \(todayStr))")
+        check(gregorianDayString(Date()) == todayStr,
+              "gregorianDayString: 시스템 달력과 무관하게 그레고리력 키를 만든다")
+        check(sc.todayPeriod() != nil,
+              "todayPeriod: 그레고리력 키로 매칭 — 사용자 달력이 불교력이어도 '오늘' 섹션이 비지 않음")
     } else {
         check(false, "stats-cache JSON 디코드 성공해야 함")
     }
