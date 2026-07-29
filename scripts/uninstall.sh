@@ -6,7 +6,8 @@ set -euo pipefail
 INSTALL_DIR="${HOME}/.local/share/cc-menutor"
 
 if [ -x "$INSTALL_DIR/uninstall.sh" ]; then
-  "$INSTALL_DIR/uninstall.sh"
+  # 인자를 그대로 넘긴다 — --purge로 사용자 설정까지 지울 수 있게.
+  "$INSTALL_DIR/uninstall.sh" "$@"
 else
   # 설치 디렉터리가 없거나 손상된 경우 LaunchAgent만 직접 정리
   # (신규 cc-menutor + 리브랜딩 이전 claude-monitor 둘 다 방어적으로 정리)

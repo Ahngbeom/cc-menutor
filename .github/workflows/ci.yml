@@ -1,0 +1,52 @@
+name: CI
+
+# 이 저장소는 테스트 프레임워크 없이 ClaudeMonitor.swift 안의 셀프테스트(--test)에 의존한다.
+# 그동안 그 셀프테스트는 개발자가 로컬에서 build.sh를 돌릴 때만 실행됐다 — push/PR에서 아무도
+# 검증하지 않았다. macOS 러너에서 빌드+셀프테스트를 돌려 그 공백을 메운다.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run self-tests
+        # build.sh가 컴파일 후 ./cc-menutor --test까지 실행하고, 실패 시 0이 아닌 코드로 끝난다.
+        run: ./build.sh
+
+      - name: Check release metadata consistency
+        # 릴리스 아티팩트가 어긋나는 걸 막는 최소 불변식. scripts/install.sh는 더 이상 버전을
+        # 하드코딩하지 않으므로(최신 릴리스를 조회) 여기서는 태그와 APP_VERSION만 맞춘다.
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(sed -n 's/^let APP_VERSION = "\(.*\)"$/\1/p' ClaudeMonitor.swift)"
+          if [ -z "$APP_VERSION" ]; then
+            echo "❌ ClaudeMonitor.swift에서 APP_VERSION을 찾지 못했습니다."
+            exit 1
+          fi
+          echo "APP_VERSION=$APP_VERSION"
+
+          # VERSION="1.10" 같은 리터럴 고정만 잡는다. VERSION="${CC_MENUTOR_VERSION:-}"(환경변수
+          # 오버라이드)는 정상이므로 숫자로 시작하는 값만 검사한다.
+          if grep -qE '^VERSION=["'"'"']?[0-9]' scripts/install.sh; then
+            echo "❌ scripts/install.sh가 버전을 하드코딩하고 있습니다."
+            echo "   과거 이 고정값이 APP_VERSION과 어긋나 설치 스크립트가 구버전을 설치했습니다."
+            exit 1
+          fi
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$APP_VERSION" ]; then
+              echo "❌ 태그(v$TAG)와 APP_VERSION($APP_VERSION)이 다릅니다. 릴리스 전에 버전을 올리세요."
+              exit 1
+            fi
+            echo "✅ 태그와 APP_VERSION 일치"
+          fi
