@@ -1081,23 +1081,22 @@ extension TitleSettings {
     }
 }
 
-// flame 테마 전용 — MoodTier(5단계)를 아이콘 모양 3단계(불씨/불꽃/화염)로 묶는다. idle+calm을
-// 묶는 이유: 블록이 없거나 막 시작한 시점엔 "아직 불이 크지 않다"는 신호가 맞고, warm+hot을
-// 묶는 이유: 대부분의 작업 시간이 여기 걸쳐 있어 형태 변화보다 색 변화(노랑→주황)로 충분히
-// 구분됨. critical만 별도 화염 형태로 분리해 "한도 근접"을 형태로도 강조한다.
-enum FlameStage: String, CaseIterable {
-    case ember, flame, blaze   // 불씨 / 불꽃 / 화염
-}
-
-func flameStage(for tier: MoodTier) -> FlameStage {
+// flame 테마 — MoodTier 5단계가 각각 뚜렷이 다른 실루엣을 가진다: idle은 바닥 불씨,
+// calm/warm/hot은 단일 불꽃이 점점 커지고(높이 55%→70%→82%) 흔들림 진폭도 함께 커지며
+// (swayScale 0.5×→0.75×→1.0×), critical은 메인+양옆 곁불꽃 화염이다. 과거엔 5단계를 3개
+// 형태(불씨/불꽃/화염)로 묶어 idle↔calm, warm↔hot이 색으로만 구분됐는데, 형태 자체가 단계마다
+// 달라야 색각 이상 사용자와 흑백 캡처에서도 단계가 읽힌다.
+func flameSpec(for tier: MoodTier) -> (height: CGFloat, swayScale: CGFloat) {
     switch tier {
-    case .idle, .calm: return .ember
-    case .warm, .hot:  return .flame
-    case .critical:    return .blaze
+    case .idle:     return (0.42, 0)      // 불씨 — 높이만 참조(흔들림 없음)
+    case .calm:     return (0.55, 0.5)
+    case .warm:     return (0.70, 0.75)
+    case .hot:      return (0.82, 1.0)
+    case .critical: return (0.90, 1.0)    // 메인 화염 기준값(곁불꽃은 flameBezierPath에서 별도)
     }
 }
 
-// flame/blaze 단계 전용 흔들림(flicker) 애니메이션 튜닝 포인트.
+// 무드 아이콘 흔들림(flicker) 애니메이션 튜닝 포인트.
 let flameFlickerInterval: TimeInterval = 0.2   // 흔들림 재계산 주기(초당 5회, 상태바 이미지만 재대입 — 가벼움)
 let flameFlickerPeriod: TimeInterval = 1.6      // 메인(느린) 숨쉬기 흔들림 한 주기(초)
 
@@ -1110,11 +1109,25 @@ let idleFlameCycleInterval: TimeInterval = 1.4
 // 느린 주성분(flameFlickerPeriod, 전체가 숨쉬듯 부풀었다 줄었다)에 더 빠르고 진폭 작은 보조
 // 성분(주기 ≈ 0.31배, 끝이 날름거리듯 잔떨림)을 얹어 완전한 주기성을 깬다 — 단일 sin 하나만 쓰면
 // 좌우로 똑같은 리듬으로 왔다갔다하는 "흔들의자" 같은 인상이라 실제 불꽃의 불규칙한 일렁임과는
-// 거리가 멀다. phaseShift로 서로 다른 위상을 줘 blaze의 메인/곁불꽃이 따로 움직이게 한다.
+// 거리가 멀다. phaseShift로 서로 다른 위상을 줘 critical 화염의 메인/곁불꽃이 따로 움직이게 한다.
 func flameSway(elapsed: TimeInterval, phaseShift: Double = 0) -> CGFloat {
     let slow = sin(elapsed * 2.0 * .pi / flameFlickerPeriod + phaseShift)
     let fast = sin(elapsed * 2.0 * .pi / (flameFlickerPeriod * 0.31) + phaseShift * 1.7) * 0.4
     return CGFloat(slow + fast) / 1.4   // 두 성분 합의 최대치(1.4)로 나눠 대략 -1...1로 정규화
+}
+
+// 0...1 정규화 펄스 — battery 저전력 깜빡임, 화산 용암 글로우 맥동처럼 "밝기가 숨쉬듯 오르내리는"
+// 애니메이션에 공용. flameSway처럼 elapsed 기반 결정론적 순수 함수라 셀프테스트가 가능하다.
+func moodPulse(elapsed: TimeInterval, period: TimeInterval, phase: Double = 0) -> CGFloat {
+    CGFloat((sin(elapsed * 2.0 * .pi / period + phase) + 1) / 2)
+}
+
+// 0...1 순환 상승값 — 한 주기 동안 0에서 1로 선형 진행 후 0으로 리셋. 화산 연기 뭉치·용암 파편이
+// 분화구에서 떠올랐다 사라지기를 반복하거나 온도계 기포가 관을 타고 오르는 움직임에 쓴다.
+// phase로 여러 요소의 시작 시점을 어긋나게 해 동시에 리셋되는 부자연스러움을 피한다.
+func moodRise(elapsed: TimeInterval, period: TimeInterval, phase: Double = 0) -> CGFloat {
+    let t = (elapsed / period + phase).truncatingRemainder(dividingBy: 1)
+    return CGFloat(t < 0 ? t + 1 : t)
 }
 
 // flame 무드 아이콘 전용 배색 — MoodTier.color(회색/초록/노랑/주황/빨강 "신호등" 배색)와
@@ -1143,25 +1156,30 @@ func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
 }
 
 // 무드 아이콘 전용 커스텀 벡터 아이콘 — 이모지 🔥 대신 Core Graphics로 직접 그려 색 틴팅이
-// 정상 동작하게 한다. FlameStage(3단계: 불씨/불꽃/화염)에
-// 따라 실루엣 자체가 커지고 복잡해진다 — 불씨는 화염 모양이 아니라 둥근 점, 불꽃은 표준 화염
-// 한 덩이, 화염은 메인 화염 옆에 곁불꽃이 하나 더 붙는다. flameColors(for:)의 outer/inner 2톤을
-// 겹쳐 칠해 실제 불꽃처럼 겉은 진하고 속은 밝은 느낌을 낸다 — 코어는 같은 실루엣을 가로 55%·
-// 세로 70%로 줄이고 바닥은 그대로 맞춰(가운데 정렬 아님) 밑에서부터 차오르는 것처럼 보이게 한다.
-// elapsed(기본 0)를 넘기면 flame/blaze 단계 실루엣이 flameSway()로 미세하게 일렁인다 — ember는
-// 항상 elapsed와 무관하게 정적이다(flameBezierPath 참고).
+// 정상 동작하게 한다. tier에 따라 실루엣 자체가 커지고 복잡해진다(flameSpec/flameBezierPath 참고).
+// 실루엣을 clip으로 잡고 아래(inner 밝은색)→위(outer 진한색) 세로 그라디언트를 채워 "속이 밝게
+// 타는" 인상을 만들고, 그 위에 같은 실루엣을 가로 55%·세로 70~75%로 줄인 코어를 inner색으로
+// 겹쳐 칠한다 — 코어 바닥은 rect.minY 그대로 맞춰(가운데 정렬 아님) 밑에서부터 차오르는 것처럼
+// 보이게 하고, hot/critical에서는 코어를 살짝 키워(0.75) 격렬함을 강조한다.
+// idle(inner=nil)은 그라디언트 없이 식은 단색 그대로 — "타는 중"이 아니므로.
 func moodFlameImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
     let colors = flameColors(for: tier)
-    let stage = flameStage(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
-        colors.outer.setFill()
-        flameBezierPath(stage: stage, in: rect, elapsed: elapsed).fill()
+        let silhouette = flameBezierPath(tier: tier, in: rect, elapsed: elapsed)
         if let inner = colors.inner {
+            NSGraphicsContext.saveGraphicsState()
+            silhouette.addClip()
+            NSGradient(starting: inner, ending: colors.outer)?.draw(in: rect, angle: 90)
+            NSGraphicsContext.restoreGraphicsState()
+            let coreHeight: CGFloat = (tier == .hot || tier == .critical) ? 0.75 : 0.70
             let coreRect = CGRect(x: rect.midX - rect.width * 0.275, y: rect.minY,
-                                   width: rect.width * 0.55, height: rect.height * 0.70)
+                                   width: rect.width * 0.55, height: rect.height * coreHeight)
             inner.setFill()
-            flameBezierPath(stage: stage, in: coreRect, elapsed: elapsed).fill()
+            flameBezierPath(tier: tier, in: coreRect, elapsed: elapsed).fill()
+        } else {
+            colors.outer.setFill()
+            silhouette.fill()
         }
         return true
     }
@@ -1200,26 +1218,29 @@ private func singleFlamePath(in rect: CGRect, lean: CGFloat) -> NSBezierPath {
     return path
 }
 
-// elapsed(기본 0)는 flame/blaze 단계에서만 쓰인다 — ember는 무시해 항상 정적으로 유지한다
-// (모니터링 활성 블록이 없는 idle/calm 상태에 흔들림을 주면 "계산이 진행 중"이라는 정보와
-// 어긋나므로 의도적으로 제외).
-private func flameBezierPath(stage: FlameStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
-    switch stage {
-    case .ember:
+// elapsed(기본 0)는 idle을 제외한 모든 tier에서 쓰인다 — idle은 무시해 항상 정적으로 유지한다
+// (활성 블록이 없는 상태에 흔들림을 주면 "계산이 진행 중"이라는 정보와 어긋나므로 의도적으로
+// 제외). calm부터는 활성 블록이 실제로 있으므로 미세한 흔들림이 정보와 어긋나지 않고, tier가
+// 오를수록 flameSpec의 swayScale로 흔들림 진폭도 커져 "더 격렬히 탄다"는 인상을 준다.
+private func flameBezierPath(tier: MoodTier, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
+    switch tier {
+    case .idle:
         // 화염 실루엣이 아니라 바닥에 깔린 작고 둥근 불씨 — 높이 canvas의 ~42%
-        let height = rect.height * 0.42
+        let height = rect.height * flameSpec(for: .idle).height
         let width = rect.width * 0.62
         let emberRect = CGRect(x: rect.midX - width / 2, y: rect.minY, width: width, height: height)
         return NSBezierPath(ovalIn: emberRect)
-    case .flame:
-        // 표준 물방울형 화염 실루엣 — 높이 ~78%, 살짝 기울어진 단일 불꽃. flameSway로 높이(±7%)와
-        // lean(±16%)을 흔들어 "타오르는" 느낌을 낸다 — lean은 singleFlamePath 정의상 끝부분(v≈1)
-        // 제어점만 크게 움직이므로 뿌리는 고정된 채 끝만 날름거리는 모양이 자연히 나온다.
-        let sway = flameSway(elapsed: elapsed)
-        let height = rect.height * (0.78 + sway * 0.07)
+    case .calm, .warm, .hot:
+        // 물방울형 단일 화염 실루엣 — tier가 오를수록 커진다(55%→70%→82%). flameSway로 높이(±7%)와
+        // lean(±16%)을 swayScale 배율로 흔들어 "타오르는" 느낌을 낸다 — lean은 singleFlamePath
+        // 정의상 끝부분(v≈1) 제어점만 크게 움직이므로 뿌리는 고정된 채 끝만 날름거리는 모양이
+        // 자연히 나온다.
+        let spec = flameSpec(for: tier)
+        let sway = flameSway(elapsed: elapsed) * spec.swayScale
+        let height = rect.height * (spec.height + sway * 0.07)
         let flameRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: height)
         return singleFlamePath(in: flameRect, lean: 0.03 + sway * 0.16)
-    case .blaze:
+    case .critical:
         // 메인 화염(높이 ~90%) + 양옆에 작은 곁불꽃 — 가장 크고 밝은 단계. 메인/양쪽 곁불꽃에 서로
         // 다른 위상의 sway를 줘 세 불꽃이 따로 움직이게 하고, x에도 미세한 흔들림을 더해 함께
         // 춤추듯 보이게 한다. mainHeight 기준값(0.90)+진폭(0.05)의 합을 1.0 밑으로 잡아 캔버스
@@ -1248,17 +1269,18 @@ private func flameBezierPath(stage: FlameStage, in rect: CGRect, elapsed: TimeIn
 
 // MARK: - Thermometer Mood Icon Theme
 //
-// flame과 동일한 3단계 그룹핑(idle+calm/warm+hot/critical)을 재사용하되, 실루엣 자체는 바뀌지
-// 않고(구근+관) "액체가 바닥부터 얼마나 찼는지"만 단계별로 커진다. 구근은 항상 가득 찬 것으로
+// 실루엣 자체는 바뀌지 않고(구근+관) "액체가 바닥부터 얼마나 찼는지"가 tier마다 다르다 —
+// 5단계가 각각 다른 액주 높이를 가져 형태만으로 단계가 읽힌다. 구근은 항상 가득 찬 것으로
 // 그린다(실제 온도계도 구근 저장분은 항상 있고 관을 타고 오르내리는 건 액주뿐이므로) — 그래서
-// low 단계에서도 완전히 빈 아이콘이 아니라 구근만 찬 모습으로 보인다.
-enum ThermometerStage: String, CaseIterable { case low, mid, high }
-
-func thermometerStage(for tier: MoodTier) -> ThermometerStage {
+// idle에서도 완전히 빈 아이콘이 아니라 구근만 찬 모습으로 보인다. 빈 관의 외곽선을 항상 연회색으로
+// 그려 "최대 눈금" 기준선을 제공한다 — 기준선이 없으면 액주 높이의 절대량을 가늠할 수 없다.
+func thermometerRatio(for tier: MoodTier) -> CGFloat {
     switch tier {
-    case .idle, .calm: return .low
-    case .warm, .hot:  return .mid
-    case .critical:    return .high
+    case .idle:     return 0.08   // 구근만 — 관에는 거의 없음
+    case .calm:     return 0.30
+    case .warm:     return 0.52
+    case .hot:      return 0.74
+    case .critical: return 0.94
     }
 }
 
@@ -1266,50 +1288,84 @@ func thermometerStage(for tier: MoodTier) -> ThermometerStage {
 // 코딩은 앱 전체에서 일관되게 유지하기 위함.
 func thermometerColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
 
+// 구근 지름 0.72w — 과거 0.85w에서는 구근이 캔버스 높이의 2/3을 차지해 관 최대 높이(h -
+// 0.82·구근)가 구근 원 상단보다 낮았고, 관이 통째로 구근 안에 숨어 아이콘이 그냥 "색깔 원"으로
+// 보였다(잠재 버그). 관은 구근 상단 부근(0.82·구근)에서 시작해 ratio=1일 때 정확히 캔버스
+// 꼭대기에 닿는다 — 그래야 외곽선(ratio 1.0 stroke)이 "최대 눈금"으로 기능한다.
 private func thermometerFillPath(in rect: CGRect, ratio: CGFloat) -> NSBezierPath {
-    let bulbDiameter = rect.width * 0.85
+    let bulbDiameter = rect.width * 0.72
     let bulbRect = CGRect(x: rect.midX - bulbDiameter / 2, y: rect.minY, width: bulbDiameter, height: bulbDiameter)
     let path = NSBezierPath(ovalIn: bulbRect)
-    let tubeWidth = rect.width * 0.34
-    let tubeMaxHeight = rect.height - bulbDiameter * 0.82
+    let tubeWidth = rect.width * 0.32
+    let tubeBottom = bulbRect.minY + bulbDiameter * 0.82
+    let tubeMaxHeight = rect.maxY - tubeBottom
     let tubeHeight = max(0, tubeMaxHeight * max(0, min(1, ratio)))
     if tubeHeight > 0 {
-        let tubeRect = CGRect(x: rect.midX - tubeWidth / 2, y: bulbRect.minY + bulbDiameter * 0.18,
+        let tubeRect = CGRect(x: rect.midX - tubeWidth / 2, y: tubeBottom,
                                width: tubeWidth, height: tubeHeight)
         path.append(NSBezierPath(roundedRect: tubeRect, xRadius: tubeWidth / 2, yRadius: tubeWidth / 2))
     }
     return path
 }
 
-// low 단계는 elapsed와 무관하게 항상 정적(관 액주 높이 고정) — mid/high만 flameSway로 액면이
-// 미세하게 출렁인다(flameSway는 flame 전용 이름이지만 흔들림 곡선 자체는 범용이라 그대로 재사용).
-private func thermometerBezierPath(stage: ThermometerStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
-    switch stage {
-    case .low:
-        return thermometerFillPath(in: rect, ratio: 0.18)
-    case .mid:
-        let sway = flameSway(elapsed: elapsed)
-        return thermometerFillPath(in: rect, ratio: 0.55 + sway * 0.06)
-    case .high:
-        let sway = flameSway(elapsed: elapsed)
-        return thermometerFillPath(in: rect, ratio: 0.92 + sway * 0.05)
+// idle/calm은 elapsed와 무관하게 항상 정적(관 액주 높이 고정 — 낮은 액주는 안정된 상태라는
+// 신호) — warm부터 flameSway로 액면이 미세하게 출렁이고(flameSway는 flame 전용 이름이지만 흔들림
+// 곡선 자체는 범용이라 그대로 재사용), critical은 출렁임을 살짝 줄이는 대신 기포가 함께 오른다
+// (thermometerBubbleRects — 액주가 0.94로 거의 가득이라 큰 출렁임은 관 밖으로 넘칠 듯 보임).
+private func thermometerBezierPath(tier: MoodTier, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
+    let base = thermometerRatio(for: tier)
+    switch tier {
+    case .idle, .calm:
+        return thermometerFillPath(in: rect, ratio: base)
+    case .warm:
+        return thermometerFillPath(in: rect, ratio: base + flameSway(elapsed: elapsed) * 0.05)
+    case .hot:
+        return thermometerFillPath(in: rect, ratio: base + flameSway(elapsed: elapsed) * 0.06)
+    case .critical:
+        return thermometerFillPath(in: rect, ratio: base + flameSway(elapsed: elapsed) * 0.04)
+    }
+}
+
+// critical 전용 "끓는" 기포 — 액주 내부를 moodRise로 타고 오르는 작은 원 2개. 위상을 절반씩
+// 어긋나게 해 두 기포가 동시에 리셋되지 않는다. 이동 구간은 구근 상단 위부터 critical 액면
+// 아래까지로 잡아(thermometerFillPath와 동일한 기하 상수) 기포가 액체 밖으로 나가지 않는다.
+func thermometerBubbleRects(in rect: CGRect, elapsed: TimeInterval) -> [CGRect] {
+    let bulbDiameter = rect.width * 0.72
+    let tubeBottom = rect.minY + bulbDiameter * 0.82
+    let radius: CGFloat = 0.8
+    let travelBottom = rect.minY + bulbDiameter + radius
+    let travelTop = tubeBottom + (rect.maxY - tubeBottom) * thermometerRatio(for: .critical) - radius - 0.4
+    return (0..<2).map { index in
+        let progress = moodRise(elapsed: elapsed, period: 1.2, phase: Double(index) * 0.5)
+        let cy = travelBottom + progress * (travelTop - travelBottom)
+        let cx = rect.midX + (index == 0 ? -0.5 : 0.5)
+        return CGRect(x: cx - radius, y: cy - radius, width: radius * 2, height: radius * 2)
     }
 }
 
 // flame과 동일한 outer/inner 2톤 오버레이 기법 — 같은 실루엣을 좁은 inset 영역에 다시 그려
-// 가운데가 밝게 빛나는 액주 하이라이트를 낸다.
+// 가운데가 밝게 빛나는 액주 하이라이트를 낸다. 채움보다 먼저 빈 관+구근 외곽선을 stroke해
+// "최대 눈금"을 항상 보여준다 — 구근 내부를 지나는 관 외곽선은 항상 가득 찬 구근 채움이 덮는다.
 func moodThermometerImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
     let colors = thermometerColors(for: tier)
-    let stage = thermometerStage(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
+        NSColor(calibratedWhite: 0.6, alpha: 0.55).setStroke()
+        let outline = thermometerFillPath(in: rect, ratio: 1.0)
+        outline.lineWidth = 0.9
+        outline.stroke()
         colors.outer.setFill()
-        thermometerBezierPath(stage: stage, in: rect, elapsed: elapsed).fill()
+        thermometerBezierPath(tier: tier, in: rect, elapsed: elapsed).fill()
         if let inner = colors.inner {
             let coreRect = CGRect(x: rect.midX - rect.width * 0.14, y: rect.minY,
                                    width: rect.width * 0.28, height: rect.height * 0.62)
             inner.setFill()
-            thermometerBezierPath(stage: stage, in: coreRect, elapsed: elapsed).fill()
+            thermometerBezierPath(tier: tier, in: coreRect, elapsed: elapsed).fill()
+            if tier == .critical {
+                for bubble in thermometerBubbleRects(in: rect, elapsed: elapsed) {
+                    NSBezierPath(ovalIn: bubble).fill()
+                }
+            }
         }
         return true
     }
@@ -1323,23 +1379,19 @@ func moodThermometerImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage 
 // 올라갈수록 채움도 늘어나고 초록→빨강으로 진행한다(문자 그대로의 배터리 잔량과는 반대 방향이지만
 // 5개 테마 전체가 공유하는 "위험도가 커질수록 채워진다" 언어를 지키기 위한 의도적 선택). 실제
 // 배터리 UI 관례를 따라 outer/inner 2톤이 아니라 단일 톤 채움만 쓴다(막대 배터리는 보통 단색).
-enum BatteryStage: String, CaseIterable { case low, mid, high }
-
-func batteryStage(for tier: MoodTier) -> BatteryStage {
-    switch tier {
-    case .idle, .calm: return .low
-    case .warm, .hot:  return .mid
-    case .critical:    return .high
-    }
-}
-
+// 채움은 연속 높이가 아니라 4칸 세그먼트다 — 11×14pt에서 5단계 연속 높이차는 인접 단계 간
+// 1~2pt 수준이라 판독이 어렵고, 칸 수(반 칸/1/2/3/4)로 이산화해야 단계가 한눈에 세어진다.
 func batteryColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
 
-private func batteryRatio(for stage: BatteryStage) -> CGFloat {
-    switch stage {
-    case .low:  return 0.18
-    case .mid:  return 0.55
-    case .high: return 0.92
+// 채워지는 칸 수 — idle은 "완전히 빈 것"과 구분되는 바닥 슬리버(반 칸, 회색)로 그려
+// "앱은 살아 있지만 블록이 없다"는 상태를 표현한다.
+func batterySegments(for tier: MoodTier) -> CGFloat {
+    switch tier {
+    case .idle:     return 0.5
+    case .calm:     return 1
+    case .warm:     return 2
+    case .hot:      return 3
+    case .critical: return 4
     }
 }
 
@@ -1354,31 +1406,45 @@ private func batteryBodyPath(in rect: CGRect) -> NSBezierPath {
     return path
 }
 
-private func batteryFillPath(in rect: CGRect, ratio: CGFloat) -> NSBezierPath {
+// 아래에서부터 segments 칸만큼 채운다 — 소수(0.5)면 마지막 칸을 그 비율 높이만 채운 슬리버.
+// 칸 사이 0.6pt 간격(메뉴바 Retina 2x에서 실질 1.2px)으로 칸 경계가 보여 "몇 칸인지" 세어진다.
+private func batterySegmentsPath(in rect: CGRect, segments: CGFloat) -> NSBezierPath {
     let nubHeight = rect.height * 0.10
     let bodyRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height - nubHeight)
     let inset = bodyRect.insetBy(dx: rect.width * 0.14, dy: rect.height * 0.05)
-    let fillHeight = max(0, inset.height * ratio)
-    let fillRect = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: fillHeight)
-    return NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1)
+    let cellCount = 4
+    let gap: CGFloat = 0.6
+    let cellHeight = (inset.height - gap * CGFloat(cellCount - 1)) / CGFloat(cellCount)
+    let path = NSBezierPath()
+    var remaining = segments
+    for index in 0..<cellCount {
+        guard remaining > 0 else { break }
+        let fraction = min(1, remaining)
+        let y = inset.minY + CGFloat(index) * (cellHeight + gap)
+        let cellRect = CGRect(x: inset.minX, y: y, width: inset.width, height: cellHeight * fraction)
+        path.append(NSBezierPath(roundedRect: cellRect, xRadius: 0.8, yRadius: 0.8))
+        remaining -= 1
+    }
+    return path
 }
 
-// high 단계(critical)만 알파를 펄스시켜 "저전력 경고"처럼 깜빡인다 — low/mid는 elapsed와
-// 무관하게 항상 정적(채움 높이 고정, 깜빡임 없음).
+// critical만 알파를 펄스시켜 "저전력 경고"처럼 깜빡인다 — 나머지 tier는 elapsed와 무관하게
+// 항상 정적(칸 수 고정, 깜빡임 없음). 깜빡일 때는 외곽선도 회색 대신 outer색으로 함께 물들여
+// 아이콘 전체가 경고색으로 숨쉬는 인상을 강화한다.
 func moodBatteryImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
     let colors = batteryColors(for: tier)
-    let stage = batteryStage(for: tier)
-    let pulse: CGFloat = stage == .high
-        ? 0.55 + 0.45 * CGFloat((sin(elapsed * 2.0 * .pi / 0.7) + 1) / 2)
-        : 1.0
+    let pulse: CGFloat = tier == .critical ? 0.55 + 0.45 * moodPulse(elapsed: elapsed, period: 0.7) : 1.0
     let image = NSImage(size: size, flipped: false) { rect in
-        NSColor(calibratedWhite: 0.6, alpha: 0.5).setStroke()
+        let outlineColor = tier == .critical
+            ? colors.outer.withAlphaComponent(0.65 * pulse)
+            : NSColor(calibratedWhite: 0.6, alpha: 0.65)
+        outlineColor.setStroke()
         let body = batteryBodyPath(in: rect)
         body.lineWidth = 0.9
         body.stroke()
         colors.outer.withAlphaComponent(pulse).setFill()
-        batteryFillPath(in: rect, ratio: batteryRatio(for: stage)).fill()
+        batterySegmentsPath(in: rect, segments: batterySegments(for: tier)).fill()
         return true
     }
     image.isTemplate = false
@@ -1387,18 +1453,11 @@ func moodBatteryImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
 
 // MARK: - Gauge Mood Icon Theme
 //
-// 반원 다이얼 + 바늘. 트랙(다이얼 면)은 tier와 무관하게 항상 같은 중립색 — 바늘 위치(3그룹)와
-// 색(5단계)만 tier를 따라 바뀐다. 바늘은 idle/calm 그룹에서 왼쪽에 고정, warm/hot에서 정중앙
-// 부근을 미세하게 떨고, critical에서 오른쪽 끝 부근을 더 크게 떤다.
-enum GaugeStage: String, CaseIterable { case low, mid, high }
-
-func gaugeStage(for tier: MoodTier) -> GaugeStage {
-    switch tier {
-    case .idle, .calm: return .low
-    case .warm, .hot:  return .mid
-    case .critical:    return .high
-    }
-}
+// 반원 다이얼 + 바늘. 트랙(다이얼 면)은 tier와 무관하게 항상 같은 중립색이고, 그 위에 왼쪽
+// 끝(180°)부터 바늘 위치까지 tier색 스윕 arc를 겹쳐 그린다 — 스피도미터처럼 "채워진 호 길이"가
+// 바늘 각도와 함께 단계를 이중 인코딩해, 바늘 하나만 있을 때보다 5단계 차이가 또렷이 읽힌다.
+// 바늘은 tier마다 다른 위치(0.06/0.28/0.50/0.72/0.93)에 있고, warm/hot은 미세하게 떨며
+// critical은 오른쪽 끝에 "박힌 채 파르르" 고주파로 잔떨림한다.
 
 func gaugeColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
 
@@ -1413,17 +1472,25 @@ private func gaugeArcPath(in rect: CGRect) -> NSBezierPath {
     return path
 }
 
-// t는 0(왼쪽/idle 방향)~1(오른쪽/critical 방향) 스윕 위치. mid/high 단계만 flameSway로 떤다.
-private func gaugeNeedlePath(stage: GaugeStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
+// t는 0(왼쪽/idle 방향)~1(오른쪽/critical 방향) 스윕 위치. idle/calm은 고정, warm/hot은
+// flameSway로 떨고, critical은 시간축을 2.2배 압축한 sway로 진폭은 작지만 빠른 잔떨림을 낸다 —
+// "바늘이 끝까지 밀려 박힌 채 파르르 떠는" 인상. 0...1 클램프로 반원 밖 오버스윙을 막는다.
+func gaugeNeedleT(for tier: MoodTier, elapsed: TimeInterval = 0) -> CGFloat {
+    let t: CGFloat
+    switch tier {
+    case .idle:     t = 0.06
+    case .calm:     t = 0.28
+    case .warm:     t = 0.50 + flameSway(elapsed: elapsed) * 0.08
+    case .hot:      t = 0.72 + flameSway(elapsed: elapsed) * 0.10
+    case .critical: t = 0.93 + flameSway(elapsed: elapsed * 2.2) * 0.04
+    }
+    return max(0, min(1, t))
+}
+
+private func gaugeNeedlePath(tier: MoodTier, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
     let center = gaugeCenter(in: rect)
     let length = min(rect.width, rect.height) * 0.42
-    let t: CGFloat
-    switch stage {
-    case .low:  t = 0.14
-    case .mid:  t = 0.5 + flameSway(elapsed: elapsed) * 0.10
-    case .high: t = 0.86 + flameSway(elapsed: elapsed) * 0.06
-    }
-    let angle = CGFloat.pi * (1 - t)
+    let angle = CGFloat.pi * (1 - gaugeNeedleT(for: tier, elapsed: elapsed))
     let tip = CGPoint(x: center.x + length * cos(angle), y: center.y + length * sin(angle))
     let path = NSBezierPath()
     path.move(to: CGPoint(x: center.x - 0.6, y: center.y))
@@ -1433,18 +1500,31 @@ private func gaugeNeedlePath(stage: GaugeStage, in rect: CGRect, elapsed: TimeIn
     return path
 }
 
-// outer=바늘, inner=중심 허브 점(있으면 더 밝은 강조색, 없으면 바늘과 같은 색).
+// 왼쪽 끝(180°)에서 바늘 위치까지의 tier색 스윕 arc — 중립 트랙 위에 겹쳐 그린다.
+private func gaugeSweepPath(in rect: CGRect, t: CGFloat) -> NSBezierPath {
+    let path = NSBezierPath()
+    let radius = min(rect.width, rect.height) * 0.46
+    path.appendArc(withCenter: gaugeCenter(in: rect), radius: radius,
+                   startAngle: 180, endAngle: 180 * (1 - t), clockwise: true)
+    return path
+}
+
+// outer=바늘·스윕 arc, inner=중심 허브 점(있으면 더 밝은 강조색, 없으면 바늘과 같은 색).
 func moodGaugeImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
     let colors = gaugeColors(for: tier)
-    let stage = gaugeStage(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
         NSColor(calibratedWhite: 0.6, alpha: 0.55).setStroke()
         let arc = gaugeArcPath(in: rect)
         arc.lineWidth = 1.1
         arc.stroke()
+        let t = gaugeNeedleT(for: tier, elapsed: elapsed)
+        colors.outer.setStroke()
+        let sweep = gaugeSweepPath(in: rect, t: t)
+        sweep.lineWidth = 1.5
+        sweep.stroke()
         colors.outer.setFill()
-        gaugeNeedlePath(stage: stage, in: rect, elapsed: elapsed).fill()
+        gaugeNeedlePath(tier: tier, in: rect, elapsed: elapsed).fill()
         let center = gaugeCenter(in: rect)
         let hubRadius: CGFloat = 1.3
         (colors.inner ?? colors.outer).setFill()
@@ -1458,29 +1538,27 @@ func moodGaugeImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
 
 // MARK: - Volcano Mood Icon Theme
 //
-// flame과 실루엣 계열은 비슷해 보이지만(위로 뾰족) 낮은 단계에서 회갈색 "휴화산" 그대로 정적이고,
-// 색이 아니라 분화구 위 연기/용암 글로우의 유무로 단계를 구분한다는 점이 다르다. dormant는 색조차
-// tier(idle/calm)와 무관하게 항상 같은 회갈색 — "쉬고 있다"는 신호를 색 변화 없이 형태로만 준다.
-enum VolcanoStage: String, CaseIterable { case dormant, smoking, erupting }
-
-func volcanoStage(for tier: MoodTier) -> VolcanoStage {
-    switch tier {
-    case .idle, .calm: return .dormant
-    case .warm, .hot:  return .smoking
-    case .critical:    return .erupting
-    }
-}
-
+// flame과 실루엣 계열은 비슷해 보이지만(위로 뾰족) 색이 아니라 분화구 위 연기 뭉치 수·용암
+// 글로우·파편의 유무로 단계를 구분한다는 점이 다르다: idle 휴화산(정적) → calm 연기 1뭉치 →
+// warm 연기 2뭉치 → hot 연기 3뭉치+글로우 → critical 분출(글로우 강화+용암 파편). 연기는 산과
+// 별도 레이어(회색, 상승할수록 옅어짐)로 그린다 — 과거엔 산과 같은 path에 append돼 산과 같은
+// 색으로 칠해져 "바위 혹"처럼 보였다.
+//
 // flame의 초록→빨강 배색을 그대로 쓰면 "쉬고 있는 산"에 초록/노랑이 섞여 어색하므로 화산만
-// 예외적으로 전용 팔레트를 쓴다 — 낮은 단계(dormant)는 회갈색 고정, erupting에서만 크레이터
-// 안쪽에 빨강/주황 용암 글로우(inner)가 나타난다.
+// 예외적으로 전용 팔레트를 쓴다 — 낮은 단계는 회갈색 계열로 tier가 오를수록 점점 어둡고 붉게
+// 달아오르고, hot부터 크레이터 안쪽에 주황 용암 글로우(inner)가 나타난다.
 func volcanoColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
-    switch volcanoStage(for: tier) {
-    case .dormant:
+    switch tier {
+    case .idle:
         return (NSColor(calibratedRed: 0.50, green: 0.46, blue: 0.42, alpha: 1), nil)
-    case .smoking:
+    case .calm:
+        return (NSColor(calibratedRed: 0.52, green: 0.45, blue: 0.36, alpha: 1), nil)
+    case .warm:
         return (NSColor(calibratedRed: 0.52, green: 0.42, blue: 0.30, alpha: 1), nil)
-    case .erupting:
+    case .hot:
+        return (NSColor(calibratedRed: 0.48, green: 0.30, blue: 0.20, alpha: 1),
+                NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.20, alpha: 1))
+    case .critical:
         return (NSColor(calibratedRed: 0.42, green: 0.22, blue: 0.16, alpha: 1),
                 NSColor(calibratedRed: 1.00, green: 0.45, blue: 0.12, alpha: 1))
     }
@@ -1502,48 +1580,73 @@ private func volcanoMountainPath(in rect: CGRect) -> NSBezierPath {
     return path
 }
 
-// 분화구 위로 떠오르는 연기 뭉치 3개 — flameSway로 각자 다른 위상을 줘 따로 흔들리게 한다.
-private func smokeWispPath(in rect: CGRect, elapsed: TimeInterval) -> NSBezierPath {
-    let path = NSBezierPath()
-    let puffDiameters: [CGFloat] = [0.20, 0.15, 0.11]
-    var cy = rect.minY + rect.height * 0.72
-    for (index, diameterFactor) in puffDiameters.enumerated() {
-        let d = rect.width * diameterFactor
+// 분화구 위로 떠오르는 연기 뭉치 — tier가 오를수록 개수가 늘고(1/2/3) 진해진다. 각 뭉치는
+// moodRise로 분화구에서 위로 떠올랐다 사라지기를 반복하고(위상을 어긋나게 해 동시 리셋 방지),
+// 떠오를수록 지름이 줄고 alpha가 옅어져 "공기 중으로 흩어지는" 인상을 준다. x는 flameSway로
+// 좌우 미세 표류. 순수 함수라 셀프테스트에서 캔버스 경계 검사가 가능하다.
+func volcanoSmokePuffs(in rect: CGRect, tier: MoodTier, elapsed: TimeInterval) -> [(rect: CGRect, alpha: CGFloat)] {
+    let count: Int
+    let baseAlpha: CGFloat
+    let period: TimeInterval
+    switch tier {
+    case .idle:
+        return []
+    case .calm:     count = 1; baseAlpha = 0.40; period = 2.4
+    case .warm:     count = 2; baseAlpha = 0.50; period = 2.4
+    case .hot:      count = 3; baseAlpha = 0.55; period = 2.0
+    case .critical: count = 3; baseAlpha = 0.70; period = 1.6
+    }
+    return (0..<count).map { index in
+        let progress = moodRise(elapsed: elapsed, period: period, phase: Double(index) / Double(count))
         let sway = flameSway(elapsed: elapsed, phaseShift: Double(index) * 1.3)
-        let x = rect.midX + sway * rect.width * 0.10
-        path.append(NSBezierPath(ovalIn: CGRect(x: x - d / 2, y: cy - d / 2, width: d, height: d)))
-        cy += rect.height * 0.10
-    }
-    return path
-}
-
-// dormant는 elapsed와 무관하게 항상 정적(연기 없음) — smoking/erupting만 연기가 흔들린다.
-private func volcanoBezierPath(stage: VolcanoStage, in rect: CGRect, elapsed: TimeInterval = 0) -> NSBezierPath {
-    let mountain = volcanoMountainPath(in: rect)
-    switch stage {
-    case .dormant:
-        return mountain
-    case .smoking, .erupting:
-        mountain.append(smokeWispPath(in: rect, elapsed: elapsed))
-        return mountain
+        let diameter = rect.width * (0.20 - 0.08 * progress)
+        let cx = rect.midX + sway * rect.width * 0.10
+        let cy = rect.minY + rect.height * (0.78 + 0.20 * progress)
+        let puffRect = CGRect(x: cx - diameter / 2, y: cy - diameter / 2, width: diameter, height: diameter)
+        return (puffRect, baseAlpha * (1 - progress * 0.6))
     }
 }
 
-// erupting 단계에서만 inner(용암 글로우)가 존재 — flame의 "실루엣을 축소해 다시 채우는" 기법
-// 대신, 분화구 노치 위치에 작은 별도 원을 얹는다(산 실루엣을 그대로 축소하면 바위 모양이 작아질
-// 뿐 "빛나는 크레이터"로 보이지 않기 때문).
+// critical 전용 용암 파편 — 분화구에서 위로 튀어오르는 작은 점 3개. 위상차를 둔 moodRise로
+// 각자 다른 타이밍에 분출되고, 떠오를수록 좌우로 벌어져 포물선 분출의 인상을 준다.
+func volcanoLavaFragmentRects(in rect: CGRect, elapsed: TimeInterval) -> [CGRect] {
+    let xOffsets: [CGFloat] = [-0.13, 0.04, 0.15]
+    return xOffsets.enumerated().map { index, xOffset in
+        let progress = moodRise(elapsed: elapsed, period: 0.9, phase: Double(index) / 3)
+        let radius: CGFloat = 0.7
+        let cx = rect.midX + xOffset * rect.width * (0.5 + progress)
+        let cy = rect.minY + rect.height * (0.74 + 0.24 * progress)
+        return CGRect(x: cx - radius, y: cy - radius, width: radius * 2, height: radius * 2)
+    }
+}
+
+// 산(outer) → 연기(별도 회색 레이어) → 용암 글로우(inner, 맥동) → 파편(critical 전용) 순으로
+// 레이어를 나눠 그린다. 글로우는 flame의 "실루엣을 축소해 다시 채우는" 기법 대신 분화구 노치
+// 위치에 작은 별도 원을 얹는다(산 실루엣을 그대로 축소하면 바위 모양이 작아질 뿐 "빛나는
+// 크레이터"로 보이지 않기 때문). idle은 산 하나만 — 완전히 정적.
 func moodVolcanoImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
     let colors = volcanoColors(for: tier)
-    let stage = volcanoStage(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
         colors.outer.setFill()
-        volcanoBezierPath(stage: stage, in: rect, elapsed: elapsed).fill()
+        volcanoMountainPath(in: rect).fill()
+        for puff in volcanoSmokePuffs(in: rect, tier: tier, elapsed: elapsed) {
+            NSColor(calibratedWhite: 0.62, alpha: puff.alpha).setFill()
+            NSBezierPath(ovalIn: puff.rect).fill()
+        }
         if let inner = colors.inner {
-            let craterRect = CGRect(x: rect.midX - rect.width * 0.14, y: rect.maxY - rect.height * 0.30,
-                                     width: rect.width * 0.28, height: rect.height * 0.18)
-            inner.setFill()
+            let pulse = moodPulse(elapsed: elapsed, period: tier == .critical ? 0.7 : 1.4)
+            // 분화구 노치(v 0.70~0.78) 안에 얹는다 — 더 위에 띄우면 산에서 분리된 "태양"처럼 보인다.
+            let craterRect = CGRect(x: rect.midX - rect.width * 0.14, y: rect.minY + rect.height * 0.66,
+                                     width: rect.width * 0.28, height: rect.height * 0.12)
+            inner.withAlphaComponent(0.6 + 0.4 * pulse).setFill()
             NSBezierPath(ovalIn: craterRect).fill()
+            if tier == .critical {
+                inner.setFill()
+                for fragment in volcanoLavaFragmentRects(in: rect, elapsed: elapsed) {
+                    NSBezierPath(ovalIn: fragment).fill()
+                }
+            }
         }
         return true
     }
@@ -1565,16 +1668,18 @@ func currentMoodImage(theme: MoodGlyphTheme, tier: MoodTier, elapsed: TimeInterv
     }
 }
 
-// flame의 "flameStage(for:) != .ember" 가드를 테마별로 일반화한 것 — 대부분 테마는 가장 낮은
-// 단계에서만 정적이고 나머지 단계가 애니메이션되지만, battery는 예외적으로 가장 높은(critical)
-// 단계에서만 깜빡인다(배터리 디자인 노트 참고).
+// 테마·tier별 애니메이션 여부 — 이 함수가 true일 때만 5Hz 흔들림 타이머가 돈다(syncFlameFlickerTimer).
+// flame/volcano는 활성 블록이 있는 calm부터 움직이고(불꽃 일렁임/연기 상승), thermometer/gauge는
+// 낮은 수치가 "안정"이라는 신호라 warm부터만 움직이며, battery는 예외적으로 가장 높은(critical)
+// 단계에서만 깜빡인다(저전력 경고 관례 — 배터리 디자인 노트 참고). 각 렌더러의 정적/동적 분기와
+// 반드시 일치해야 한다 — 어긋나면 정적 tier에서 타이머가 헛돌거나 동적 tier가 멈춘 채 보인다.
 func moodIconAnimates(theme: MoodGlyphTheme, tier: MoodTier) -> Bool {
     switch theme {
-    case .flame:       return flameStage(for: tier) != .ember
-    case .thermometer: return thermometerStage(for: tier) != .low
-    case .battery:     return batteryStage(for: tier) == .high
-    case .gauge:       return gaugeStage(for: tier) != .low
-    case .volcano:     return volcanoStage(for: tier) != .dormant
+    case .flame:       return tier != .idle
+    case .thermometer: return tier == .warm || tier == .hot || tier == .critical
+    case .battery:     return tier == .critical
+    case .gauge:       return tier == .warm || tier == .hot || tier == .critical
+    case .volcano:     return tier != .idle
     }
 }
 
@@ -2160,7 +2265,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var coldStartTimer: Timer?  // 콜드 스타트(앱 최초 실행) 전용 로딩 점 순환 애니메이션 — 이후 refresh에는 관여하지 않음
     private var coldStartDotPhase = 0  // 0...3, 표시 폭 고정을 위해 미표시 구간은 공백으로 패딩
     private var coldStartFlameIndex = 0  // MoodTier.allCases(5개) 순환 인덱스 — coldStartDotPhase(mod 4)와 별개로 둬야 critical(인덱스 4)에도 도달한다
-    private(set) var flameFlickerTimer: Timer?  // flame/blaze 단계에서만 syncFlameFlickerTimer()가 시작/중지한다
+    private(set) var flameFlickerTimer: Timer?  // 동적 tier(moodIconAnimates 참고)에서만 syncFlameFlickerTimer()가 시작/중지한다
     private var lastMoodTier: MoodTier?  // 흔들림 타이머가 재사용할, 가장 최근 refresh에서 계산된 tier
     private(set) var idleFlameCycleTimer: Timer?  // 유휴 상태 + 메뉴 열림일 때만 syncIdleFlameCycleTimer()가 시작/중지한다
     private(set) var idleFlameCycleIndex: Int = 0  // MoodTier.allCases 상의 현재 순환 프레임
@@ -4359,48 +4464,81 @@ func runSelfTests() -> Never {
     let savedMoodThemeForFlameTest = UserDefaults.standard.string(forKey: "moodGlyphTheme")
     TitleSettings.setMoodGlyphTheme(.flame)
 
-    // FlameStage 그룹핑 불변식 — MoodTier 5단계를 정확히 3개의 아이콘 형태로 묶는지 검증
-    check(flameStage(for: .idle) == flameStage(for: .calm), "flameStage: idle과 calm은 같은 불씨 단계")
-    check(flameStage(for: .warm) == flameStage(for: .hot), "flameStage: warm과 hot은 같은 불꽃 단계")
-    check(flameStage(for: .critical) != flameStage(for: .warm) && flameStage(for: .critical) != flameStage(for: .idle),
-          "flameStage: critical은 화염 단계로 별도 분리")
-    check(Set(MoodTier.allCases.map(flameStage(for:))).count == 3,
-          "flameStage: MoodTier 5단계가 정확히 3개의 아이콘 형태로 묶임")
+    // 5단계 형태 분화 불변식 — tier가 오를수록 실루엣이 실제로 커지는지(rest 포즈 elapsed=0 기준).
+    // 과거 3-stage 그룹핑(idle+calm/warm+hot/critical)을 대체한 테스트: 이제 5개 tier가 전부
+    // 형태상 서로 달라야 한다.
+    let flameCanvas = CGRect(x: 0, y: 0, width: 11, height: 14)
+    let flameHeights = MoodTier.allCases.map { flameBezierPath(tier: $0, in: flameCanvas, elapsed: 0).bounds.height }
+    check(zip(flameHeights, flameHeights.dropFirst()).allSatisfy { $0 < $1 },
+          "flameBezierPath: tier가 오를수록 실루엣 높이가 순단조 증가(5단계 형태 분화)")
+    check(flameBezierPath(tier: .critical, in: flameCanvas, elapsed: 0).bounds.width
+              > flameBezierPath(tier: .hot, in: flameCanvas, elapsed: 0).bounds.width,
+          "flameBezierPath: critical은 곁불꽃 때문에 hot보다 넓음(화염 형태 분리)")
 
-    // flameSway — 시간에 따라 실제로 값이 변하는 순수 함수인지(흔들림 애니메이션의 기반)
+    // flameSway/moodPulse/moodRise — 시간 기반 결정론적 순수 함수 계약(흔들림 애니메이션의 기반)
     check(flameSway(elapsed: 0) != flameSway(elapsed: flameFlickerPeriod / 4),
           "flameSway: elapsed가 다르면 다른 흔들림 값을 반환")
+    check((0...40).allSatisfy { step -> Bool in
+              let pulse = moodPulse(elapsed: Double(step) * 0.1, period: 0.7)
+              let rise = moodRise(elapsed: Double(step) * 0.1, period: 1.2)
+              return (0...1).contains(pulse) && (0...1).contains(rise)
+          }, "moodPulse/moodRise: 항상 0...1 범위")
+    check(abs(moodRise(elapsed: 0.4, period: 1.2) - moodRise(elapsed: 0.4 + 1.2, period: 1.2)) < 0.0001,
+          "moodRise: 한 주기(period) 뒤에 같은 값으로 되돌아옴(순환)")
 
-    // moodFlameImage(elapsed:) — ember(idle/calm)는 elapsed와 무관하게 완전히 정적이어야 하고,
-    // flame/blaze(warm 이상)는 elapsed에 따라 실제로 도형이 달라져야 한다(회귀 방지).
+    // moodFlameImage(elapsed:) — idle은 elapsed와 무관하게 완전히 정적이어야 하고(활성 블록 없음),
+    // calm부터는 elapsed에 따라 실제로 도형이 달라져야 한다(활성 블록이 있으므로 흔들림).
     check(moodFlameImage(tier: .idle, elapsed: 0).tiffRepresentation == moodFlameImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
-          "moodFlameImage: ember 단계(idle)는 elapsed가 달라도 이미지가 동일(정적 유지)")
-    check(moodFlameImage(tier: .calm, elapsed: 0).tiffRepresentation == moodFlameImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
-          "moodFlameImage: ember 단계(calm)는 elapsed가 달라도 이미지가 동일(정적 유지)")
+          "moodFlameImage: idle(불씨)은 elapsed가 달라도 이미지가 동일(정적 유지)")
+    check(moodFlameImage(tier: .calm, elapsed: 0).tiffRepresentation != moodFlameImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
+          "moodFlameImage: calm부터는 elapsed에 따라 이미지가 달라짐(약한 흔들림)")
     check(moodFlameImage(tier: .hot, elapsed: 0).tiffRepresentation != moodFlameImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
-          "moodFlameImage: flame 단계(hot)는 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
+          "moodFlameImage: hot은 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
     check(moodFlameImage(tier: .critical, elapsed: 0).tiffRepresentation != moodFlameImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
-          "moodFlameImage: blaze 단계(critical)는 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
+          "moodFlameImage: critical(화염)은 elapsed에 따라 이미지가 달라짐(흔들림 애니메이션)")
 
-    // 회귀: blaze 단계 도형이 캔버스 경계를 크게 벗어나면 안 된다. 세로는 mainHeight가 캔버스
-    // 높이(rect.height)를 넘지 않아야 하고(불꽃 끝은 singleFlamePath의 실제 앵커 포인트(v=1.0)라
-    // bounds.maxY가 정확히 그 높이를 반영), 가로는 좌우 곁불꽃이 캔버스를 살짝 포개는 것 자체는
-    // 의도된 디자인(sideRect가 -0.05*width에서 시작)이라 완전히 0~width 안에 들어갈 필요는 없지만,
-    // 여유 마진(±2pt)을 넘는 극단적 오버플로는 회귀로 잡는다. elapsed를 촘촘히 스캔해 모든
-    // 프레임을 확인한다.
-    let flameCanvas = CGRect(x: 0, y: 0, width: 11, height: 14)
-    var blazeOverflowed = false
-    var flameScanElapsed = 0.0
-    while flameScanElapsed < 8.0 {
-        let bounds = flameBezierPath(stage: .blaze, in: flameCanvas, elapsed: flameScanElapsed).bounds
-        if bounds.maxY > flameCanvas.height + 0.001
-            || bounds.minX < -2.0 || bounds.maxX > flameCanvas.width + 2.0 {
-            blazeOverflowed = true
-            break
+    // 회귀: 동적 도형이 흔들림 전 구간에서 캔버스 경계를 크게 벗어나면 안 된다. 세로는 캔버스
+    // 높이 + 소폭 마진, 가로는 좌우 곁불꽃·연기 표류가 캔버스를 살짝 포개는 것 자체는 의도된
+    // 디자인이라 여유 마진(±2pt)을 넘는 극단적 오버플로만 회귀로 잡는다. elapsed를 촘촘히 스캔해
+    // 모든 프레임을 확인한다 — 대상: flame 실루엣(전 동적 tier), gauge 바늘 t 클램프, 온도계 기포,
+    // 화산 연기 뭉치·용암 파편.
+    var dynamicOverflowed: String? = nil
+    var scanElapsed = 0.0
+    func rectsOverflow(_ rects: [CGRect], allowTopMargin: CGFloat = 2.0) -> Bool {
+        rects.contains { r in
+            r.maxY > flameCanvas.height + allowTopMargin || r.minX < -2.0 || r.maxX > flameCanvas.width + 2.0
         }
-        flameScanElapsed += 0.05
     }
-    check(!blazeOverflowed, "flameBezierPath: blaze 단계는 흔들림 전 구간에서 캔버스 경계를 크게 넘지 않음")
+    scanLoop: while scanElapsed < 8.0 {
+        for tier in [MoodTier.calm, .warm, .hot, .critical] {
+            let flameBounds = flameBezierPath(tier: tier, in: flameCanvas, elapsed: scanElapsed).bounds
+            if flameBounds.maxY > flameCanvas.height + 0.001
+                || flameBounds.minX < -2.0 || flameBounds.maxX > flameCanvas.width + 2.0 {
+                dynamicOverflowed = "flame/\(tier)"
+                break scanLoop
+            }
+            let t = gaugeNeedleT(for: tier, elapsed: scanElapsed)
+            if t < 0 || t > 1 {
+                dynamicOverflowed = "gauge/\(tier)"
+                break scanLoop
+            }
+            if rectsOverflow(volcanoSmokePuffs(in: flameCanvas, tier: tier, elapsed: scanElapsed).map { $0.rect }) {
+                dynamicOverflowed = "volcanoSmoke/\(tier)"
+                break scanLoop
+            }
+        }
+        if rectsOverflow(thermometerBubbleRects(in: flameCanvas, elapsed: scanElapsed)) {
+            dynamicOverflowed = "thermometerBubble"
+            break scanLoop
+        }
+        if rectsOverflow(volcanoLavaFragmentRects(in: flameCanvas, elapsed: scanElapsed)) {
+            dynamicOverflowed = "volcanoLava"
+            break scanLoop
+        }
+        scanElapsed += 0.05
+    }
+    check(dynamicOverflowed == nil,
+          "동적 도형 오버플로 스캔: 흔들림 전 구간에서 캔버스 경계를 크게 넘지 않음(위반: \(dynamicOverflowed ?? "없음"))")
 
     // F4 회귀: moodImageToApply()는 elapsed=0 고정 프레임이 아니라 실시간 elapsed를 써야 한다.
     // Date()를 모킹할 수 없어 "실시간 호출 결과가 elapsed=0 정지 프레임과 다르다"로 간접
@@ -4408,17 +4546,17 @@ func runSelfTests() -> Never {
     let restFrame = moodFlameImage(tier: .hot, elapsed: 0)
     let liveFrame = moodImageToApply(tier: .hot)
     check(liveFrame?.tiffRepresentation != restFrame.tiffRepresentation,
-          "moodImageToApply: flame/blaze 단계는 elapsed=0 고정 프레임이 아니라 실시간 elapsed 사용")
+          "moodImageToApply: 동적 tier는 elapsed=0 고정 프레임이 아니라 실시간 elapsed 사용")
 
     // F5 회귀: syncFlameFlickerTimer()가 조건에 따라 타이머를 실제로 시작/중지하는지(정지 상태 =
     // flameFlickerTimer == nil).
     let flickerApp = ClaudeMonitorApp()
     flickerApp.applyMood(.hot)
-    check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: flame 단계 진입 시 타이머 시작")
+    check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: 동적 tier(hot) 진입 시 타이머 시작")
     flickerApp.applyMood(.idle)
-    check(flickerApp.flameFlickerTimer == nil, "syncFlameFlickerTimer: ember 단계로 돌아가면 타이머 중지")
+    check(flickerApp.flameFlickerTimer == nil, "syncFlameFlickerTimer: 정적 tier(idle)로 돌아가면 타이머 중지")
     flickerApp.applyMood(.critical)
-    check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: blaze 단계에서도 타이머 시작")
+    check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: critical에서도 타이머 시작")
     flickerApp.flameFlickerTimer?.invalidate()
 
     // flame 전용 구간 종료 — 실제 사용자가 골라둔 테마로 복원(키 자체가 없었다면 제거).
@@ -4428,42 +4566,61 @@ func runSelfTests() -> Never {
         UserDefaults.standard.removeObject(forKey: "moodGlyphTheme")
     }
 
-    // MoodGlyphTheme 신규 테마 4종 — 각 테마의 Stage 그룹핑(3단계)과 elapsed 기반 애니메이션
-    // 게이팅(가장 낮은 단계는 정적, 나머지는 동적)이 flame과 동일한 원칙으로 동작하는지 검증.
-    // battery만 예외적으로 high(critical) 단계에서만 애니메이션(깜빡임)된다.
-    check(thermometerStage(for: .idle) == thermometerStage(for: .calm), "thermometerStage: idle과 calm은 같은 low 단계")
-    check(thermometerStage(for: .warm) == thermometerStage(for: .hot), "thermometerStage: warm과 hot은 같은 mid 단계")
-    check(thermometerStage(for: .critical) == .high, "thermometerStage: critical은 high 단계")
+    // MoodGlyphTheme 테마 4종(비 flame) — 5단계 파라미터의 순단조 증가와 elapsed 기반 애니메이션
+    // 게이팅(정적/동적 tier 구분)이 각 테마의 렌더러 분기와 일치하는지 검증.
+    // thermometer/gauge는 idle/calm 정적·warm부터 동적, volcano는 idle만 정적(calm부터 연기 상승),
+    // battery만 예외적으로 critical에서만 애니메이션(깜빡임)된다.
+    let thermoRatios = MoodTier.allCases.map(thermometerRatio(for:))
+    check(zip(thermoRatios, thermoRatios.dropFirst()).allSatisfy { $0 < $1 },
+          "thermometerRatio: tier가 오를수록 액주 높이 순단조 증가(5단계 분화)")
     check(moodThermometerImage(tier: .idle, elapsed: 0).tiffRepresentation == moodThermometerImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
-          "moodThermometerImage: low 단계(idle)는 elapsed와 무관하게 정적")
-    check(moodThermometerImage(tier: .hot, elapsed: 0).tiffRepresentation != moodThermometerImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
-          "moodThermometerImage: mid 단계(hot)는 elapsed에 따라 액면이 출렁임")
+          "moodThermometerImage: idle은 elapsed와 무관하게 정적")
+    check(moodThermometerImage(tier: .calm, elapsed: 0).tiffRepresentation == moodThermometerImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
+          "moodThermometerImage: calm도 정적(낮은 액주는 안정 신호)")
+    check(moodThermometerImage(tier: .warm, elapsed: 0).tiffRepresentation != moodThermometerImage(tier: .warm, elapsed: 1.0).tiffRepresentation,
+          "moodThermometerImage: warm부터 elapsed에 따라 액면이 출렁임")
     check(moodThermometerImage(tier: .critical, elapsed: 0).tiffRepresentation != moodThermometerImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
-          "moodThermometerImage: high 단계(critical)는 elapsed에 따라 달라짐")
+          "moodThermometerImage: critical은 액면 출렁임 + 기포 상승으로 동적")
 
-    check(batteryStage(for: .warm) == .mid, "batteryStage: warm은 mid 단계")
+    let batterySegmentCounts = MoodTier.allCases.map(batterySegments(for:))
+    check(zip(batterySegmentCounts, batterySegmentCounts.dropFirst()).allSatisfy { $0 < $1 },
+          "batterySegments: tier가 오를수록 채움 칸 수 순단조 증가(반 칸→1→2→3→4)")
     check(moodBatteryImage(tier: .idle, elapsed: 0).tiffRepresentation == moodBatteryImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
-          "moodBatteryImage: low 단계(idle)는 elapsed와 무관하게 정적")
+          "moodBatteryImage: idle은 elapsed와 무관하게 정적")
     check(moodBatteryImage(tier: .hot, elapsed: 0).tiffRepresentation == moodBatteryImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
-          "moodBatteryImage: mid 단계(hot)도 elapsed와 무관하게 정적(배터리는 high 전용 깜빡임)")
+          "moodBatteryImage: hot도 elapsed와 무관하게 정적(배터리는 critical 전용 깜빡임)")
     check(moodBatteryImage(tier: .critical, elapsed: 0).tiffRepresentation != moodBatteryImage(tier: .critical, elapsed: 0.175).tiffRepresentation,
-          "moodBatteryImage: high 단계(critical)만 elapsed에 따라 깜빡임")
+          "moodBatteryImage: critical만 elapsed에 따라 깜빡임")
 
-    check(gaugeStage(for: .idle) == gaugeStage(for: .calm), "gaugeStage: idle과 calm은 같은 low 단계")
+    let gaugeTs = MoodTier.allCases.map { gaugeNeedleT(for: $0, elapsed: 0) }
+    check(zip(gaugeTs, gaugeTs.dropFirst()).allSatisfy { $0 < $1 },
+          "gaugeNeedleT: tier가 오를수록 바늘 위치 순단조 증가(5단계 분화)")
     check(moodGaugeImage(tier: .idle, elapsed: 0).tiffRepresentation == moodGaugeImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
-          "moodGaugeImage: low 단계는 elapsed와 무관하게 정적(바늘 고정)")
+          "moodGaugeImage: idle은 elapsed와 무관하게 정적(바늘 고정)")
+    check(moodGaugeImage(tier: .calm, elapsed: 0).tiffRepresentation == moodGaugeImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
+          "moodGaugeImage: calm도 정적(바늘 고정)")
     check(moodGaugeImage(tier: .warm, elapsed: 0).tiffRepresentation != moodGaugeImage(tier: .warm, elapsed: 1.0).tiffRepresentation,
-          "moodGaugeImage: mid 단계는 elapsed에 따라 바늘이 떨림")
+          "moodGaugeImage: warm부터 elapsed에 따라 바늘이 떨림")
     check(moodGaugeImage(tier: .critical, elapsed: 0).tiffRepresentation != moodGaugeImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
-          "moodGaugeImage: high 단계는 elapsed에 따라 바늘이 떨림")
+          "moodGaugeImage: critical은 고주파 잔떨림으로 동적")
 
-    check(volcanoStage(for: .idle) == volcanoStage(for: .calm), "volcanoStage: idle과 calm은 같은 dormant 단계")
-    check(moodVolcanoImage(tier: .calm, elapsed: 0).tiffRepresentation == moodVolcanoImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
-          "moodVolcanoImage: dormant 단계는 elapsed와 무관하게 정적(연기 없음)")
+    check(moodVolcanoImage(tier: .idle, elapsed: 0).tiffRepresentation == moodVolcanoImage(tier: .idle, elapsed: 1.0).tiffRepresentation,
+          "moodVolcanoImage: idle(휴화산)은 elapsed와 무관하게 정적(연기 없음)")
+    check(moodVolcanoImage(tier: .calm, elapsed: 0).tiffRepresentation != moodVolcanoImage(tier: .calm, elapsed: 1.0).tiffRepresentation,
+          "moodVolcanoImage: calm부터 elapsed에 따라 연기가 피어오름")
     check(moodVolcanoImage(tier: .hot, elapsed: 0).tiffRepresentation != moodVolcanoImage(tier: .hot, elapsed: 1.0).tiffRepresentation,
-          "moodVolcanoImage: smoking 단계는 elapsed에 따라 연기가 흔들림")
+          "moodVolcanoImage: hot은 연기 3뭉치 + 글로우 맥동으로 동적")
     check(moodVolcanoImage(tier: .critical, elapsed: 0).tiffRepresentation != moodVolcanoImage(tier: .critical, elapsed: 1.0).tiffRepresentation,
-          "moodVolcanoImage: erupting 단계는 elapsed에 따라 연기가 흔들림")
+          "moodVolcanoImage: critical(분출)은 연기·파편·글로우로 동적")
+
+    // 5단계 형태 분화의 최종 관문 — 모든 테마에서 5개 tier 이미지가 전부 서로 달라야 한다
+    // (rest 포즈 elapsed=0 기준: 색이 아니라 형태·채움이 달라도 tiff가 달라지므로 "어느 두 단계도
+    // 같은 그림이 아니다"를 보장). currentMoodImage는 테마를 인자로 받으므로 UserDefaults와 무관.
+    for theme in MoodGlyphTheme.allCases {
+        let tiffs = MoodTier.allCases.compactMap { currentMoodImage(theme: theme, tier: $0, elapsed: 0).tiffRepresentation }
+        check(Set(tiffs).count == MoodTier.allCases.count,
+              "currentMoodImage(\(theme)): 5개 tier 이미지가 전부 상이(형태 분화)")
+    }
 
     // currentMoodImage/moodIconAnimates 디스패처 배선 검증 — 테마별로 실제 다른 렌더러가 호출되는지,
     // moodIconAnimates가 테마별 특수 규칙(battery는 high 전용)을 정확히 반영하는지 확인.
@@ -4471,9 +4628,12 @@ func runSelfTests() -> Never {
           "currentMoodImage: flame 테마는 moodFlameImage로 위임")
     check(currentMoodImage(theme: .thermometer, tier: .idle).tiffRepresentation != currentMoodImage(theme: .battery, tier: .idle).tiffRepresentation,
           "currentMoodImage: 테마마다 서로 다른 이미지를 반환")
-    check(moodIconAnimates(theme: .battery, tier: .warm) == false, "moodIconAnimates: battery는 mid 단계에서 애니메이션 없음(high 전용)")
-    check(moodIconAnimates(theme: .battery, tier: .critical) == true, "moodIconAnimates: battery는 high(critical) 단계에서 애니메이션")
-    check(moodIconAnimates(theme: .thermometer, tier: .warm) == true, "moodIconAnimates: thermometer는 mid 단계에서도 애니메이션(battery와 다른 일반 규칙)")
+    check(moodIconAnimates(theme: .battery, tier: .warm) == false, "moodIconAnimates: battery는 warm에서 애니메이션 없음(critical 전용)")
+    check(moodIconAnimates(theme: .battery, tier: .critical) == true, "moodIconAnimates: battery는 critical에서 애니메이션")
+    check(moodIconAnimates(theme: .thermometer, tier: .warm) == true, "moodIconAnimates: thermometer는 warm부터 애니메이션(battery와 다른 일반 규칙)")
+    check(moodIconAnimates(theme: .flame, tier: .calm) == true, "moodIconAnimates: flame은 calm부터 애니메이션(렌더러의 동적 분기와 일치)")
+    check(moodIconAnimates(theme: .volcano, tier: .calm) == true, "moodIconAnimates: volcano는 calm부터 애니메이션(연기 상승)")
+    check(moodIconAnimates(theme: .gauge, tier: .calm) == false, "moodIconAnimates: gauge는 calm까지 정적(바늘 고정)")
 
     // F6 회귀: syncIdleFlameCycleTimer()는 유휴+메뉴 열림 조합일 때만 타이머를 돌려야 한다.
     let idleCycleApp = ClaudeMonitorApp()
