@@ -4898,6 +4898,17 @@ func runSelfTests() -> Never {
 
     // F5 회귀: syncFlameFlickerTimer()가 조건에 따라 타이머를 실제로 시작/중지하는지(정지 상태 =
     // flameFlickerTimer == nil).
+    //
+    // syncFlameFlickerTimer는 무드 아이콘 기능 토글을 UserDefaults.standard에서 읽는데 그 기본값이
+    // OFF다 — 즉 이 테스트들은 "개발자가 재미 모드를 켜 둔 머신"에서만 통과하고 깨끗한 환경에선
+    // 전부 실패했다(CI 도입 후 실제로 드러난 문제). 실제 사용자 설정을 save/restore하며 명시적으로
+    // 켜서, 머신 상태와 무관하게 항상 같은 결과가 나오게 한다(이 파일의 moodGlyphTheme 테스트와
+    // 동일한 관례).
+    // (defer를 쓸 수 없다 — runSelfTests()는 exit()로 끝나 defer가 실행되지 않는다. 구간 끝에서
+    // 명시적으로 되돌린다.)
+    let savedMoodIconEnabled = TitleSettings.isFunModeFeatureEnabled(.moodIcon)
+    TitleSettings.setFunModeFeatureEnabled(.moodIcon, true)
+
     let flickerApp = ClaudeMonitorApp()
     flickerApp.applyMood(.hot)
     check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: 동적 tier(hot) 진입 시 타이머 시작")
@@ -4919,6 +4930,17 @@ func runSelfTests() -> Never {
     check(flickerApp.flameFlickerTimer != nil,
           "setMoodAnimationSuspended(false): 깨어나면 동적 tier에서 타이머 재시작")
     check(flickerApp.moodAnimationSuspended == false, "setMoodAnimationSuspended: 상태 플래그 왕복")
+
+    // 무드 아이콘 토글이 꺼져 있으면 tier와 무관하게 타이머가 돌지 않아야 한다 — 위에서 강제로
+    // 켜 둔 김에 그 반대 방향도 함께 고정한다(재미 모드 OFF 사용자에게 5Hz 타이머가 새지 않음).
+    TitleSettings.setFunModeFeatureEnabled(.moodIcon, false)
+    let funOffApp = ClaudeMonitorApp()
+    funOffApp.applyMood(.critical)
+    check(funOffApp.flameFlickerTimer == nil,
+          "syncFlameFlickerTimer: 재미 모드(무드 아이콘) OFF면 동적 tier여도 타이머가 돌지 않음")
+    funOffApp.flameFlickerTimer?.invalidate()
+
+    TitleSettings.setFunModeFeatureEnabled(.moodIcon, savedMoodIconEnabled)  // 실제 사용자 설정 복원
     flickerApp.flameFlickerTimer?.invalidate()
 
     // flame 전용 구간 종료 — 실제 사용자가 골라둔 테마로 복원(키 자체가 없었다면 제거).
@@ -5351,14 +5373,24 @@ func runSelfTests() -> Never {
         let wireExceeded = RateLimitWindow(usedPercentage: 100.0, resetsAt: Int(wireNow.timeIntervalSince1970) + 3600)
         wireApp.cachedRateLimits = RateLimitsCache(fiveHour: wireExceeded, sevenDay: nil)
         wireApp.cachedAll = []
-        let idleData = wireApp.makeBlockDisplayData(fromEntries: [], reader: wireApp.reader, now: wireNow)
+        // reader는 반드시 projects 디렉터리가 **존재하는** 홈을 가리켜야 한다. makeBlockDisplayData
+        // (fromEntries:)는 "엔트리 0개 + projects 디렉터리 없음"을 .noData로 조기 반환하는데, 그러면
+        // rateLimitReset이 채워지기 전에 빠져나가 이 테스트가 검증하려는 배선을 아예 타지 않는다.
+        // 예전엔 실제 홈(wireApp.reader)을 써서 "개발자 머신에는 ~/.claude/projects가 있다"는 우연에
+        // 기대고 있었고, 그래서 CI 같은 깨끗한 환경에서만 실패했다.
+        let wireHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeMonitorSelfTest.wire.\(UUID().uuidString)")
+        let wireReader = UsageDataReader(homeDir: wireHome)
+        try? FileManager.default.createDirectory(at: wireReader.projectsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: wireHome) }
+        let idleData = wireApp.makeBlockDisplayData(fromEntries: [], reader: wireReader, now: wireNow)
         check(idleData.rateLimitReset == wireExceeded.resetsAtDate,
               "makeBlockDisplayData(fromEntries:): 활성 블록 없음 + 한도 도달 캐시 신선 → rateLimitReset 채워짐")
 
         let activeEntry = UsageEntry(timestamp: wireNow, model: "claude-sonnet-5",
                                       inputTokens: 0, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0,
                                       sessionId: "s1", uuid: "u1")
-        let activeData = wireApp.makeBlockDisplayData(fromEntries: [activeEntry], reader: wireApp.reader, now: wireNow)
+        let activeData = wireApp.makeBlockDisplayData(fromEntries: [activeEntry], reader: wireReader, now: wireNow)
         check(activeData.rateLimitReset == nil,
               "makeBlockDisplayData(fromEntries:): 활성 블록이 있으면 한도 도달 캐시가 신선해도 rateLimitReset은 nil")
     }
