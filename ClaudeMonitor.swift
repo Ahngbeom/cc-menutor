@@ -2341,6 +2341,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var coldStartDotPhase = 0  // 0...3, 표시 폭 고정을 위해 미표시 구간은 공백으로 패딩
     private var coldStartFlameIndex = 0  // MoodTier.allCases(5개) 순환 인덱스 — coldStartDotPhase(mod 4)와 별개로 둬야 critical(인덱스 4)에도 도달한다
     private(set) var flameFlickerTimer: Timer?  // 동적 tier(moodIconAnimates 참고)에서만 syncFlameFlickerTimer()가 시작/중지한다
+    // 화면 절전/잠금/사용자 전환 중이면 true — 아무도 못 보는 애니메이션에 프레임당 ~20ms를 쓰지
+    // 않도록 타이머를 멈추는 스위치(installPowerAndVisibilityObservers 참고).
+    private(set) var moodAnimationSuspended = false
     private var lastMoodTier: MoodTier?  // 흔들림 타이머가 재사용할, 가장 최근 refresh에서 계산된 tier
     private(set) var idleFlameCycleTimer: Timer?  // 유휴 상태 + 메뉴 열림일 때만 syncIdleFlameCycleTimer()가 시작/중지한다
     private(set) var idleFlameCycleIndex: Int = 0  // MoodTier.allCases 상의 현재 순환 프레임
@@ -2354,9 +2357,69 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         startColdStartAnimation()
+        installPowerAndVisibilityObservers()
 
         refresh()
         rescheduleTimer()
+    }
+
+    // 화면이 잠들거나(디스플레이 절전/시스템 슬립/화면 잠금/사용자 전환) 저전력 모드에 들어가면
+    // 무드 아이콘 애니메이션을 멈춘다.
+    //
+    // 왜 필요한가: 5Hz 흔들림은 프레임마다 statusItem.button.image에 대입하는데, 그 대입 한 번이
+    // AppKit으로 하여금 상태바 스냅샷 전체를 오프스크린 비트맵으로 다시 뜨게 하고(Control Center
+    // 복제본 갱신 포함) 그 과정에서 **이미지만 바뀌었는데도 타이틀 텍스트를 CoreText로 전체
+    // 재조판**하게 만든다. 샘플링 프로파일 기준 프레임당 약 20ms로, 상시 CPU 8.7%의 사실상 전부가
+    // 여기였다. 반면 아이콘을 실제로 그리는 비용은 프레임당 0.05ms에 불과하다 — 즉 드로잉을
+    // 최적화해도 소용이 없고 **대입 횟수를 줄이는 것만이** 효과가 있다.
+    // 아무도 볼 수 없는 동안 그 비용을 계속 내는 건 순수한 배터리 낭비다.
+    private func installPowerAndVisibilityObservers() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        let suspendEvents: [Notification.Name] = [
+            NSWorkspace.screensDidSleepNotification,      // 디스플레이 절전
+            NSWorkspace.willSleepNotification,            // 시스템 슬립
+            NSWorkspace.sessionDidResignActiveNotification, // 빠른 사용자 전환으로 세션이 뒤로 감
+        ]
+        let resumeEvents: [Notification.Name] = [
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification,
+        ]
+        for name in suspendEvents {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.setMoodAnimationSuspended(true)
+            }
+        }
+        for name in resumeEvents {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.setMoodAnimationSuspended(false)
+            }
+        }
+        // 화면 잠금은 NSWorkspace가 아니라 분산 알림으로 온다(공개 상수는 없지만 오래 쓰인 이름).
+        // 못 받아도 기능이 깨지진 않고 이 최적화만 놓친다 — 그래서 실패해도 무시 가능한 추가분이다.
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(forName: Notification.Name("com.apple.screenIsLocked"),
+                                object: nil, queue: .main) { [weak self] _ in
+            self?.setMoodAnimationSuspended(true)
+        }
+        distributed.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"),
+                                object: nil, queue: .main) { [weak self] _ in
+            self?.setMoodAnimationSuspended(false)
+        }
+        // 저전력 모드 토글은 타이머 조건에 바로 반영한다(syncFlameFlickerTimer가 매번 다시 읽는다).
+        NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.syncFlameFlickerTimer()
+        }
+    }
+
+    func setMoodAnimationSuspended(_ suspended: Bool) {
+        guard moodAnimationSuspended != suspended else { return }
+        moodAnimationSuspended = suspended
+        syncFlameFlickerTimer()
+        // 재개 시엔 다음 틱(최대 0.2초)을 기다리지 않고 즉시 한 프레임 그려, 깨어난 직후 아이콘이
+        // 멈춘 포즈로 남아 있는 것처럼 보이지 않게 한다.
+        if !suspended { refreshFlameFlicker() }
     }
 
     // 콜드 스타트 동안만 타이틀/메뉴 헤더에 점 순환("불러오는 중.", "..", "...")을 보여준다. 수동/자동
@@ -2418,9 +2481,15 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 갱신 주기 변경 시 기존 타이머를 무효화하고 새 간격으로 재스케줄
     func rescheduleTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: RefreshSettings.interval().rawValue, repeats: true) { [weak self] _ in
+        let interval = RefreshSettings.interval().rawValue
+        let t = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        // 사용량 표시는 몇 초 늦어도 아무 상관이 없다. tolerance를 주면 커널이 이 타이머를 다른
+        // wakeup과 묶어(coalescing) 처리해 유휴 전력 소모가 줄어든다 — 기본값 0은 "정확히 이 시각에
+        // 깨워라"라 매번 단독 wakeup을 강제한다. 주기의 10%(30초 → 3초)면 체감 차이가 없다.
+        t.tolerance = interval * 0.1
+        timer = t
     }
 
     // 읽기는 백그라운드 큐에서, UI 갱신은 메인 큐에서 수행.
@@ -2589,17 +2658,21 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshFlameFlicker() {
         let theme = TitleSettings.moodGlyphTheme()
         guard TitleSettings.isFunModeFeatureEnabled(.moodIcon),
+              !moodAnimationSuspended,
               let tier = lastMoodTier,
               moodIconAnimates(theme: theme, tier: tier) else { return }
-        statusItem.button?.image = currentMoodImage(theme: theme, tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
+        statusItem?.button?.image = currentMoodImage(theme: theme, tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
     }
 
-    // 무드 아이콘 on + 현재 선택된 테마가 애니메이션 단계일 때만 타이머를 돌린다. 그 외 조건에서는
-    // 타이머 자체를 멈춰 무의미한 5Hz 백그라운드 깨어남을 없앤다. refreshFlameFlicker()의 기존
-    // 가드는 안전망(방어적 이중 체크)으로 그대로 둔다.
-    private func syncFlameFlickerTimer() {
+    // 무드 아이콘 on + 현재 선택된 테마가 애니메이션 단계 + 화면이 켜져 있고 저전력 모드가 아닐 때만
+    // 타이머를 돌린다. 그 외 조건에서는 타이머 자체를 멈춰 무의미한 5Hz 깨어남을 없앤다
+    // (프레임당 비용이 큰 이유는 installPowerAndVisibilityObservers 주석 참고).
+    // refreshFlameFlicker()의 기존 가드는 안전망(방어적 이중 체크)으로 그대로 둔다.
+    func syncFlameFlickerTimer() {
         let theme = TitleSettings.moodGlyphTheme()
         let shouldRun = TitleSettings.isFunModeFeatureEnabled(.moodIcon)
+            && !moodAnimationSuspended
+            && !ProcessInfo.processInfo.isLowPowerModeEnabled
             && (lastMoodTier.map { moodIconAnimates(theme: theme, tier: $0) } ?? false)
         if shouldRun {
             guard flameFlickerTimer == nil else { return }
@@ -4742,6 +4815,20 @@ func runSelfTests() -> Never {
     check(flickerApp.flameFlickerTimer == nil, "syncFlameFlickerTimer: 정적 tier(idle)로 돌아가면 타이머 중지")
     flickerApp.applyMood(.critical)
     check(flickerApp.flameFlickerTimer != nil, "syncFlameFlickerTimer: critical에서도 타이머 시작")
+
+    // 화면 절전/잠금 중에는 애니메이션 타이머가 반드시 멈춰야 한다. 프레임당 statusItem 이미지
+    // 대입이 AppKit 상태바 스냅샷 전체 재생성(+타이틀 CoreText 재조판)을 유발해 프레임당 약 20ms가
+    // 드는데, 아무도 못 보는 동안 그걸 계속 내면 순수 배터리 낭비다(상시 CPU 8.7%의 원인).
+    flickerApp.setMoodAnimationSuspended(true)
+    check(flickerApp.flameFlickerTimer == nil,
+          "setMoodAnimationSuspended(true): 화면 절전/잠금 중엔 흔들림 타이머 정지")
+    flickerApp.applyMood(.hot)
+    check(flickerApp.flameFlickerTimer == nil,
+          "setMoodAnimationSuspended(true): 정지 상태에선 tier가 바뀌어도 타이머가 되살아나지 않음")
+    flickerApp.setMoodAnimationSuspended(false)
+    check(flickerApp.flameFlickerTimer != nil,
+          "setMoodAnimationSuspended(false): 깨어나면 동적 tier에서 타이머 재시작")
+    check(flickerApp.moodAnimationSuspended == false, "setMoodAnimationSuspended: 상태 플래그 왕복")
     flickerApp.flameFlickerTimer?.invalidate()
 
     // flame 전용 구간 종료 — 실제 사용자가 골라둔 테마로 복원(키 자체가 없었다면 제거).
