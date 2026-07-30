@@ -51,6 +51,8 @@ tail -f ~/.cc-menutor.log   # LaunchAgent 실행 시 stdout/stderr 로그
   - 조회 스케줄링은 `refresh()`의 메인 큐 완료 지점에 편승하되 파이프라인을 블로킹하지 않는다(`URLSession`은 비동기라 `.utility` 블록에 동기로 끼울 수 없다). 성공 시 1시간, **실패 시 5분 백오프**가 필수다 — 없으면 새로고침 주기 10초를 쓰는 오프라인 사용자가 분당 6회 실패 요청을 낸다. 실패 시 `cachedExchangeRate`는 손대지 않는다(`StatsCacheReader`의 "디코드 실패 시 캐시 오염 방지"와 같은 원칙).
   - stale 배너는 `baseDate`가 아니라 `fetchedAt` 기준으로 판단한다 — ECB 환율은 주말·공휴일에 **정상적으로** 직전 영업일 값이라, `baseDate`로 판단하면 주말마다 거짓 경고가 뜬다.
   - 셀프테스트가 `.standard`를 건드릴 때는 `CurrencySettings.currency()`가 아니라 `object(forKey: "displayCurrency")`로 백업한다 — 전자는 "키 없음"과 "usd 저장됨"을 구분할 수 없어 복원 시 없던 키를 만들어내 **사용자 도메인을 오염시킨다**(실제로 한 번 발생했다).
+- **셀프테스트의 "격리된 suite"는 인자 도메인으로부터 격리되지 않는다.** `UserDefaults(suiteName:)` 인스턴스도 검색 목록 맨 앞에 `NSArgumentDomain`을 두므로, 번들 없는 이 바이너리를 `./cc-menutor --test -someKey value` 로 실행하면 그 키를 읽는 **격리 suite 단정까지 덮인다**(`-AppleLocale`처럼 설정 키를 인자로 주입하는 검증 방식과 정면으로 부딪히는 지점). 키 이름이 전달된 인자와 겹칠 때만 드러나므로 대부분의 기존 테스트는 우연히 무사하다. 통화 테스트는 `UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)`으로 덮임 여부를 먼저 확인하고(`currencyArgOverridden`) 관련 단정을 건너뛴다.
+  - 더 위험한 쪽은 `.standard`를 건드리는 구간이다: `object(forKey:)`가 인자 도메인 값까지 읽으므로 그 값을 복원 단계에서 되쓰면 **메모리에만 있던 값이 영속 도메인으로 세탁되어 디스크에 기록된다**(인자 도메인은 원래 디스크에 남지 않는다). 게다가 진짜 저장값은 가려져 읽을 수조차 없어 안전한 복원이 불가능하다 — 그래서 건너뛰는 것이 유일하게 옳은 처리다. 새 설정 키에 대해 `.standard` 기반 테스트를 추가할 때 같은 가드를 넣을 것.
 - LaunchAgent plist는 `install.sh`가 바이너리 **절대경로를 박아** 생성한다. 바이너리 위치를 옮기면 재설치 필요.
 - **바이너리/프로세스명은 `cc-menutor`** (구버전 `ClaudeMonitor`에서 리브랜딩). 번들 ID 없는 bare 실행 파일이라
   `UserDefaults.standard` 도메인이 바이너리명에서 자동 파생되므로, 바이너리명을 다시 바꾸면 설정 도메인도 같이

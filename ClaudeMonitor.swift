@@ -4730,9 +4730,23 @@ func runSelfTests() -> Never {
     check(ExchangeRateFetcher.endpoint.scheme == "https",
           "ExchangeRateFetcher: 엔드포인트는 https")
 
+    // `--test -displayCurrency krw`처럼 인자 도메인이 이 키를 덮고 있으면 displayCurrency를 읽는
+    // 단정들을 건너뛴다. 두 가지 이유가 있고 둘 다 이 저장소의 기존 관용구로는 못 피한다:
+    //  ① UserDefaults(suiteName:)는 **인자 도메인으로부터 격리되지 않는다** — suite 인스턴스도
+    //     검색 목록 맨 앞에 NSArgumentDomain을 두므로 "기본값은 .usd" 같은 단정이 깨진다.
+    //  ② `.standard`를 건드리는 구간에서는 object(forKey:)가 인자 도메인 값까지 읽으므로, 그 값을
+    //     복원 단계에서 되쓰면 **메모리에만 있던 값이 영속 도메인으로 세탁되어 디스크에 기록**된다
+    //     (인자 도메인은 원래 디스크에 남지 않는다). 게다가 진짜 저장값은 가려져 읽을 수조차 없어
+    //     안전하게 복원할 방법이 없다.
+    let currencyArgOverridden =
+        UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["displayCurrency"] != nil
+    if currencyArgOverridden {
+        check(true, "통화: 인자 도메인이 displayCurrency를 덮고 있어 관련 단정을 건너뜀")
+    }
+
     // CurrencySettings — 격리 suite 왕복
     let currencySuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
-    if let cud = UserDefaults(suiteName: currencySuite) {
+    if let cud = UserDefaults(suiteName: currencySuite), !currencyArgOverridden {
         check(CurrencySettings.currency(defaults: cud) == .usd,
               "CurrencySettings: 기본값 .usd — 설치 직후 네트워크 요청 0회(옵트인)")
         CurrencySettings.setCurrency(.krw, defaults: cud)
@@ -4742,7 +4756,9 @@ func runSelfTests() -> Never {
         cud.set("bogus", forKey: "displayCurrency")
         check(CurrencySettings.currency(defaults: cud) == .usd, "CurrencySettings: 알 수 없는 값은 .usd로 폴백")
         cud.removePersistentDomain(forName: currencySuite)
-    } else { check(false, "CurrencySettings: 전용 UserDefaults suite 생성 성공해야 함") }
+    } else if !currencyArgOverridden {
+        check(false, "CurrencySettings: 전용 UserDefaults suite 생성 성공해야 함")
+    }
 
     // ExchangeRateStore — 격리 suite 왕복
     let fxSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
@@ -5132,6 +5148,8 @@ func runSelfTests() -> Never {
         // (ResetAnchorSettings와 동일한 기존 관례) 실제 값을 save/restore한다.
         // CurrencySettings.currency()가 아니라 object(forKey:)로 백업한다 — 전자는 "키 없음"과
         // "usd 저장됨"을 구분할 수 없어 복원 시 없던 키를 만들어낸다(테스트가 사용자 도메인을 오염).
+        // currencyArgOverridden(위 통화 테스트 구간에서 계산)이면 건너뛴다 — 이유는 그쪽 주석 참고.
+        if !currencyArgOverridden {
         let savedCurrencyRaw = UserDefaults.standard.object(forKey: "displayCurrency")
         CurrencySettings.setCurrency(.krw)
         app.cachedExchangeRate = ExchangeRate(rate: 1452.35, baseDate: "2026-06-29", fetchedAt: testNow)
@@ -5162,6 +5180,7 @@ func runSelfTests() -> Never {
         } else { check(false, "달러 모드: makeTitleContext non-nil이어야 함") }
         if let v = savedCurrencyRaw { UserDefaults.standard.set(v, forKey: "displayCurrency") }
         else { UserDefaults.standard.removeObject(forKey: "displayCurrency") }
+        }  // currencyArgOverridden else
 
         if let s = savedAnchor { ResetAnchorSettings.setAnchor(s) } else { ResetAnchorSettings.clearAnchor() }
     } else {
