@@ -748,15 +748,19 @@ struct UsageEntry {
     }
 }
 
-// message.id + requestId 우선, 그중 하나만 있으면 message.id, 둘 다 없으면 uuid, 전부 없으면
-// nil(dedupe 미대상). Claude Code가 세션을 fork/resume할 때 이전 턴을 새 세션ID의 새 파일로
-// 복사하며 uuid는 "보통 있지만 항상 보존되진 않는" 반면 message.id/requestId는 항상 함께
-// 다니므로, uuid 단독 키보다 견고하다.
-func buildUsageDedupeKey(messageId: String?, requestId: String?, uuid: String) -> String? {
-    if let mid = messageId, !mid.isEmpty {
-        if let rid = requestId, !rid.isEmpty { return "\(mid):\(rid)" }
-        return "msg:\(mid)"
-    }
+// message.id가 있으면 그것만으로 키를 만들고, 없으면 uuid, 둘 다 없으면 nil(dedupe 미대상).
+// Claude Code가 세션을 fork/resume할 때 이전 턴을 새 세션ID의 새 파일로 복사하며 uuid는 "보통
+// 있지만 항상 보존되진 않는" 반면 message.id는 그 턴을 만든 API 응답의 ID라 복제본 사이에서도
+// 동일하므로, uuid 단독 키보다 견고하다.
+//
+// requestId를 키에 섞지 않는 이유: 그러면 같은 message.id가 requestId 유무에 따라 서로 다른
+// 키("mid:rid" vs "msg:mid")로 갈라져 **한 턴이 두 번 집계된다**. 실데이터(1,413파일·46,287키)
+// 전수 대조 결과 (a) 한 message.id가 서로 다른 requestId를 갖는 경우 0건이라 requestId는 변별력을
+// 전혀 더하지 못하고, (b) 이 단순화 전후로 엔트리 수·토큰 합계·모델별 합계·추정 비용이 완전히
+// 동일하다. 즉 현재 데이터에서는 무해한 하드닝이고, requestId가 누락된 로그가 섞여 들어오는
+// 순간에만 차이가 난다(그때 예전 키는 조용히 이중 집계했다).
+func buildUsageDedupeKey(messageId: String?, uuid: String) -> String? {
+    if let mid = messageId, !mid.isEmpty { return "msg:\(mid)" }
     if !uuid.isEmpty { return "uuid:\(uuid)" }
     return nil
 }
@@ -784,11 +788,29 @@ class UsageDataReader {
 
     // 파일 경로별 증분 캐시 상태
     struct FileCacheState {
-        var size: UInt64       // 마지막으로 읽은 시점의 파일 크기
+        var size: UInt64       // 마지막으로 **성공적으로 소비한** 시점의 파일 크기
         var offset: UInt64     // 마지막 완전한 개행까지의 바이트 오프셋
         var entries: [UsageEntry]
+        // 읽기 실패 재시도 상태 — 읽기에 성공하면 항상 초기값으로 리셋된다(성공 경로가 이 struct를
+        // 통째로 새로 만들기 때문). readFailures > 0 인 동안에만 아래 세 필드가 의미를 갖는다.
+        var readFailures: Int = 0
+        var failedAtSize: UInt64 = 0   // 마지막 실패를 관측한 시점의 파일 크기
+        var retryAfter: Date? = nil
     }
     private var fileCache: [String: FileCacheState] = [:]
+
+    // 읽기 실패 재시도 정책. 영구히 못 읽는 파일(권한 없음 등)을 매 사이클 두드리지 않도록 지수
+    // 백오프를 걸고, 그래도 안 되면 포기해 "파일이 다시 자랄 때까지 대기"라는 원래 상태로 돌린다.
+    static let maxReadFailures = 6
+    static let baseRetryDelay: TimeInterval = 15   // refresh 주기(30초)보다 짧아 첫 재시도는 바로 다음 사이클
+    static let maxRetryDelay: TimeInterval = 600
+
+    // 연속 n회 실패 뒤 다음 재시도까지 기다릴 시간(15s → 30 → 60 → … → 최대 10분). 순수 함수.
+    static func retryDelay(consecutiveFailures n: Int) -> TimeInterval {
+        guard n >= 1 else { return 0 }
+        let exponent = min(n - 1, 8)   // 지수 폭주로 Double이 inf가 되는 것 방지
+        return min(baseRetryDelay * pow(2, Double(exponent)), maxRetryDelay)
+    }
 
     // 이번 readAll() 호출에서 파일이 하나라도 바뀌었는지 — false면 cachedEntries가 직전 호출과
     // 완전히 동일하다는 뜻이므로, 호출부(refresh())가 cachedAll 기반 전체 재계산(스트릭/마일스톤)을
@@ -802,7 +824,8 @@ class UsageDataReader {
     var projectsDir: URL { homeDir.appendingPathComponent(".claude/projects") }
 
     // 변경된 파일의 신규 줄만 읽어 누적. 메인스레드 외(백그라운드 큐)에서 호출됨.
-    func readAll() -> [UsageEntry] {
+    // now는 읽기 실패 백오프 판정에만 쓰인다(셀프테스트에서 시간을 앞당기기 위해 주입 가능).
+    func readAll(now: Date = Date()) -> [UsageEntry] {
         let fm = FileManager.default
         guard fm.fileExists(atPath: projectsDir.path) else {
             fileCache.removeAll()
@@ -832,21 +855,51 @@ class UsageDataReader {
             present.insert(path)
 
             let size = UInt64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            let cached = fileCache[path]
 
             // 크기 동일 → 변경 없음, 캐시 재사용 (파일 미오픈)
-            if let cached = fileCache[path], cached.size == size { continue }
+            if let cached = cached, cached.size == size { continue }
 
-            didChange = true
+            // 직전 읽기가 실패했고 그 뒤로 크기가 그대로면 백오프/포기 정책을 적용한다. 크기가
+            // 달라졌다면 파일이 자라는 중이라는 뜻이므로(예: 쓰다 만 부분 줄이 완성됐을 수 있다)
+            // 실패 이력을 무시하고 즉시 재시도한다 — 활발히 쓰이는 세션 파일이 백오프에 걸려
+            // 사용량 표시가 몇 분씩 늦어지는 일을 막는다.
+            if var stale = cached, stale.readFailures > 0, stale.failedAtSize == size {
+                if stale.readFailures >= Self.maxReadFailures {
+                    // 포기: 관측된 크기를 받아들여 "파일이 다시 자랄 때까지 대기" 상태로 되돌린다.
+                    // offset은 보존되므로 나중에 파일이 자라면 놓친 구간부터 다시 읽어 회수된다.
+                    stale.size = size
+                    stale.readFailures = 0
+                    stale.retryAfter = nil
+                    fileCache[path] = stale
+                    continue
+                }
+                if let retryAfter = stale.retryAfter, now < retryAfter { continue }
+            }
+
             let sessionId = fileURL.deletingPathExtension().lastPathComponent
+            // 증분(이전 오프셋부터 신규 줄만) vs 전체 재읽기(신규 파일 또는 트렁케이트/로테이션)
+            let isIncremental = (cached.map { size > $0.size } ?? false)
+            let fromOffset = isIncremental ? (cached?.offset ?? 0) : 0
+            let priorEntries = isIncremental ? (cached?.entries ?? []) : []
 
-            if let cached = fileCache[path], size > cached.size {
-                // 증분: 이전 오프셋부터 신규 줄만 파싱
-                let (newEntries, newOffset) = entries(in: fileURL, fromOffset: cached.offset, sessionId: sessionId)
-                fileCache[path] = FileCacheState(size: size, offset: newOffset, entries: cached.entries + newEntries)
-            } else {
-                // 신규 파일 또는 트렁케이트/로테이션 → 전체 재읽기
-                let (all, newOffset) = entries(in: fileURL, fromOffset: 0, sessionId: sessionId)
-                fileCache[path] = FileCacheState(size: size, offset: newOffset, entries: all)
+            switch entries(in: fileURL, fromOffset: fromOffset, sessionId: sessionId) {
+            case let .consumed(newEntries, newOffset):
+                didChange = true
+                fileCache[path] = FileCacheState(size: size, offset: newOffset,
+                                                 entries: priorEntries + newEntries)
+            case .notConsumed:
+                // size를 **기록하지 않는다**. 기록하면 다음 사이클의 `cached.size == size` 스킵에
+                // 걸려 이 실패가 굳어버린다(그 파일이 또 자라거나 앱을 재시작할 때까지 회수 불가).
+                // didChange도 건드리지 않는다: 병합 입력이 하나도 안 바뀌었으므로 전역 재병합이
+                // 불필요할 뿐 아니라, 매 사이클 true로 고착되면 라이프타임 엔트리 O(N log N) 정렬이
+                // 30초마다 되살아나 스킵 최적화가 통째로 무효화된다.
+                var next = cached ?? FileCacheState(size: 0, offset: 0, entries: [])
+                next.readFailures = (cached?.failedAtSize == size ? next.readFailures : 0) + 1
+                next.failedAtSize = size
+                next.retryAfter = now.addingTimeInterval(
+                    Self.retryDelay(consecutiveFailures: next.readFailures))
+                fileCache[path] = next
             }
         }
 
@@ -866,9 +919,22 @@ class UsageDataReader {
         // 전역 병합 + dedupeKey 기준 중복 제거(키 없으면 dedupe 대상 아님). 같은 키가 재등장하면
         // discard-first가 아니라 토큰 필드 max 병합 — 스트리밍 partial usage 갱신이나 세션
         // fork/resume로 다른 파일에 복제된 동일 턴을 모두 견고하게 처리한다(mergeUsageEntriesByMaxTokens 참고).
+        // 파일 경로 오름차순으로 순회한다 — Swift Dictionary의 순회 순서는 프로세스마다 달라지는
+        // 해시 시드에 의존해 비결정적인데, mergeUsageEntriesByMaxTokens가 토큰은 max로(순서 무관)
+        // 병합하면서 timestamp/model은 **먼저 관측된 쪽**을 유지하기 때문에, 같은 턴이 여러 파일에
+        // 복제되면(fork/resume) 어느 파일을 먼저 읽었는지가 결과에 새어 나온다.
+        //
+        // 지금 데이터에서 이게 실제로 관측되지는 않는다: 실측 46,287키 중 여러 파일에 걸친 중복은
+        // 450건인데 그 450건 모두 파일마다 **동일한** timestamp/model을 기여해, 순서를 바꿔도 결과가
+        // 같다(수정 전 바이너리를 6회 돌려도 전 엔트리 timestamp 합이 불변임을 확인). 파일 **내부**
+        // 중복(스트리밍 중 부분 usage가 여러 줄로 기록 — 34,867건)은 timestamp가 갈리지만 줄 순서가
+        // 곧 순회 순서라 원래부터 결정적이다. 따라서 이 한 줄은 "지금 나는 버그" 수정이 아니라,
+        // 복제본이 서로 다른 timestamp를 갖게 되는 순간 조용히 실행마다 다른 값을 내놓게 될 잠재
+        // 비결정성을 미리 없애는 것이다.
         var indexByKey: [String: Int] = [:]
         var merged: [UsageEntry] = []
-        for state in fileCache.values {
+        for path in fileCache.keys.sorted() {
+            guard let state = fileCache[path] else { continue }
             for e in state.entries {
                 guard let key = e.dedupeKey else {
                     merged.append(e)
@@ -887,21 +953,30 @@ class UsageDataReader {
         return merged
     }
 
+    // entries(in:)의 결과. "0줄을 읽었다"와 "읽지 못했다"를 반드시 구분해야 한다 — 호출부가
+    // 후자에서 파일 크기를 기록해버리면 그 시점의 미읽은 구간이 사실상 유실되기 때문이다.
+    private enum FileReadOutcome {
+        case consumed(entries: [UsageEntry], newOffset: UInt64)
+        // 열기/seek/읽기 실패, 또는 아직 완전한 줄(개행)이 없어 소비할 것이 없는 경우.
+        // 호출부 입장에서 대응이 같으므로(크기 미기록 + 재시도 예약) 한 케이스로 합친다.
+        case notConsumed
+    }
+
     // fromOffset부터 끝까지 읽되, 마지막 완전한 개행까지만 소비하고 그 오프셋을 반환.
     // 쓰는 중인 마지막 부분 줄은 다음 주기로 미룬다.
-    private func entries(in url: URL, fromOffset: UInt64, sessionId: String) -> (entries: [UsageEntry], newOffset: UInt64) {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return ([], fromOffset) }
+    private func entries(in url: URL, fromOffset: UInt64, sessionId: String) -> FileReadOutcome {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .notConsumed }
         defer { try? handle.close() }
-        do { try handle.seek(toOffset: fromOffset) } catch { return ([], fromOffset) }
+        do { try handle.seek(toOffset: fromOffset) } catch { return .notConsumed }
 
-        let data = (try? handle.readToEnd()) ?? Data()
-        guard !data.isEmpty, let lastNL = data.lastIndex(of: 0x0A) else {
-            return ([], fromOffset)  // 완전한 줄 없음 → 대기
+        guard let data = try? handle.readToEnd(), !data.isEmpty,
+              let lastNL = data.lastIndex(of: 0x0A) else {
+            return .notConsumed  // 읽기 실패 또는 완전한 줄 없음 → 대기 후 재시도
         }
         let consumed = data[...lastNL]                 // 개행 포함
         let text = String(decoding: consumed, as: UTF8.self)
         let newOffset = fromOffset + UInt64(consumed.count)
-        return (parseLines(text, sessionId: sessionId), newOffset)
+        return .consumed(entries: parseLines(text, sessionId: sessionId), newOffset: newOffset)
     }
 
     private func parseLines(_ content: String, sessionId: String) -> [UsageEntry] {
@@ -935,9 +1010,7 @@ class UsageDataReader {
             let cacheWrite1h = cacheCreationBreakdown?["ephemeral_1h_input_tokens"] as? Int ?? 0
 
             let uuidStr = json["uuid"] as? String ?? ""
-            let messageId = message["id"] as? String
-            let requestId = json["requestId"] as? String
-            let dedupeKey = buildUsageDedupeKey(messageId: messageId, requestId: requestId, uuid: uuidStr)
+            let dedupeKey = buildUsageDedupeKey(messageId: message["id"] as? String, uuid: uuidStr)
 
             let entry = UsageEntry(
                 timestamp: timestamp,
@@ -4312,17 +4385,29 @@ func runSelfTests() -> Never {
     check(abs(eCacheMixed.cost - 4.65) < 1e-6,
           "cost: 캐시 쓰기 합계 중 1시간분은 2배, 나머지 5분분은 1.25배 단가로 각각 계산")
 
-    // buildUsageDedupeKey — message.id:requestId 계층 (순수 함수)
-    check(buildUsageDedupeKey(messageId: "msg_1", requestId: "req_1", uuid: "u") == "msg_1:req_1",
-          "dedupeKey: message.id+requestId 둘 다 있으면 그 조합이 우선")
-    check(buildUsageDedupeKey(messageId: "msg_1", requestId: nil, uuid: "u") == "msg:msg_1",
-          "dedupeKey: requestId 없으면 msg:{id}로 폴백")
-    check(buildUsageDedupeKey(messageId: nil, requestId: "req_1", uuid: "u") == "uuid:u",
-          "dedupeKey: requestId만 있고 messageId 없으면 uuid로 폴백(requestId 단독 신뢰 안 함)")
-    check(buildUsageDedupeKey(messageId: nil, requestId: nil, uuid: "u") == "uuid:u",
-          "dedupeKey: message.id도 없으면 uuid로 최종 폴백")
-    check(buildUsageDedupeKey(messageId: nil, requestId: nil, uuid: "") == nil,
+    // buildUsageDedupeKey — message.id → uuid 계층 (순수 함수)
+    check(buildUsageDedupeKey(messageId: "msg_1", uuid: "u") == "msg:msg_1",
+          "dedupeKey: message.id가 있으면 그것만으로 키를 만든다")
+    check(buildUsageDedupeKey(messageId: "msg_1", uuid: "") ==
+          buildUsageDedupeKey(messageId: "msg_1", uuid: "other"),
+          "dedupeKey: 같은 message.id면 uuid가 달라도 같은 키(fork/resume 복제본 병합의 전제)")
+    check(buildUsageDedupeKey(messageId: nil, uuid: "u") == "uuid:u",
+          "dedupeKey: message.id가 없으면 uuid로 폴백")
+    check(buildUsageDedupeKey(messageId: "", uuid: "u") == "uuid:u",
+          "dedupeKey: 빈 message.id는 없는 것으로 취급")
+    check(buildUsageDedupeKey(messageId: nil, uuid: "") == nil,
           "dedupeKey: 전부 없으면 nil(기존 '빈 uuid는 dedupe 대상 아님'과 동일)")
+
+    // UsageDataReader.retryDelay — 지수 백오프가 단조 증가하고 상한에서 멈추는지 (순수 함수)
+    check(UsageDataReader.retryDelay(consecutiveFailures: 1) == UsageDataReader.baseRetryDelay,
+          "retryDelay: 첫 실패는 기본 지연(=refresh 주기보다 짧아 바로 다음 사이클에 재시도)")
+    check(UsageDataReader.retryDelay(consecutiveFailures: 2) ==
+          UsageDataReader.baseRetryDelay * 2,
+          "retryDelay: 실패마다 2배로 증가")
+    check(UsageDataReader.retryDelay(consecutiveFailures: 99) == UsageDataReader.maxRetryDelay,
+          "retryDelay: 상한(10분)에서 포화 — 지수 폭주로 inf가 되지 않는다")
+    check(UsageDataReader.retryDelay(consecutiveFailures: 0) == 0,
+          "retryDelay: 실패 0회면 대기 없음")
 
     // mergeUsageEntriesByMaxTokens — 토큰 필드는 max, 그 외 필드는 첫 엔트리 유지 (순수 함수)
     let mergeA = entry(Date(timeIntervalSince1970: 0), "claude-sonnet-4-5", out: 100)
@@ -5408,6 +5493,125 @@ func runSelfTests() -> Never {
               "readAll: 복제된 턴 중 더 완전한(큰) usage 값이 max 병합으로 남는다")
 
         try? FileManager.default.removeItem(at: forkHome)
+    }
+
+    // UsageDataReader.readAll() — 전역 병합 순서 결정성. 같은 message.id가 여러 파일에 복제돼
+    // 있으면 mergeUsageEntriesByMaxTokens가 **먼저 관측된 쪽**의 timestamp/model을 남기므로,
+    // Dictionary 순회 순서(프로세스마다 다른 해시 시드)에 의존하면 실행마다 결과가 달라진다.
+    // 파일 경로 오름차순 순회로 고정했는지 검증한다 — 구현이 .values 순회로 되돌아가면 이 테스트는
+    // 실행마다 통과/실패가 갈리는(=CI에서 결국 잡히는) 상태가 된다.
+    do {
+        let orderHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeMonitorSelfTest.order.\(UUID().uuidString)")
+        let projectDir = orderHome.appendingPathComponent(".claude/projects/proj1")
+        try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+
+        func dupLine(ts: String, model: String) -> String {
+            "{\"type\":\"assistant\",\"uuid\":\"\",\"timestamp\":\"\(ts)\"," +
+            "\"message\":{\"id\":\"msg_dup\",\"model\":\"\(model)\"," +
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":100}}}\n"
+        }
+        try? dupLine(ts: "2026-01-01T00:00:00Z", model: "claude-sonnet-5")
+            .write(to: projectDir.appendingPathComponent("a-session.jsonl"), atomically: true, encoding: .utf8)
+        try? dupLine(ts: "2026-01-01T02:30:00Z", model: "claude-opus-5")
+            .write(to: projectDir.appendingPathComponent("z-session.jsonl"), atomically: true, encoding: .utf8)
+
+        let orderEntries = UsageDataReader(homeDir: orderHome).readAll()
+        check(orderEntries.count == 1, "readAll: 두 파일에 복제된 동일 message.id는 1개로 병합")
+        check(orderEntries.first?.model == "claude-sonnet-5",
+              "readAll: 병합 시 경로 오름차순으로 먼저 오는 파일(a-session)의 model이 남는다(결정적)")
+        check(orderEntries.first?.timestamp == parseISO8601("2026-01-01T00:00:00Z"),
+              "readAll: timestamp도 같은 순서 규칙을 따른다 — 실행마다 흔들리지 않는다")
+
+        try? FileManager.default.removeItem(at: orderHome)
+    }
+
+    // UsageDataReader.readAll() — 읽기 실패 경로. 예전엔 실패해도 호출부가 파일 크기를 무조건
+    // 기록해버려 다음 사이클의 `cached.size == size` 스킵에 걸렸다: 그 파일이 다시 자라거나 앱을
+    // 재시작하기 전까지 놓친 구간을 영영 못 읽었다. 지금은 실패 시 크기를 기록하지 않고 백오프로
+    // 재시도한다. 정상 경로만 덮던 기존 readAll 테스트가 놓치던 구멍이다.
+    do {
+        let failHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeMonitorSelfTest.readfail.\(UUID().uuidString)")
+        let projectDir = failHome.appendingPathComponent(".claude/projects/proj1")
+        try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let sessionFile = projectDir.appendingPathComponent("locked.jsonl")
+
+        func failLine(uuid: String, ts: String, out: Int) -> String {
+            "{\"type\":\"assistant\",\"uuid\":\"\(uuid)\",\"timestamp\":\"\(ts)\"," +
+            "\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":\(out)}}}\n"
+        }
+        try? failLine(uuid: "locked-1", ts: "2026-01-01T00:00:00Z", out: 100)
+            .write(to: sessionFile, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: sessionFile.path)
+
+        if FileManager.default.isReadableFile(atPath: sessionFile.path) {
+            // root로 실행 중이면 chmod 000이 읽기를 막지 못해 실패 경로를 유발할 수 없다.
+            check(true, "readAll 읽기 실패 테스트: 권한이 무시되는 환경(root)이라 스킵")
+        } else {
+            let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+            let failReader = UsageDataReader(homeDir: failHome)
+
+            check(failReader.readAll(now: t0).isEmpty,
+                  "readAll: 읽지 못한 파일은 엔트리를 만들지 않는다")
+            check(!failReader.lastReadChanged,
+                  "readAll: 읽기 실패는 lastReadChanged를 true로 만들지 않는다 — 매 사이클 O(N log N) 재병합이 되살아나는 것을 막는다")
+
+            // 크기가 그대로인 동안은 백오프가 걸려 즉시 재시도하지 않는다.
+            _ = failReader.readAll(now: t0.addingTimeInterval(1))
+            check(!failReader.lastReadChanged, "readAll: 백오프 대기 중에도 lastReadChanged는 false 유지")
+
+            // 백오프 만료를 넘겨가며 포기 한도까지 계속 실패시킨다. 그 뒤 권한을 복구하고 줄을
+            // 추가하면(=크기 변화) 실패 이전에 쓰인 줄까지 **전부** 회수돼야 한다.
+            for i in 1...(UsageDataReader.maxReadFailures + 1) {
+                _ = failReader.readAll(now: t0.addingTimeInterval(Double(i) * 3600))
+            }
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: sessionFile.path)
+            if let handle = try? FileHandle(forWritingTo: sessionFile) {
+                handle.seekToEndOfFile()
+                handle.write(failLine(uuid: "locked-2", ts: "2026-01-01T00:05:00Z", out: 200).data(using: .utf8)!)
+                try? handle.close()
+            }
+            let recovered = failReader.readAll(now: t0.addingTimeInterval(86_400))
+            check(recovered.count == 2,
+                  "readAll: 읽기 실패 뒤 파일이 자라면 실패 구간(첫 줄)까지 포함해 회수된다")
+            check(failReader.lastReadChanged, "readAll: 회수 성공 사이클에서 lastReadChanged == true")
+        }
+
+        try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: sessionFile.path)
+        try? FileManager.default.removeItem(at: failHome)
+    }
+
+    // UsageDataReader.readAll() — 개행 없는 부분 줄(쓰는 중)은 소비하지 않고 대기하되, 파일이
+    // 자라면 백오프를 무시하고 즉시 재시도해야 한다. 백오프를 크기 변화와 무관하게 걸면 활발히
+    // 쓰이는 세션 파일의 사용량 반영이 최대 10분까지 늦어진다.
+    do {
+        let partialHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeMonitorSelfTest.partial.\(UUID().uuidString)")
+        let projectDir = partialHome.appendingPathComponent(".claude/projects/proj1")
+        try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let sessionFile = projectDir.appendingPathComponent("writing.jsonl")
+
+        let full = "{\"type\":\"assistant\",\"uuid\":\"p1\",\"timestamp\":\"2026-01-01T00:00:00Z\"," +
+                   "\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":100}}}"
+        let splitAt = full.index(full.startIndex, offsetBy: 40)
+        try? String(full[full.startIndex..<splitAt]).write(to: sessionFile, atomically: true, encoding: .utf8)
+
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let partialReader = UsageDataReader(homeDir: partialHome)
+        check(partialReader.readAll(now: t0).isEmpty,
+              "readAll: 개행 없는 부분 줄은 소비하지 않는다(다음 주기로 미룸)")
+
+        if let handle = try? FileHandle(forWritingTo: sessionFile) {
+            handle.seekToEndOfFile()
+            handle.write((String(full[splitAt...]) + "\n").data(using: .utf8)!)
+            try? handle.close()
+        }
+        // now를 전혀 진행시키지 않는다 — 크기가 바뀌었으므로 백오프가 걸려선 안 된다.
+        check(partialReader.readAll(now: t0).count == 1,
+              "readAll: 부분 줄이 완성되면 백오프 대기 없이 같은 사이클 조건에서도 즉시 읽는다")
+
+        try? FileManager.default.removeItem(at: partialHome)
     }
 
     // F1 회귀: refresh()가 entriesChanged와 무관하게 updateGamificationRecord()/
