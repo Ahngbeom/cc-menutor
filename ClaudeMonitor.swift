@@ -340,6 +340,31 @@ enum RefreshSettings {
     }
 }
 
+// MARK: - Display Currency (메뉴바 비용 표기 통화 — 달러/원화 택일)
+//
+// 기본값 .usd는 의도적이다. 이 앱의 유일한 아웃바운드 네트워크 요청이 환율 조회인데,
+// .krw를 고른 사용자만 그 요청을 타게 해서 "달러 표시 = 완전 오프라인"을 유지한다.
+
+enum DisplayCurrency: String, CaseIterable {
+    case usd, krw
+    var label: String {
+        switch self {
+        case .usd: return t("달러 (USD)", "US Dollar (USD)")
+        case .krw: return t("원화 (KRW)", "Korean Won (KRW)")
+        }
+    }
+}
+
+enum CurrencySettings {
+    private static let currencyKey = "displayCurrency"
+    static func currency(defaults: UserDefaults = .standard) -> DisplayCurrency {
+        defaults.string(forKey: currencyKey).flatMap(DisplayCurrency.init(rawValue:)) ?? .usd
+    }
+    static func setCurrency(_ c: DisplayCurrency, defaults: UserDefaults = .standard) {
+        defaults.set(c.rawValue, forKey: currencyKey)
+    }
+}
+
 // MARK: - Reset Anchor (5시간 블록 리셋 기준 시각 — 사용자가 claude.ai 등에서 확인한 실제
 // 리셋 순간을 등록하면, 이후 블록 계산이 FiveHourBlock.anchoredWindow(그 순간부터 5시간
 // 간격으로 반복되는 그리드)를 따른다. 사용자가 지우기 전까지 영구 유지되는 설정 —
@@ -1287,6 +1312,96 @@ func formatCost(_ c: Double) -> String {
     return String(format: "$%.2f", c)
 }
 
+// MARK: - Currency Conversion (원화 환산 — 단일 진실 공급원)
+//
+// 메뉴바 타이틀과 드롭다운이 각자 통화를 계산하면 같은 블록인데 서로 다른 금액이 뜬다 —
+// 리셋 앵커에서 실제로 겪은 버그다(CLAUDE.md 참고). 그래서 두 경로가 CurrencyContext 하나를
+// 공유하고, 금액 문자열은 반드시 formatMoney() 한 곳으로 수렴한다.
+
+enum CurrencyContext {
+    case usd
+    case krw(rate: Double)
+    var krwRate: Double? { if case .krw(let r) = self { return r } else { return nil } }
+}
+
+/// 설정이 .krw여도 환율이 없거나 비상식적이면 .usd로 떨어진다 — 순수 함수라 셀프테스트가 직접 단정한다.
+func currencyContext(currency: DisplayCurrency, rate: ExchangeRate?) -> CurrencyContext {
+    guard currency == .krw, let r = rate, isPlausibleKRWRate(r.rate) else { return .usd }
+    return .krw(rate: r.rate)
+}
+
+/// 드롭다운이 필요한 통화 표시 상태 일체 — "어떤 통화로 렌더할지"(context) + 고지 상태 3개.
+/// 두 makeBlockDisplayData 어댑터가 currencyDisplay() 하나를 공유하므로 각자 계산하다 어긋날 수
+/// 없고, currencyContext()와 같은 판정을 재사용한다.
+struct CurrencyDisplay {
+    let rate: Double?        // nil = 달러 모드(또는 환율을 못 받음)
+    let baseDate: String?
+    let stale: Bool          // 마지막 성공 조회 > 24h
+    let unavailable: Bool    // 원화를 골랐는데 환율이 없어 달러로 표시 중
+
+    /// 드롭다운의 모든 금액 행이 이걸 통해 포맷한다 — 행마다 통화를 따로 판단할 여지를 없앤다.
+    var context: CurrencyContext { rate.map { .krw(rate: $0) } ?? .usd }
+
+    /// 달러 모드 기본 상태 — 금액은 formatCost와 동일해지고 환율 행·배너는 통째로 사라진다
+    /// (기존 사용자 화면 불변).
+    static let none = CurrencyDisplay(rate: nil, baseDate: nil, stale: false, unavailable: false)
+}
+
+func currencyDisplay(currency: DisplayCurrency, rate: ExchangeRate?, now: Date = Date()) -> CurrencyDisplay {
+    guard let r = currencyContext(currency: currency, rate: rate).krwRate, let er = rate else {
+        return CurrencyDisplay(rate: nil, baseDate: nil, stale: false, unavailable: currency == .krw)
+    }
+    return CurrencyDisplay(rate: r, baseDate: er.baseDate, stale: er.isStale(now: now), unavailable: false)
+}
+
+/// 원화 표기의 유일한 숫자 포매터. 금액(소수 0자리)과 환율 자체(소수 2자리)가 이걸 공유하므로
+/// 아래 로케일/그룹핑 설정이 한 곳에만 존재한다 — 두 번째 포매터를 따로 만들면 그 함정을 다시
+/// 밟게 된다.
+private func krwGroupedNumber(_ value: Double, fractionDigits: Int) -> String {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    // ⚠ 로케일과 그룹핑을 둘 다 명시해야 한다. NumberFormatter는 지정하지 않으면
+    // Locale.current를 따라가 de_DE에선 천단위 구분자가 "."(6.623), 인도 로케일에선
+    // 3-2-2 그룹핑(6,62,300)이 된다 — gregorianDayFormatter()가 맨손 DateFormatter를
+    // 금지하는 것과 같은 계열의 함정이다. 그런데 en_US_POSIX만 지정하면 POSIX 관례상
+    // usesGroupingSeparator == false / groupingSize == 0이라 구분자가 통째로 사라진다.
+    // 따라서 로케일로 나머지 동작을 못박고, 그룹핑은 로케일 기본값에 맡기지 않고 직접 지정한다.
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.usesGroupingSeparator = true
+    f.groupingSeparator = ","
+    f.groupingSize = 3
+    f.minimumFractionDigits = fractionDigits
+    f.maximumFractionDigits = fractionDigits
+    return f.string(from: NSNumber(value: value))
+        ?? String(format: "%.\(fractionDigits)f", value)
+}
+
+func formatKRW(_ krw: Double) -> String {
+    // 1원 미만을 정수 반올림하면 전부 "₩0"이 되어 "무료"로 오독된다 —
+    // formatCost가 $0.01 미만에서 4자리로 넓히는 것과 같은 취지.
+    if abs(krw) < 1 { return String(format: "₩%.2f", krw) }
+    return "₩" + krwGroupedNumber(krw, fractionDigits: 0)
+}
+
+/// 이 앱의 **유일한** 금액 포매터. 메뉴바와 드롭다운의 모든 금액 행이 이걸 거치므로
+/// 두 화면이 서로 다른 금액을 보여줄 구조적 여지가 없다.
+/// `.usd`는 formatCost를 그대로 호출한다 — 달러 모드 출력은 통화 기능 도입 전과 문자 단위로 동일하다.
+func formatMoney(_ usd: Double, _ cc: CurrencyContext) -> String {
+    switch cc {
+    case .usd:           return formatCost(usd)
+    case .krw(let rate): return formatKRW(usd * rate)
+    }
+}
+
+/// 드롭다운 하단 정보 행에 쓰는 환율 자체의 표기. 소수 2자리이고, 천단위 구분자는 금액 행들과
+/// 같은 포매터를 공유한다 — 이 행만 "₩1452.35"로 구분자가 빠져 있으면 패널 안에서 눈에 걸린다.
+/// 단일 통화 표시에서는 이 행이 **유일한 달러 대조 수단**이다.
+func formatExchangeRateLine(rate: Double, baseDate: String) -> String {
+    let r = krwGroupedNumber(rate, fractionDigits: 2)
+    return "  💱 " + t("환율 ₩\(r)/$1 · \(baseDate) 기준",
+                       "Rate ₩\(r)/$1 · as of \(baseDate)")
+}
+
 func formatTime(_ interval: TimeInterval) -> String {
     let h = Int(interval) / 3600
     let m = (Int(interval) % 3600) / 60
@@ -2159,11 +2274,13 @@ struct TitleContext {
     let todayTokens: Int
     let todayCost: Double
     let cumulativeTokens: Int
+    let currency: CurrencyContext  // 기본 .usd — 기존 호출부/테스트의 "$" 출력이 그대로 유지된다
 
     // moodTier 이후 추가되는 필드는 전부 기본값을 줘 기존 호출부가 그대로 컴파일되게 한다.
     init(outputTokens: Int, totalTokens: Int, cost: Double, remainingText: String?, model: String?,
          moodTier: MoodTier? = nil,
-         todayTokens: Int = 0, todayCost: Double = 0, cumulativeTokens: Int = 0) {
+         todayTokens: Int = 0, todayCost: Double = 0, cumulativeTokens: Int = 0,
+         currency: CurrencyContext = .usd) {
         self.outputTokens = outputTokens
         self.totalTokens = totalTokens
         self.cost = cost
@@ -2173,6 +2290,7 @@ struct TitleContext {
         self.todayTokens = todayTokens
         self.todayCost = todayCost
         self.cumulativeTokens = cumulativeTokens
+        self.currency = currency
     }
 }
 
@@ -2195,11 +2313,11 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
         switch field {
         case .outputTokens:     parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
         case .totalTokens:      parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: TitleSettings.color(for: field)))
-        case .cost:             parts.append(TitlePart(text: formatCost(ctx.cost), color: TitleSettings.color(for: field)))
+        case .cost:             parts.append(TitlePart(text: formatMoney(ctx.cost, ctx.currency), color: TitleSettings.color(for: field)))
         case .remainingTime:    if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: TitleSettings.color(for: field))) }
         case .model:            if let m = ctx.model { parts.append(TitlePart(text: shortModelName(m), color: TitleSettings.color(for: field))) }
         case .todayTokens:      parts.append(TitlePart(text: formatTokens(ctx.todayTokens), color: TitleSettings.color(for: field)))
-        case .todayCost:        parts.append(TitlePart(text: formatCost(ctx.todayCost), color: TitleSettings.color(for: field)))
+        case .todayCost:        parts.append(TitlePart(text: formatMoney(ctx.todayCost, ctx.currency), color: TitleSettings.color(for: field)))
         case .cumulativeTokens: parts.append(TitlePart(text: formatTokens(ctx.cumulativeTokens), color: TitleSettings.color(for: field)))
         }
     }
@@ -2443,6 +2561,90 @@ final class RateLimitsCacheReader {
     }
 }
 
+// MARK: - Exchange Rate (USD→KRW, api.frankfurter.dev)
+//
+// 이 앱의 유일한 아웃바운드 네트워크 요청. 사용량 데이터는 전송하지 않으며, 요청은
+// CurrencySettings.currency() == .krw일 때만 발생한다(달러 표시 = 요청 0회).
+// 소스는 ECB 기준 환율을 서비스하는 frankfurter.dev — API 키가 없고 응답이 60바이트 남짓이다.
+
+struct ExchangeRate {
+    let rate: Double        // 1 USD 당 KRW
+    let baseDate: String    // API가 준 기준일 "yyyy-MM-dd" — 표시용
+    let fetchedAt: Date     // 마지막 성공 조회 시각 — 신선도 판단의 유일한 기준
+
+    /// 재조회 TTL. ECB는 영업일 1회 갱신이지만 앱 시작 시각과 위상이 어긋날 수 있어 1시간.
+    func needsRefetch(now: Date = Date()) -> Bool { now.timeIntervalSince(fetchedAt) > 3600 }
+
+    /// "환율 오래됨" 배너 기준. baseDate가 아니라 fetchedAt으로 판단한다 — baseDate는 주말·공휴일에
+    /// 정상적으로 이틀 전이 되므로 그것으로 판단하면 주말마다 거짓 경고가 뜬다.
+    func isStale(now: Date = Date()) -> Bool { now.timeIntervalSince(fetchedAt) > 24 * 3600 }
+}
+
+/// 0이나 NaN이 통과하면 모든 비용이 ₩0으로 렌더돼 "무료"로 오독된다. 파싱·표시 양쪽의 방어선.
+func isPlausibleKRWRate(_ r: Double) -> Bool { r.isFinite && r >= 100 && r <= 100_000 }
+
+enum ExchangeRateStore {
+    private static let rateKey = "fxKRWRate"
+    private static let baseDateKey = "fxKRWBaseDate"
+    private static let fetchedAtKey = "fxKRWFetchedAt"
+
+    static func load(defaults: UserDefaults = .standard) -> ExchangeRate? {
+        // object(forKey:) as? Double을 쓴다 — double(forKey:)는 키가 없을 때 0을 돌려주므로
+        // "저장된 적 없음"과 "0이 저장됨"을 구분할 수 없다(GamificationSettings와 의도적으로 다름).
+        guard let rate = defaults.object(forKey: rateKey) as? Double,
+              let fetchedAt = defaults.object(forKey: fetchedAtKey) as? Double,
+              let baseDate = defaults.string(forKey: baseDateKey),
+              isPlausibleKRWRate(rate) else { return nil }
+        return ExchangeRate(rate: rate, baseDate: baseDate,
+                            fetchedAt: Date(timeIntervalSince1970: fetchedAt))
+    }
+
+    static func save(_ r: ExchangeRate, defaults: UserDefaults = .standard) {
+        defaults.set(r.rate, forKey: rateKey)
+        defaults.set(r.baseDate, forKey: baseDateKey)
+        defaults.set(r.fetchedAt.timeIntervalSince1970, forKey: fetchedAtKey)
+    }
+}
+
+private struct FrankfurterResponse: Codable {
+    let date: String
+    let rates: [String: Double]
+}
+
+/// 네트워크에서 분리된 순수 파서 — 셀프테스트가 실제 응답 픽스처로 직접 검증한다.
+func parseExchangeRateResponse(_ data: Data, now: Date = Date()) -> ExchangeRate? {
+    guard let r = try? JSONDecoder().decode(FrankfurterResponse.self, from: data),
+          let krw = r.rates["KRW"], isPlausibleKRWRate(krw) else { return nil }
+    return ExchangeRate(rate: krw, baseDate: r.date, fetchedAt: now)
+}
+
+final class ExchangeRateFetcher {
+    static let endpoint = URL(string: "https://api.frankfurter.dev/v1/latest?base=USD&symbols=KRW")!
+    private let session: URLSession
+
+    init() {
+        // .ephemeral — 디스크 캐시·쿠키·크리덴셜을 남기지 않는다. 응답이 60바이트라
+        // 캐싱으로 얻을 게 없고, 로컬에 흔적을 남기지 않는 편이 이 앱의 성격에 맞다.
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 10
+        cfg.timeoutIntervalForResource = 15
+        session = URLSession(configuration: cfg)
+    }
+
+    /// completion은 성공·실패 모두 항상 메인 큐에서 1회 호출된다.
+    func fetch(completion: @escaping (ExchangeRate?) -> Void) {
+        let task = session.dataTask(with: ExchangeRateFetcher.endpoint) { data, response, _ in
+            let rate: ExchangeRate? = {
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      let data = data else { return nil }
+                return parseExchangeRateResponse(data)
+            }()
+            DispatchQueue.main.async { completion(rate) }
+        }
+        task.resume()
+    }
+}
+
 // MARK: - Block Menu Display Model
 //
 // buildMenu(fromCache:)/buildMenuFromEntries() 공유 뷰모델. 두 데이터 소스(StatsCache 1차 경로
@@ -2494,7 +2696,11 @@ struct BlockSectionData {
     let resetState: ResetState        // "리셋까지"/"블록 리셋됨" 표시 줄
     let warningResetText: String       // "⚠️ 사용량 N% — 남음" 줄 전용(resetState와 별개 — 이미 리셋된
                                        // 경우에도 원본 코드가 0초 텍스트를 그대로 쓰던 동작을 보존)
-    let burnRateText: String?         // 캐시 경로만
+    // 시간당 비용(USD 원값). 캐시 경로만 채워진다. **미리 포맷하지 않는다** — 표시 통화가 설정에
+    // 따라 바뀌므로 금액 포맷은 렌더링 시점 한 번으로 끝나야 한다(shortModelName의 이중 축약
+    // 방지와 같은 취지). 예전엔 어댑터가 formatCost로 문자열을 만들어 넣던 유일한 금액 필드였고,
+    // 그래서 원화 모드에서 이 줄만 달러로 남았다.
+    let burnRateCostPerHour: Double?
     let warning: UsageWarning?
     let moodTier: MoodTier?
     let moodRatio: Double
@@ -2524,15 +2730,20 @@ struct BlockDisplayData {
     // 서버 실측 사용률(5시간/주간) — rate-limits-cache.json이 있고 신선할 때만 non-nil.
     // 이 앱의 블록 추정치와 독립적인 별개 소스라 활성 블록 유무와 무관하게 표시한다.
     let serverLimits: ServerLimitsSectionData?
+    // 드롭다운의 모든 금액 행이 쓰는 표시 통화 + 환율 고지 상태. currencyDisplay()/
+    // currencyContext()가 유일한 판정자이므로 메뉴바 타이틀과 어긋날 수 없다. .none이면 금액이
+    // formatCost와 동일해지고 환율 행·배너가 통째로 사라진다(달러 모드 = 기존 화면 그대로).
+    let currency: CurrencyDisplay
 
     // 커스텀 init: anchorIsEstimating/rateLimitReset/serverLimits에 기본값을 주기 위함 — Swift의
     // synthesized memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
     init(isEstimate: Bool, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil,
-         serverLimits: ServerLimitsSectionData? = nil, state: State) {
+         serverLimits: ServerLimitsSectionData? = nil, currency: CurrencyDisplay = .none, state: State) {
         self.isEstimate = isEstimate
         self.anchorIsEstimating = anchorIsEstimating
         self.rateLimitReset = rateLimitReset
         self.serverLimits = serverLimits
+        self.currency = currency
         self.state = state
     }
 }
@@ -2542,8 +2753,11 @@ extension BlockDisplayData {
     // 없으므로 nil을 반환한다(호출부가 이 경우 단순 "로딩 중" placeholder로 대체).
     func asLoadingSkeleton() -> BlockDisplayData? {
         guard case .ready(let block, let model, let today, let allTime) = state else { return nil }
+        // currency도 반드시 함께 전파한다 — 빠뜨리면 메뉴가 열린 채 새로고침될 때 금액이
+        // 달러로 한 프레임 되돌아가 행 폭이 흔들린다.
         return BlockDisplayData(isEstimate: isEstimate, anchorIsEstimating: anchorIsEstimating,
                                  rateLimitReset: rateLimitReset, serverLimits: serverLimits,
+                                 currency: currency,
                                  state: .loading(block: block, model: model, today: today, allTime: allTime))
     }
 }
@@ -2560,6 +2774,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var cachedAll: [UsageEntry] = []
     var cachedStats: StatsCache?
     var cachedRateLimits: RateLimitsCache?
+    let rateFetcher = ExchangeRateFetcher()
+    // 마지막으로 확보한 환율. 앱 시작 시 ExchangeRateStore에서 부트스트랩하므로 첫 프레임부터
+    // 캐시 값으로 원화가 보이고, 조회 실패 시에도 이 값이 유지된다(폴백).
+    var cachedExchangeRate: ExchangeRate?
+    private var isFetchingRate = false
+    // 실패 백오프. 없으면 새로고침 주기 10초를 쓰는 오프라인 사용자가 분당 6회 실패 요청을 낸다.
+    private var nextRateFetchAllowedAt = Date(timeIntervalSince1970: 0)
     private(set) var gamificationTodayTokens: Int = 0
     private(set) var gamificationTodayCost: Double = 0
     private(set) var gamificationNewRecordToday: Bool = false
@@ -2580,6 +2801,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     weak var moodThemeSubmenu: NSMenu?
     weak var refreshIntervalSubmenu: NSMenu?
     weak var languageSubmenu: NSMenu?
+    weak var currencySubmenu: NSMenu?
     weak var funModeSubmenu: NSMenu?
     weak var resetAnchorSubmenu: NSMenu?
     // 메인 5시간 블록 메뉴 — refresh마다 새 NSMenu()로 교체하지 않고 재사용한다. 매번 새 인스턴스를
@@ -2611,6 +2833,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyDefaultsIfNeeded()
         migrateFunModeIfNeeded()
+        // 저장된 환율을 먼저 올려둔다 — 첫 refresh()의 네트워크 응답을 기다리지 않고
+        // 첫 프레임부터 원화가 보인다(원화 모드일 때).
+        cachedExchangeRate = ExchangeRateStore.load()
         NSApp.setActivationPolicy(.accessory)  // Hide from Dock
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -2789,7 +3014,41 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.buildMenu()
                 if manual { self.statusItem.button?.alphaValue = 1.0 }
                 self.isRefreshing = false
+                // 환율은 URLSession(비동기)이라 위 .utility 블록에 동기로 끼울 수 없다. 기존
+                // 파이프라인을 블로킹하지 않고 여기서 별도로 띄우며, 도착하면 스스로 UI를 갱신한다.
+                self.maybeFetchExchangeRate()
             }
+        }
+    }
+
+    /// 환율 조회 게이트. force는 "원화로 전환한 직후"처럼 사용자가 결과를 기다리는 경우에만 쓴다
+    /// (백오프를 무시하지만, 이미 신선한 환율이 있으면 여전히 요청하지 않는다).
+    func maybeFetchExchangeRate(force: Bool = false, now: Date = Date()) {
+        // 달러 표시 사용자는 네트워크를 타지 않는다 — 옵트인의 실체가 이 한 줄이다.
+        guard CurrencySettings.currency() == .krw else { return }
+        guard !isFetchingRate else { return }
+        if !force && now < nextRateFetchAllowedAt { return }
+        if let r = cachedExchangeRate ?? ExchangeRateStore.load() {
+            cachedExchangeRate = r
+            if !r.needsRefetch(now: now) { return }
+        }
+        isFetchingRate = true
+        rateFetcher.fetch { [weak self] rate in
+            guard let self = self else { return }
+            self.isFetchingRate = false
+            guard let rate = rate else {
+                // 실패 시 cachedExchangeRate는 손대지 않는다 — StatsCacheReader의
+                // "디코드 실패 시 캐시 오염 방지"와 같은 원칙. 오프라인에서도 마지막 값으로 계속 표시된다.
+                self.nextRateFetchAllowedAt = Date().addingTimeInterval(300)
+                self.buildMenu()  // "환율 조회 실패" 안내 행이 필요할 수 있다
+                return
+            }
+            ExchangeRateStore.save(rate)
+            self.cachedExchangeRate = rate
+            self.nextRateFetchAllowedAt = Date().addingTimeInterval(3600)
+            // buildMenu()가 첫 줄에서 updateStatusBarTitle을 호출하므로 별도로 부르지 않는다 —
+            // statusItem.button.image/title 재할당은 상태바 전체 재레이아웃을 유발해 비싸다.
+            self.buildMenu()
         }
     }
 
@@ -3069,7 +3328,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: elapsedRatio, warning: warning),
                                todayTokens: gamificationTodayTokens,
                                todayCost: gamificationTodayCost,
-                               cumulativeTokens: stats.cumulative?.totalTokens ?? 0)
+                               cumulativeTokens: stats.cumulative?.totalTokens ?? 0,
+                               currency: currencyContext(currency: CurrencySettings.currency(),
+                                                         rate: cachedExchangeRate))
         return (ctx, warning)
     }
 
@@ -3122,7 +3383,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    moodTier: moodTier,
                                    todayTokens: gamificationTodayTokens,
                                    todayCost: gamificationTodayCost,
-                                   cumulativeTokens: UsageStats(entries: cachedAll).totalTokens)
+                                   cumulativeTokens: UsageStats(entries: cachedAll).totalTokens,
+                                   currency: currencyContext(currency: CurrencySettings.currency(),
+                                                             rate: cachedExchangeRate))
             renderTitle(parts: titlePartsWithBadge(ctx), warning: warning)
         }
     }
@@ -3248,7 +3511,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 progressRatio: progressRatio,
                 resetState: resetState,
                 warningResetText: anchorWindow.map { formatTime($0.remaining) } ?? resetCountdownText(for: b),
-                burnRateText: anchorWindow != nil ? nil : b.burnRate?.costPerHour.map { formatCost($0) },
+                burnRateCostPerHour: anchorWindow != nil ? nil : b.burnRate?.costPerHour,
                 warning: warning,
                 moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: progressRatio, warning: warning),
                 moodRatio: warning?.ratio ?? progressRatio,
@@ -3289,6 +3552,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return BlockDisplayData(isEstimate: false, anchorIsEstimating: anchorIsEstimating,
                                  rateLimitReset: rateLimitReset,
                                  serverLimits: makeServerLimitsSection(from: cachedRateLimits, now: now),
+                                 currency: currencyDisplay(currency: CurrencySettings.currency(),
+                                                           rate: cachedExchangeRate, now: now),
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -3305,13 +3570,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
-                                 skeleton: true, into: menu)
+                                 currency: data.currency, skeleton: true, into: menu)
 
         case .ready(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
-                                 skeleton: false, into: menu)
+                                 currency: data.currency, skeleton: false, into: menu)
         }
     }
 
@@ -3321,12 +3586,20 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func renderBlockSections(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData,
                                       allTime: AllTimeSectionData?, isEstimate: Bool, anchorIsEstimating: Bool,
                                       rateLimitReset: Date?, serverLimits: ServerLimitsSectionData? = nil,
+                                      currency: CurrencyDisplay = .none,
                                       skeleton: Bool, into menu: NSMenu) {
         if isEstimate {
             addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
             menu.addItem(.separator())
         } else if anchorIsEstimating {
             addSectionHeader(menu, t("⚓ 리셋 앵커 적용 중 — 이 블록 비용은 추정치", "⚓ Reset anchor active — this block's cost is estimated"))
+            menu.addItem(.separator())
+        }
+        // 환율 배너는 위 두 배너와 독립 사건이므로 else-if가 아니라 별도 if다
+        // (추정 모드이면서 환율도 오래됐을 수 있고, 둘 다 알려줘야 한다).
+        if currency.stale, let base = currency.baseDate {
+            addSectionHeader(menu, t("⚠ 환율 오래됨 (\(base) 기준) — 네트워크 확인",
+                                     "⚠ Exchange rate outdated (as of \(base)) — check network"))
             menu.addItem(.separator())
         }
 
@@ -3363,13 +3636,17 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if skeleton {
                 addSkeletonLabel(menu)
             } else {
-                addLabel(menu, "  " + t("\(formatCost(b.cost)) · \(formatTokens(b.outputTokens)) 출력 / \(formatTokens(b.totalTokens)) 전체 · \(b.messageCount)건",
-                                        "\(formatCost(b.cost)) · \(formatTokens(b.outputTokens)) out / \(formatTokens(b.totalTokens)) total · \(b.messageCount) msgs"))
+                let blockCost = formatMoney(b.cost, currency.context)
+                addLabel(menu, "  " + t("\(blockCost) · \(formatTokens(b.outputTokens)) 출력 / \(formatTokens(b.totalTokens)) 전체 · \(b.messageCount)건",
+                                        "\(blockCost) · \(formatTokens(b.outputTokens)) out / \(formatTokens(b.totalTokens)) total · \(b.messageCount) msgs"))
             }
 
             var windowBurnParts: [String] = []
             if let windowText = b.windowText { windowBurnParts.append(windowText) }
-            if let cph = b.burnRateText { windowBurnParts.append(t("소모율 \(cph)/시간", "burn \(cph)/hr")) }
+            if let cph = b.burnRateCostPerHour {
+                let cphText = formatMoney(cph, currency.context)
+                windowBurnParts.append(t("소모율 \(cphText)/시간", "burn \(cphText)/hr"))
+            }
             if !windowBurnParts.isEmpty {
                 skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + windowBurnParts.joined(separator: " · "))
             }
@@ -3446,7 +3723,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .breakdown(let items, let unknownCount):
                 for item in items {
                     skeleton ? addSkeletonLabel(menu)
-                             : addLabel(menu, "  \(paddedModelColumn(item.model))  \(formatTokens(item.tokens))  \(formatCost(item.cost))")
+                             : addLabel(menu, "  \(paddedModelColumn(item.model))  \(formatTokens(item.tokens))  \(formatMoney(item.cost, currency.context))")
                 }
                 if unknownCount > 0 {
                     skeleton ? addSkeletonLabel(menu)
@@ -3460,12 +3737,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addSectionHeader(menu, t("📅  오늘 (로컬 기준)", "📅  Today (Local Time)"))
         if today.hasUsage {
             skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("전체 토큰: \(formatTokens(today.totalTokens))", "Total Tokens: \(formatTokens(today.totalTokens))"))
-            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("예상 비용: \(formatCost(today.totalCost))", "Estimated Cost: \(formatCost(today.totalCost))"))
+            let todayCost = formatMoney(today.totalCost, currency.context)
+            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("예상 비용: \(todayCost)", "Estimated Cost: \(todayCost)"))
             if let mc = today.messageCount {
                 skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("메시지 수: \(mc)건", "Messages: \(mc)"))
             }
             for mb in today.modelBreakdown ?? [] {
-                skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  \(paddedModelColumn(mb.model))  \(formatTokens(mb.tokens))  \(formatCost(mb.cost))")
+                skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  \(paddedModelColumn(mb.model))  \(formatTokens(mb.tokens))  \(formatMoney(mb.cost, currency.context))")
             }
         } else {
             addLabel(menu, "  " + t("사용 없음", "No usage"))
@@ -3476,12 +3754,26 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let allTime = allTime {
             addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
             skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("전체 토큰: \(formatTokens(allTime.totalTokens))", "Total Tokens: \(formatTokens(allTime.totalTokens))"))
-            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("예상 비용: \(formatCost(allTime.totalCost))", "Estimated Cost: \(formatCost(allTime.totalCost))"))
+            let allCost = formatMoney(allTime.totalCost, currency.context)
+            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + t("예상 비용: \(allCost)", "Estimated Cost: \(allCost)"))
+            menu.addItem(.separator())
+        }
+
+        // ── 환율 정보 / 실패 안내 (달러 모드에서는 두 행 모두 나타나지 않는다) ──
+        if let rate = currency.rate, let base = currency.baseDate {
+            addLabel(menu, formatExchangeRateLine(rate: rate, baseDate: base))
+            menu.addItem(.separator())
+        } else if currency.unavailable {
+            // 사용자가 원화를 골랐는데 환율을 한 번도 받지 못한 상태 — 금액이 달러로 보이는
+            // 이유를 밝혀 준다(설정이 무시된 것처럼 보이지 않게).
+            addColoredLabel(menu, "  " + t("💱 환율 조회 실패 — 달러로 표시 중",
+                                           "💱 Exchange rate unavailable — showing USD"),
+                            color: .systemOrange)
             menu.addItem(.separator())
         }
 
         if !skeleton {
-            appendGamificationSection(menu)
+            appendGamificationSection(menu, currency: currency)
         }
     }
 
@@ -3490,8 +3782,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         name.padding(toLength: 12, withPad: " ", startingAt: 0)
     }
 
-    // ── 재미 모드 게이팅된 "🏆 기록" 섹션 — 1차/폴백 메뉴 빌더 양쪽에서 공유(중복 방지) ──
-    func appendGamificationSection(_ menu: NSMenu) {
+    // ── 재미 모드 게이팅된 "🏆 기록" 섹션 ──
+    // 데이터를 GamificationSettings에서 직접 읽어 BlockDisplayData를 우회하는 유일한 섹션이라
+    // 표시 통화를 인자로 받는다(호출부는 renderBlockSections 한 곳뿐 — 1차/폴백 빌더가 모두
+    // renderBlockMenu → renderBlockSections로 수렴한다. 기본값은 심볼 호환용).
+    func appendGamificationSection(_ menu: NSMenu, currency: CurrencyDisplay = .none) {
         guard TitleSettings.isFunModeFeatureEnabled(.streakSection) else { return }
         let rec = GamificationSettings.load()
         addSectionHeader(menu, t("🏆  기록", "🏆  Record"))
@@ -3500,8 +3795,11 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 "\(rec.currentStreakDays)-day streak (best \(rec.longestStreakDays) days)")
             : t("기록 없음", "No record yet")
         addLabel(menu, "  " + t("연속 사용: \(streakLabel)", "Streak: \(streakLabel)"))
-        addLabel(menu, "  " + t("최고 기록: \(formatTokens(rec.bestDayTokens)) · \(formatCost(rec.bestDayCost))",
-                                "Best Day: \(formatTokens(rec.bestDayTokens)) · \(formatCost(rec.bestDayCost))"))
+        // 과거 기록을 **현재 환율로** 환산한다(기록 당시 환율은 저장하지 않는다). 원화 모드에서
+        // 환율이 움직이면 이 금액도 함께 움직인다 — 의도된 동작이다.
+        let bestCost = formatMoney(rec.bestDayCost, currency.context)
+        addLabel(menu, "  " + t("최고 기록: \(formatTokens(rec.bestDayTokens)) · \(bestCost)",
+                                "Best Day: \(formatTokens(rec.bestDayTokens)) · \(bestCost)"))
         if gamificationNewRecordToday {
             addLabel(menu, "  " + t("📈 오늘 최고 기록 경신", "📈 New personal best today"))
         }
@@ -3573,6 +3871,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(resetAnchorMenuItem)
         resetAnchorItem = resetAnchorMenuItem
 
+        let currencyMake = { "  💱 " + t("표시 통화", "Display Currency") }
+        let currencyItem = NSMenuItem(title: currencyMake(), action: nil, keyEquivalent: "")
+        currencyItem.submenu = obtainCurrencySubmenu()
+        menu.addItem(currencyItem)
+        track(currencyItem, currencyMake)
+
         let languageMake = { "  🌐 " + t("표시 언어", "Display Language") }
         let languageItem = NSMenuItem(title: languageMake(), action: nil, keyEquivalent: "")
         languageItem.submenu = obtainLanguageSubmenu()
@@ -3612,6 +3916,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshRadioSubmenu(separatorSubmenu, current: TitleSettings.separator(), action: #selector(setSeparatorButton(_:))) { $0.label }
         refreshRadioSubmenu(moodThemeSubmenu, current: TitleSettings.moodGlyphTheme(), action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
         refreshRadioSubmenu(refreshIntervalSubmenu, current: RefreshSettings.interval(), action: #selector(setRefreshIntervalButton(_:))) { $0.label }
+        refreshRadioSubmenu(currencySubmenu, current: CurrencySettings.currency(), action: #selector(setDisplayCurrencyButton(_:))) { $0.label }
         refreshRadioSubmenu(languageSubmenu, current: TitleSettings.languagePreference(), action: #selector(setLanguagePreferenceButton(_:))) { $0.label }
     }
 
@@ -4035,6 +4340,29 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshFooterLocalizedText()   // footer 고정 항목 + 6개 서브메뉴 행 텍스트를 새 언어로 patch
     }
 
+    // ── 표시 통화 서브메뉴(라디오 스타일 — 달러/원화 택일) ──
+    private func obtainCurrencySubmenu() -> NSMenu {
+        let current = CurrencySettings.currency()
+        if let existing = currencySubmenu {
+            refreshRadioSubmenu(existing, current: current, action: #selector(setDisplayCurrencyButton(_:))) { $0.label }
+            return existing
+        }
+        let sub = buildRadioSubmenuView(current: current, action: #selector(setDisplayCurrencyButton(_:))) { $0.label }
+        currencySubmenu = sub
+        return sub
+    }
+
+    @objc func setDisplayCurrencyButton(_ sender: NSButton) {
+        let c = DisplayCurrency.allCases[sender.tag]
+        CurrencySettings.setCurrency(c)
+        // 원화로 전환한 즉시 조회한다 — 사용자가 결과를 기다리는 순간이라 백오프를 무시한다.
+        // (이미 신선한 환율이 있으면 maybeFetchExchangeRate가 스스로 요청을 생략한다.)
+        maybeFetchExchangeRate(force: true)
+        buildMenu()   // 내부에서 updateStatusBarTitle까지 처리한다
+        // buildMenu()만으로는 열려 있던 이 서브메뉴가 닫힌다 — 행만 in-place로 patch해야 유지된다.
+        refreshRadioSubmenu(currencySubmenu, current: c, action: #selector(setDisplayCurrencyButton(_:))) { $0.label }
+    }
+
     // ── 폴백 경로: stats-cache.json 부재 시 JSONL 직접 파싱(추정 단가) ──
     func buildMenuFromEntries() {
         updateStatusBarTitleFromEntries()
@@ -4079,7 +4407,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 progressRatio: activeBlock.progress,
                 resetState: rem > 0 ? .remaining(formatTime(rem)) : .alreadyReset,
                 warningResetText: formatTime(rem),
-                burnRateText: nil,
+                burnRateCostPerHour: nil,   // 폴백(JSONL) 경로엔 소모율 데이터가 없다
                 warning: warning,
                 moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: activeBlock.progress, warning: warning),
                 moodRatio: warning?.ratio ?? activeBlock.progress,
@@ -4110,6 +4438,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         return BlockDisplayData(isEstimate: true, rateLimitReset: rateLimitReset,
                                  serverLimits: makeServerLimitsSection(from: self.cachedRateLimits, now: now),
+                                 currency: currencyDisplay(currency: CurrencySettings.currency(),
+                                                           rate: cachedExchangeRate, now: now),
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -4527,6 +4857,158 @@ func runSelfTests() -> Never {
     check(formatCost(0.005) == "$0.0050", "formatCost 소액 4자리")
     check(formatCost(0.18) == "$0.18", "formatCost 일반")
 
+    // ── 원화 환산(formatKRW / formatMoney / currencyContext / currencyDisplay) ──
+    check(formatKRW(6_623.4) == "₩6,623", "formatKRW: 천단위 구분 + 정수 반올림")
+    check(formatKRW(0) == "₩0.00", "formatKRW: 0은 소수 2자리(1원 미만 규칙)")
+    check(formatKRW(0.42) == "₩0.42", "formatKRW: 1원 미만은 소수 2자리 — 정수 반올림하면 '무료'로 오독됨")
+    check(formatKRW(295_466.7) == "₩295,467", "formatKRW: 6자리 천단위 구분")
+    // 로케일 독립성 회귀 가드. NumberFormatter는 지정하지 않으면 Locale.current를 따라가
+    // de_DE에선 "6.623", 인도 로케일에선 "6,623"이 아닌 3-2-2 그룹핑이 된다. 아래는
+    // ./cc-menutor --test -AppleLocale "de_DE" 로 실제 로케일을 바꿔 돌려야 의미가 있다
+    // (gregorianDayString의 불교력 검증과 같은 방식).
+    check(!formatKRW(6_623).contains("."), "formatKRW: 로케일 무관 — 천단위 구분자로 '.'을 쓰지 않는다")
+    check(formatKRW(1_000_000) == "₩1,000,000", "formatKRW: 로케일 무관 — 3자리 그룹핑 고정")
+    // 환율 정보 행도 같은 포매터를 공유한다 — 구분자가 이 행에만 빠지면 패널 안에서 눈에 걸린다.
+    let fxLine = formatExchangeRateLine(rate: 1452.35, baseDate: "2026-07-29")
+    check(fxLine.contains("₩1,452.35/$1"), "formatExchangeRateLine: 환율에도 천단위 구분자 + 소수 2자리")
+    check(fxLine.contains("2026-07-29"), "formatExchangeRateLine: 기준일 표기")
+    check(formatExchangeRateLine(rate: 1452.35, baseDate: "x").filter { $0 == "." } .count == 1,
+          "formatExchangeRateLine: 로케일 무관 — '.'은 소수점 하나뿐(천단위 구분자로 쓰이지 않는다)")
+
+    // formatMoney는 메뉴바·드롭다운 전 금액 행의 유일한 포매터다. .usd가 formatCost와 문자 단위로
+    // 동일하다는 것이 "달러 모드 화면 불변"의 근거이므로 금액 크기대별로 확인한다.
+    check(formatMoney(4.2, .usd) == formatCost(4.2), "formatMoney: .usd는 formatCost와 완전히 동일")
+    check(formatMoney(0.005, .usd) == "$0.0050", "formatMoney: .usd 소액 규칙도 formatCost 그대로")
+    check(formatMoney(1572.23, .usd) == "$1572.23", "formatMoney: .usd 대액(최고 기록 크기대)")
+    let krwCC = CurrencyContext.krw(rate: 1452.35)
+    check(formatMoney(4.56, krwCC) == "₩6,623", "formatMoney: .krw 환산(블록 비용 크기대)")
+    check(formatMoney(0.0003, krwCC) == "₩0.44", "formatMoney: .krw 소액은 소수 2자리(모델별 분해 하단 행)")
+    check(formatMoney(1572.23, krwCC) == "₩2,283,428", "formatMoney: .krw 대액(최고 기록 크기대)")
+    check(formatMoney(12.4, krwCC) == "₩18,009", "formatMoney: .krw 소모율 크기대")
+    check(formatMoney(0, krwCC) == "₩0.00", "formatMoney: .krw 0원")
+
+    check(isPlausibleKRWRate(1452.35), "isPlausibleKRWRate: 정상값")
+    check(isPlausibleKRWRate(100) && isPlausibleKRWRate(100_000), "isPlausibleKRWRate: 경계 포함")
+    check(!isPlausibleKRWRate(0), "isPlausibleKRWRate: 0 거부 — 통과하면 모든 비용이 ₩0으로 렌더됨")
+    check(!isPlausibleKRWRate(99) && !isPlausibleKRWRate(100_001), "isPlausibleKRWRate: 범위 밖 거부")
+    check(!isPlausibleKRWRate(.nan) && !isPlausibleKRWRate(.infinity), "isPlausibleKRWRate: NaN/무한 거부")
+
+    let fxNow = Date(timeIntervalSince1970: 1_800_000_000)
+    let goodRate = ExchangeRate(rate: 1452.35, baseDate: "2026-07-29", fetchedAt: fxNow)
+    let zeroRate = ExchangeRate(rate: 0, baseDate: "2026-07-29", fetchedAt: fxNow)
+    if case .usd = currencyContext(currency: .usd, rate: goodRate) {
+        check(true, "currencyContext: 달러 설정이면 환율이 있어도 .usd")
+    } else { check(false, "currencyContext: 달러 설정이면 환율이 있어도 .usd") }
+    if case .krw(let r) = currencyContext(currency: .krw, rate: goodRate) {
+        check(abs(r - 1452.35) < 1e-9, "currencyContext: 원화 설정 + 정상 환율 → .krw")
+    } else { check(false, "currencyContext: 원화 설정 + 정상 환율 → .krw") }
+    if case .usd = currencyContext(currency: .krw, rate: nil) {
+        check(true, "currencyContext: 원화 설정이지만 환율 없음 → .usd 폴백")
+    } else { check(false, "currencyContext: 원화 설정이지만 환율 없음 → .usd 폴백") }
+    if case .usd = currencyContext(currency: .krw, rate: zeroRate) {
+        check(true, "currencyContext: 비상식적 환율(0) → .usd 폴백")
+    } else { check(false, "currencyContext: 비상식적 환율(0) → .usd 폴백") }
+    check(currencyContext(currency: .krw, rate: goodRate).krwRate != nil
+              && currencyContext(currency: .usd, rate: goodRate).krwRate == nil,
+          "CurrencyContext.krwRate: .usd일 때 nil")
+
+    // currencyDisplay — 드롭다운 상태 4종
+    let dispUSD = currencyDisplay(currency: .usd, rate: goodRate, now: fxNow)
+    check(dispUSD.rate == nil && !dispUSD.unavailable && !dispUSD.stale,
+          "currencyDisplay: 달러 모드 → 환율 행·배너·안내 전부 없음(기존 화면 불변)")
+    let dispFresh = currencyDisplay(currency: .krw, rate: goodRate, now: fxNow + 3600)
+    check(dispFresh.rate != nil && dispFresh.baseDate == "2026-07-29" && !dispFresh.stale && !dispFresh.unavailable,
+          "currencyDisplay: 원화 + 신선한 환율 → 환율 행 O, 배너 X")
+    let dispStale = currencyDisplay(currency: .krw, rate: goodRate, now: fxNow + 25 * 3600)
+    check(dispStale.rate != nil && dispStale.stale,
+          "currencyDisplay: 24시간 초과 → 원화 표시는 유지하고 배너만 켠다(캐시 폴백)")
+    let dispNone = currencyDisplay(currency: .krw, rate: nil, now: fxNow)
+    check(dispNone.rate == nil && dispNone.unavailable,
+          "currencyDisplay: 원화 설정 + 환율 없음 → unavailable 안내")
+    check(!currencyDisplay(currency: .usd, rate: nil, now: fxNow).unavailable,
+          "currencyDisplay: 달러 모드에서 환율이 없어도 unavailable이 아니다(안내 행 안 뜸)")
+
+    // CurrencyDisplay.context — 드롭다운 금액 행 전체가 이 파생값 하나만 본다.
+    check(dispUSD.context.krwRate == nil, "CurrencyDisplay.context: 달러 모드 → .usd")
+    check(formatMoney(4.56, dispUSD.context) == formatCost(4.56),
+          "CurrencyDisplay.context: 달러 모드 금액은 formatCost와 동일(화면 불변의 근거)")
+    check(dispFresh.context.krwRate != nil, "CurrencyDisplay.context: 원화 모드 → .krw")
+    check(formatMoney(4.56, dispFresh.context) == "₩6,623", "CurrencyDisplay.context: 원화 모드 금액 환산")
+    check(formatMoney(4.56, dispNone.context) == formatCost(4.56),
+          "CurrencyDisplay.context: 환율을 못 받으면 달러로 폴백(설정과 화면이 어긋나는 유일한 경우 → 안내 행)")
+    check(formatMoney(4.56, dispStale.context) == "₩6,623",
+          "CurrencyDisplay.context: 오래된 환율도 계속 환산에 쓴다(배너로만 고지)")
+
+    // 신선도 경계
+    check(!goodRate.needsRefetch(now: fxNow + 3599) && goodRate.needsRefetch(now: fxNow + 3601),
+          "ExchangeRate.needsRefetch: 1시간 경계")
+    check(!goodRate.isStale(now: fxNow + 24 * 3600 - 1) && goodRate.isStale(now: fxNow + 24 * 3600 + 1),
+          "ExchangeRate.isStale: 24시간 경계")
+
+    // parseExchangeRateResponse — 실측 응답 픽스처
+    let fxFixture = Data(#"{"amount":1.0,"base":"USD","date":"2026-07-29","rates":{"KRW":1452.35}}"#.utf8)
+    if let parsed = parseExchangeRateResponse(fxFixture, now: fxNow) {
+        check(abs(parsed.rate - 1452.35) < 1e-9, "parseExchangeRateResponse: rate 파싱")
+        check(parsed.baseDate == "2026-07-29", "parseExchangeRateResponse: 기준일 파싱")
+        check(parsed.fetchedAt == fxNow, "parseExchangeRateResponse: fetchedAt은 주입된 now")
+    } else { check(false, "parseExchangeRateResponse: 실측 픽스처 파싱 성공해야 함") }
+    check(parseExchangeRateResponse(Data(#"{"date":"2026-07-29","rates":{"JPY":150.0}}"#.utf8)) == nil,
+          "parseExchangeRateResponse: KRW 키 없으면 nil")
+    check(parseExchangeRateResponse(Data(#"{"date":"2026-07-29","rates":{"KRW":0}}"#.utf8)) == nil,
+          "parseExchangeRateResponse: 비상식적 환율은 파싱 단계에서 거부")
+    check(parseExchangeRateResponse(Data("not json".utf8)) == nil,
+          "parseExchangeRateResponse: 깨진 JSON은 nil")
+    check(parseExchangeRateResponse(Data("".utf8)) == nil,
+          "parseExchangeRateResponse: 빈 응답은 nil")
+    check(ExchangeRateFetcher.endpoint.scheme == "https",
+          "ExchangeRateFetcher: 엔드포인트는 https")
+
+    // `--test -displayCurrency krw`처럼 인자 도메인이 이 키를 덮고 있으면 displayCurrency를 읽는
+    // 단정들을 건너뛴다. 두 가지 이유가 있고 둘 다 이 저장소의 기존 관용구로는 못 피한다:
+    //  ① UserDefaults(suiteName:)는 **인자 도메인으로부터 격리되지 않는다** — suite 인스턴스도
+    //     검색 목록 맨 앞에 NSArgumentDomain을 두므로 "기본값은 .usd" 같은 단정이 깨진다.
+    //  ② `.standard`를 건드리는 구간에서는 object(forKey:)가 인자 도메인 값까지 읽으므로, 그 값을
+    //     복원 단계에서 되쓰면 **메모리에만 있던 값이 영속 도메인으로 세탁되어 디스크에 기록**된다
+    //     (인자 도메인은 원래 디스크에 남지 않는다). 게다가 진짜 저장값은 가려져 읽을 수조차 없어
+    //     안전하게 복원할 방법이 없다.
+    let currencyArgOverridden =
+        UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["displayCurrency"] != nil
+    if currencyArgOverridden {
+        check(true, "통화: 인자 도메인이 displayCurrency를 덮고 있어 관련 단정을 건너뜀")
+    }
+
+    // CurrencySettings — 격리 suite 왕복
+    let currencySuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let cud = UserDefaults(suiteName: currencySuite), !currencyArgOverridden {
+        check(CurrencySettings.currency(defaults: cud) == .usd,
+              "CurrencySettings: 기본값 .usd — 설치 직후 네트워크 요청 0회(옵트인)")
+        CurrencySettings.setCurrency(.krw, defaults: cud)
+        check(CurrencySettings.currency(defaults: cud) == .krw, "CurrencySettings: 저장/조회 왕복")
+        CurrencySettings.setCurrency(.usd, defaults: cud)
+        check(CurrencySettings.currency(defaults: cud) == .usd, "CurrencySettings: 달러로 복귀")
+        cud.set("bogus", forKey: "displayCurrency")
+        check(CurrencySettings.currency(defaults: cud) == .usd, "CurrencySettings: 알 수 없는 값은 .usd로 폴백")
+        cud.removePersistentDomain(forName: currencySuite)
+    } else if !currencyArgOverridden {
+        check(false, "CurrencySettings: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
+    // ExchangeRateStore — 격리 suite 왕복
+    let fxSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let fud = UserDefaults(suiteName: fxSuite) {
+        check(ExchangeRateStore.load(defaults: fud) == nil, "ExchangeRateStore: 최초엔 nil")
+        ExchangeRateStore.save(goodRate, defaults: fud)
+        if let loaded = ExchangeRateStore.load(defaults: fud) {
+            check(abs(loaded.rate - 1452.35) < 1e-9 && loaded.baseDate == "2026-07-29"
+                      && abs(loaded.fetchedAt.timeIntervalSince1970 - fxNow.timeIntervalSince1970) < 1,
+                  "ExchangeRateStore: 3개 필드 왕복")
+        } else { check(false, "ExchangeRateStore: 저장 후 load 성공해야 함") }
+        fud.set(0.0, forKey: "fxKRWRate")
+        check(ExchangeRateStore.load(defaults: fud) == nil,
+              "ExchangeRateStore: 저장된 값이 비상식적이면 nil — double(forKey:)의 0 폴백에 속지 않는다")
+        fud.removePersistentDomain(forName: fxSuite)
+    } else { check(false, "ExchangeRateStore: 전용 UserDefaults suite 생성 성공해야 함") }
+
     // FiveHourBlock.active
     let base = Date(timeIntervalSince1970: 1_704_067_200)  // 2024-01-01 00:00:00 UTC
     let h: TimeInterval = 3600
@@ -4890,6 +5372,80 @@ func runSelfTests() -> Never {
         } else {
             check(false, "makeTitleContext: 앵커 미설정+활성 블록 조합도 non-nil이어야 함")
         }
+
+        // 원화 회귀: 메뉴바 타이틀 금액과 드롭다운 "현재 블록" 금액이 **같은 문자열**이어야 한다.
+        // 두 어댑터가 currencyContext()/currencyDisplay()를 공유하는지 고정한다 — 앵커에서 겪은
+        // "드롭다운만 고치고 타이틀을 놓쳐 위아래가 다른 값을 보여준" 버그의 통화 버전 예방.
+        // makeBlockDisplayData/makeTitleContext는 CurrencySettings를 .standard에서 읽으므로
+        // (ResetAnchorSettings와 동일한 기존 관례) 실제 값을 save/restore한다.
+        // CurrencySettings.currency()가 아니라 object(forKey:)로 백업한다 — 전자는 "키 없음"과
+        // "usd 저장됨"을 구분할 수 없어 복원 시 없던 키를 만들어낸다(테스트가 사용자 도메인을 오염).
+        // currencyArgOverridden(위 통화 테스트 구간에서 계산)이면 건너뛴다 — 이유는 그쪽 주석 참고.
+        if !currencyArgOverridden {
+        let savedCurrencyRaw = UserDefaults.standard.object(forKey: "displayCurrency")
+        CurrencySettings.setCurrency(.krw)
+        app.cachedExchangeRate = ExchangeRate(rate: 1452.35, baseDate: "2026-06-29", fetchedAt: testNow)
+        let krwData = app.makeBlockDisplayData(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow)
+        if let titleKRW = app.makeTitleContext(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow),
+           case .ready(let kBlock, _, _, _) = krwData.state, let kb = kBlock {
+            check(krwData.currency.rate != nil, "원화 모드: 드롭다운에 환율이 실린다")
+            check(krwData.currency.baseDate == "2026-06-29", "원화 모드: 기준일이 정보 행으로 전달된다")
+            check(!krwData.currency.stale && !krwData.currency.unavailable,
+                  "원화 모드: 신선한 환율이면 배너·실패 안내 없음")
+            let titleMoney = formatMoney(titleKRW.ctx.cost, titleKRW.ctx.currency)
+            let dropMoney = formatMoney(kb.cost, krwData.currency.context)
+            check(titleMoney.hasPrefix("₩"), "원화 모드: 메뉴바 타이틀 비용이 ₩로 렌더된다")
+            check(dropMoney.hasPrefix("₩"), "원화 모드: 드롭다운 블록 비용이 ₩로 렌더된다")
+            check(dropMoney == titleMoney,
+                  "원화 모드: 타이틀 금액 == 드롭다운 금액(같은 formatMoney·같은 환율)")
+            // 드롭다운의 나머지 금액 행들도 같은 context를 쓰는지 — 행마다 통화가 갈리지 않음을 고정.
+            if case .ready(_, let kModel, let kToday, let kAll) = krwData.state {
+                check(formatMoney(kToday.totalCost, krwData.currency.context).hasPrefix("₩"),
+                      "원화 모드: 오늘 예상 비용도 ₩")
+                if let all = kAll {
+                    check(formatMoney(all.totalCost, krwData.currency.context).hasPrefix("₩"),
+                          "원화 모드: 전체 누적 예상 비용도 ₩")
+                }
+                // 1차(캐시) 경로는 모델 이름만 있고 분해가 없다(.namesOnly) — 분해가 있을 때만 단정.
+                if case .breakdown(let items, _) = kModel?.shape, let first = items.first {
+                    check(formatMoney(first.cost, krwData.currency.context).hasPrefix("₩"),
+                          "원화 모드: 모델별 분해 행도 ₩")
+                }
+                if let cph = kb.burnRateCostPerHour {
+                    check(formatMoney(cph, krwData.currency.context).hasPrefix("₩"),
+                          "원화 모드: 소모율도 ₩ (뷰모델이 Double을 넘겨 렌더러가 포맷)")
+                }
+            }
+            // 최고 기록은 GamificationSettings에서 직접 읽는 별개 경로 — 같은 context를 쓰는지만 고정.
+            check(formatMoney(GamificationSettings.load().bestDayCost, krwData.currency.context).hasPrefix("₩"),
+                  "원화 모드: 최고 기록도 ₩ (현재 환율로 환산)")
+        } else {
+            check(false, "원화 모드: 앵커 미설정+활성 블록 조합은 non-nil이어야 함")
+        }
+
+        // 회귀: 달러 모드로 되돌리면 환율 행·배너·안내가 전부 사라지고 모든 금액이 "$"로 복귀 —
+        // 즉 기존 사용자 화면이 문자 단위로 불변임을 고정한다.
+        CurrencySettings.setCurrency(.usd)
+        let usdData = app.makeBlockDisplayData(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow)
+        check(usdData.currency.rate == nil && !usdData.currency.stale && !usdData.currency.unavailable,
+              "달러 모드: 환율이 캐시에 있어도 환율 행·배너·안내 전부 없음(기존 화면 불변)")
+        if case .ready(let uBlock, _, let uToday, let uAll) = usdData.state, let ub = uBlock {
+            check(formatMoney(ub.cost, usdData.currency.context) == formatCost(ub.cost),
+                  "달러 모드: 드롭다운 블록 비용이 formatCost와 완전히 동일")
+            check(formatMoney(uToday.totalCost, usdData.currency.context) == formatCost(uToday.totalCost),
+                  "달러 모드: 오늘 예상 비용도 formatCost 그대로")
+            if let all = uAll {
+                check(formatMoney(all.totalCost, usdData.currency.context) == formatCost(all.totalCost),
+                      "달러 모드: 전체 누적 예상 비용도 formatCost 그대로")
+            }
+        } else { check(false, "달러 모드: .ready(block: non-nil)이어야 함") }
+        if let titleUSD = app.makeTitleContext(fromCache: scAnchor, cachedAll: anchorEntries, now: testNow) {
+            check(formatMoney(titleUSD.ctx.cost, titleUSD.ctx.currency) == formatCost(titleUSD.ctx.cost),
+                  "달러 모드: 타이틀 비용 문자열이 formatCost와 완전히 동일")
+        } else { check(false, "달러 모드: makeTitleContext non-nil이어야 함") }
+        if let v = savedCurrencyRaw { UserDefaults.standard.set(v, forKey: "displayCurrency") }
+        else { UserDefaults.standard.removeObject(forKey: "displayCurrency") }
+        }  // currencyArgOverridden else
 
         if let s = savedAnchor { ResetAnchorSettings.setAnchor(s) } else { ResetAnchorSettings.clearAnchor() }
     } else {
@@ -5356,6 +5912,16 @@ func runSelfTests() -> Never {
     setEnabled([.todayTokens, .todayCost, .cumulativeTokens])
     check(buildTitleText(todayCumulativeCtx) == "⌨ 128.0K $2.50 5.20M",
           "title: 오늘 토큰+오늘 비용+누적 토큰 조합(패딩 없는 formatTokens)")
+    // 원화 모드 타이틀 — currency 기본값이 .usd라 위 기존 단정들이 그대로 통과하는 것 자체가
+    // "기존 사용자 화면 불변" 회귀 가드다. 여기서는 .krw를 명시했을 때의 출력을 고정한다.
+    let krwTitleCtx = TitleContext(outputTokens: 12_300, totalTokens: 50_000, cost: 4.2,
+                                   remainingText: nil, model: "claude-sonnet-4-5",
+                                   todayTokens: 128_000, todayCost: 2.5,
+                                   currency: .krw(rate: 1500))
+    setEnabled([.outputTokens, .cost])
+    check(buildTitleText(krwTitleCtx) == "⌨ 12.3K ₩6,300", "title: 원화 모드 블록 비용(4.2 × 1500)")
+    setEnabled([.todayCost])
+    check(buildTitleText(krwTitleCtx) == "⌨ ₩3,750", "title: 원화 모드 오늘 비용도 함께 환산(2.5 × 1500)")
     for (field, value) in savedTitleDefaults {
         if let v = value { UserDefaults.standard.set(v, forKey: field.defaultsKey) }
         else { UserDefaults.standard.removeObject(forKey: field.defaultsKey) }
