@@ -2626,6 +2626,133 @@ func makeServerLimitsSection(from rateLimits: RateLimitsCache?, now: Date = Date
     return rows.isEmpty ? nil : ServerLimitsSectionData(rows: rows)
 }
 
+// MARK: - Limit Consumption History (한도 소진 이력)
+//
+// rate-limits-cache.json은 **스냅샷**이다 — 매 턴 덮어써지므로 "이번 주 피크가 얼마였나",
+// "5시간 한도를 몇 번이나 쳤나"에 답할 수 없다. 그런데 플랜 업/다운그레이드 판단에 필요한 건
+// 현재 %가 아니라 바로 그 분포다. 그래서 이 앱이 직접 적립한다.
+//
+// **OAuth를 붙여도 이 결론은 바뀌지 않는다**(조사 결과): ① claude.ai OAuth 스코프에 사용량·한도를
+// 읽는 스코프가 없고(user:inference/profile/file_upload/mcp_servers/sessions뿐), ② 한도 정보는
+// 조회 가능한 자원이 아니라 추론 요청의 `anthropic-ratelimit-unified-*` **응답 헤더**로만 나와
+// 관측하려면 측정 대상 쿼터를 스스로 소비해야 하며, ③ 공식 시계열 API(Admin Usage/Cost)는 Console
+// 조직 전용으로 "individual accounts 사용 불가"가 문서에 명시돼 있다. 반면 여기서 쓰는 값은
+// **사용자가 어차피 보낸 요청의 부산물**이라 정확도는 같으면서 쿼터도 네트워크도 쓰지 않는다.
+//
+// 창의 식별자는 `resets_at`이다 — **달력 주가 아니다**. 서버 주간 창은 임의 위상(예: 금 16:00~금
+// 16:00)이라 드롭다운의 "이번 주(일요일 시작)" 섹션과 구간이 다르다. 두 숫자를 같은 기준으로 읽으면
+// 안 되므로 섹션과 라벨을 분리한다("5시간 블록 ≠ 서버 리셋"과 같은 취지).
+//
+// 절대 한도나 플랜 배수 환산은 **의도적으로 없다**. 공식 문서에 Pro/Max 절대 한도가 없고, 널리
+// 인용되는 비공식 수치조차 5x가 Pro의 2배·20x가 5배로 이름의 배수와 맞지 않으며 모델별로도 다르다.
+// 근거 없는 환산으로 플랜 변경을 유도하지 않는다 — 남는 정직한 표현은 "현재 플랜에서의 피크 분포"뿐이다.
+let LIMIT_HISTORY_WEEKS = 12
+// 판단을 권하기 전 필요한 최소 관측 주 수. 이보다 적으면 "수집 중"을 명시한다 — 2주 데이터로
+// 플랜을 바꾸게 두면 이 기능이 하려는 일과 정반대가 된다.
+let LIMIT_TREND_MIN_WEEKS = 4
+
+struct LimitWindowPeak: Codable, Equatable {
+    let windowEnd: Date       // resets_at — 이 창의 고유 키
+    var peakPercent: Double   // 그 창에서 관측한 최대 used_percentage
+}
+
+struct LimitHistory: Codable, Equatable {
+    var weeklyPeaks: [LimitWindowPeak] = []    // windowEnd 오름차순
+    var fiveHourHighWindowEnds: [Date] = []    // 임계 이상을 친 5시간 창의 종료 시각(창당 1건)
+    static let empty = LimitHistory()
+}
+
+// 순수 함수: 기존 이력 + 새 관측 → 갱신된 이력. I/O와 분리해 셀프테스트가 창 전환·중복 관측·
+// stale 조합을 직접 시험할 수 있게 한다.
+func recordLimitPeaks(_ history: LimitHistory, observing limits: RateLimitsCache?,
+                      now: Date, highRatio: Double = WARN_RATIO,
+                      retainWeeks: Int = LIMIT_HISTORY_WEEKS) -> LimitHistory {
+    var h = history
+
+    // 주간 창: 같은 창을 30초마다 다시 보므로 **최대값으로 갱신**한다. 마지막 관측으로 덮어쓰면
+    // 리셋 직전에 낮게 관측된 값이 그 주의 피크를 지워 버린다.
+    if let w = limits?.sevenDay, let pct = w.usedPercentage, let end = w.resetsAtDate, !w.isStale(now: now) {
+        if let i = h.weeklyPeaks.firstIndex(where: { $0.windowEnd == end }) {
+            h.weeklyPeaks[i].peakPercent = max(h.weeklyPeaks[i].peakPercent, pct)
+        } else {
+            h.weeklyPeaks.append(LimitWindowPeak(windowEnd: end, peakPercent: pct))
+        }
+    }
+
+    // 5시간 창: "임계 이상을 쳤다"는 **사실**만 창당 한 번 센다. 중복을 막지 않으면 한 번의 고사용이
+    // 새로고침 주기마다 계수돼(10초 주기면 5시간에 1,800회) 숫자가 통째로 무의미해진다.
+    if let w = limits?.fiveHour, let pct = w.usedPercentage, let end = w.resetsAtDate, !w.isStale(now: now),
+       pct >= highRatio * 100, !h.fiveHourHighWindowEnds.contains(end) {
+        h.fiveHourHighWindowEnds.append(end)
+    }
+
+    // 보관 기간 밖은 버린다(UserDefaults에 영속되므로 무한 증식하면 안 된다).
+    h.weeklyPeaks.sort { $0.windowEnd < $1.windowEnd }
+    if h.weeklyPeaks.count > retainWeeks {
+        h.weeklyPeaks.removeFirst(h.weeklyPeaks.count - retainWeeks)
+    }
+    // 5시간 이벤트는 개수가 아니라 시각으로 자른다 — 주간 이력과 같은 지평선을 보게 해서
+    // "최근 N주간 몇 회"라는 표시가 실제 그 기간을 가리키도록 한다.
+    let horizon = now.addingTimeInterval(-Double(retainWeeks) * 7 * 86_400)
+    h.fiveHourHighWindowEnds = h.fiveHourHighWindowEnds.filter { $0 >= horizon }.sorted()
+    return h
+}
+
+// 표시용 뷰모델. 관측 기록이 하나도 없으면 nil → 호출부가 섹션 자체를 그리지 않는다
+// (serverLimits와 같은 관례 — 기능 도입 전 사용자 화면 불변).
+struct LimitTrendSectionData {
+    let peaks: [Double]            // 오래된 → 최신 순 주간 피크 %
+    let maxPercent: Double
+    let avgPercent: Double
+    let fiveHourHighCount: Int
+    let observedWeeks: Int
+    let retainWeeks: Int
+    let highRatioPercent: Int      // 5시간 도달 판정 임계(표시용) — WARN_RATIO에서 파생
+    var isBuilding: Bool { observedWeeks < LIMIT_TREND_MIN_WEEKS }
+}
+
+func makeLimitTrendSection(from history: LimitHistory,
+                           retainWeeks: Int = LIMIT_HISTORY_WEEKS,
+                           highRatio: Double = WARN_RATIO) -> LimitTrendSectionData? {
+    // 저장 순서를 신뢰하지 않고 여기서 다시 정렬한다 — 스파크라인은 시간축 그래프라 순서가
+    // 어긋나면 조용히 거짓 추세를 그린다(값은 다 맞는데 모양만 틀리므로 눈치채기 어렵다).
+    let peaks = history.weeklyPeaks.sorted { $0.windowEnd < $1.windowEnd }.map { $0.peakPercent }
+    guard !peaks.isEmpty else { return nil }
+    return LimitTrendSectionData(peaks: peaks,
+                                 maxPercent: peaks.max() ?? 0,
+                                 avgPercent: peaks.reduce(0, +) / Double(peaks.count),
+                                 fiveHourHighCount: history.fiveHourHighWindowEnds.count,
+                                 observedWeeks: peaks.count,
+                                 retainWeeks: retainWeeks,
+                                 highRatioPercent: Int((highRatio * 100).rounded()))
+}
+
+// 0~100%를 8단계 블록 문자로. **스케일은 항상 0~100 고정이다** — 데이터 최대값으로 정규화하면
+// 3%짜리 주와 90%짜리 주가 똑같이 꽉 찬 막대가 되어, "한도에 얼마나 가까운가"라는 이 그래프의
+// 유일한 질문에 정확히 거짓말을 하게 된다.
+func limitSparkline(_ percents: [Double]) -> String {
+    let bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    return percents.map { p -> String in
+        let clamped = max(0, min(100, p))
+        return bars[min(bars.count - 1, Int(clamped / 100 * Double(bars.count - 1) + 0.5))]
+    }.joined()
+}
+
+enum LimitHistoryStore {
+    private static let key = "limitHistory"
+    // Date의 기본 Codable 표현은 숫자(레퍼런스 기준 초)라 날짜 포매터를 타지 않는다 —
+    // 이 파일이 반복해서 밟았던 로케일/달력 함정이 여기엔 애초에 없다.
+    static func load(defaults: UserDefaults = .standard) -> LimitHistory {
+        guard let data = defaults.data(forKey: key),
+              let h = try? JSONDecoder().decode(LimitHistory.self, from: data) else { return .empty }
+        return h
+    }
+    static func save(_ h: LimitHistory, defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(h) else { return }   // 인코딩 실패 시 기존 값 보존
+        defaults.set(data, forKey: key)
+    }
+}
+
 final class RateLimitsCacheReader {
     let url: URL
     private var lastMTime: Date?
@@ -2937,6 +3064,9 @@ struct BlockDisplayData {
     // 채 새로고침될 때 섹션이 사라졌다 다시 나타나며 메뉴 높이가 튄다.
     let week: PeriodSectionData?
     let month: PeriodSectionData?
+    // 한도 소진 추이 — 관측 기록이 하나도 없으면 nil이라 섹션 자체가 사라진다. week/month와 같은
+    // 이유로 최상위 필드다.
+    let limitTrend: LimitTrendSectionData?
 
     // 커스텀 init: anchorIsEstimating/rateLimitReset/serverLimits/week/month에 기본값을 주기 위함 —
     // Swift의 synthesized memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지
@@ -2944,7 +3074,8 @@ struct BlockDisplayData {
     // 컴파일되고 통과하는 것이 "기존 사용자 화면 불변"의 증거다(통화 기능 도입 때와 같은 방식).
     init(isEstimate: Bool, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil,
          serverLimits: ServerLimitsSectionData? = nil, currency: CurrencyDisplay = .none,
-         week: PeriodSectionData? = nil, month: PeriodSectionData? = nil, state: State) {
+         week: PeriodSectionData? = nil, month: PeriodSectionData? = nil,
+         limitTrend: LimitTrendSectionData? = nil, state: State) {
         self.isEstimate = isEstimate
         self.anchorIsEstimating = anchorIsEstimating
         self.rateLimitReset = rateLimitReset
@@ -2952,6 +3083,7 @@ struct BlockDisplayData {
         self.currency = currency
         self.week = week
         self.month = month
+        self.limitTrend = limitTrend
         self.state = state
     }
 }
@@ -2966,7 +3098,7 @@ extension BlockDisplayData {
         // (빠뜨리면 새로고침 중에만 두 섹션이 통째로 사라져 메뉴 높이가 튄다).
         return BlockDisplayData(isEstimate: isEstimate, anchorIsEstimating: anchorIsEstimating,
                                  rateLimitReset: rateLimitReset, serverLimits: serverLimits,
-                                 currency: currency, week: week, month: month,
+                                 currency: currency, week: week, month: month, limitTrend: limitTrend,
                                  state: .loading(block: block, model: model, today: today, allTime: allTime))
     }
 }
@@ -2983,6 +3115,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var cachedAll: [UsageEntry] = []
     var cachedStats: StatsCache?
     var cachedRateLimits: RateLimitsCache?
+    // 한도 소진 이력. 앱 시작 시 디스크에서 부트스트랩하므로 재시작해도 이어서 쌓인다
+    // (LaunchAgent로 상시 실행되지만 재부팅·업데이트로 끊기는 것을 감당해야 한다).
+    var cachedLimitHistory: LimitHistory = LimitHistoryStore.load()
     let rateFetcher = ExchangeRateFetcher()
     // 마지막으로 확보한 환율. 앱 시작 시 ExchangeRateStore에서 부트스트랩하므로 첫 프레임부터
     // 캐시 값으로 원화가 보이고, 조회 실패 시에도 이 값이 유지된다(폴백).
@@ -3219,6 +3354,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // 돌아가는 자기소멸 설계라 게이팅하면 "🎉 마일스톤" 배지가 영구 고정된다.
                 self.updateGamificationRecord()
                 self.updateEasterEggState()
+                self.updateLimitHistory(rateLimits: rateLimits)
                 self.applyAutoResetAnchorIfNeeded(rateLimits: rateLimits)
                 self.buildMenu()
                 if manual { self.statusItem.button?.alphaValue = 1.0 }
@@ -3768,6 +3904,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  currency: currencyDisplay(currency: CurrencySettings.currency(),
                                                            rate: cachedExchangeRate, now: now),
                                  week: periods.week, month: periods.month,
+                                 limitTrend: makeLimitTrendSection(from: cachedLimitHistory),
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -3782,14 +3919,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         case .loading(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
-                                 week: data.week, month: data.month,
+                                 week: data.week, month: data.month, limitTrend: data.limitTrend,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
                                  currency: data.currency, skeleton: true, into: menu)
 
         case .ready(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
-                                 week: data.week, month: data.month,
+                                 week: data.week, month: data.month, limitTrend: data.limitTrend,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
                                  currency: data.currency, skeleton: false, into: menu)
@@ -3802,6 +3939,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func renderBlockSections(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData,
                                       allTime: AllTimeSectionData?,
                                       week: PeriodSectionData? = nil, month: PeriodSectionData? = nil,
+                                      limitTrend: LimitTrendSectionData? = nil,
                                       isEstimate: Bool, anchorIsEstimating: Bool,
                                       rateLimitReset: Date?, serverLimits: ServerLimitsSectionData? = nil,
                                       currency: CurrencyDisplay = .none,
@@ -3930,6 +4068,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
+        // ── Limit Trend Section ──
+        // 바로 위 "서버 실측 사용률"이 **지금 이 순간**의 %라면, 여기는 그 값을 매 refresh마다
+        // 적립해 만든 **분포**다. 플랜 업/다운그레이드 판단에 쓰이는 건 현재값이 아니라 이쪽이다.
+        // 두 섹션을 붙여 두는 건 출처가 같기 때문이고, 라벨로 "지금" vs "추이"를 구분한다.
+        if let trend = limitTrend {
+            renderLimitTrendSection(trend, skeleton: skeleton, into: menu)
+        }
+
         // ── Model Section ──
         if let model = model {
             addSectionHeader(menu, t(model.headerKo, model.headerEn))
@@ -3999,6 +4145,39 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !skeleton {
             appendGamificationSection(menu, currency: currency)
         }
+    }
+
+    // 한도 소진 추이 렌더러. 금액이 없는 섹션이라 통화 인자를 받지 않는다 — 여기 숫자는 전부
+    // 서버가 준 %이고, 환율이나 표시 통화와 무관하다.
+    private func renderLimitTrendSection(_ data: LimitTrendSectionData, skeleton: Bool, into menu: NSMenu) {
+        // 헤더에 "서버 주간 창"을 명시하는 건 필수다 — 아래 "이번 주" 섹션은 일요일 시작 달력 주고
+        // 이건 서버가 정한 임의 위상의 7일 창이라, 라벨이 없으면 두 숫자가 안 맞는 이유를 알 수 없다.
+        addSectionHeader(menu, t("📉  한도 소진 추이 (서버 주간 창 기준)",
+                                 "📉  Limit Consumption Trend (server weekly windows)"))
+        skeleton ? addSkeletonLabel(menu)
+                 : addLabel(menu, "  " + t("주간 피크: \(limitSparkline(data.peaks))",
+                                           "Weekly peaks: \(limitSparkline(data.peaks))"))
+        let maxPct = Int(data.maxPercent.rounded())
+        let avgPct = Int(data.avgPercent.rounded())
+        skeleton ? addSkeletonLabel(menu)
+                 : addLabel(menu, "  " + t("최고 \(maxPct)% · 평균 \(avgPct)% (\(data.observedWeeks)주 관측)",
+                                           "Peak \(maxPct)% · avg \(avgPct)% (\(data.observedWeeks) weeks observed)"))
+        // 0회일 땐 줄 자체를 넣지 않는다 — "0회"는 정보가 아니라 잡음이고, 이 줄이 보이는 것
+        // 자체가 "한도를 친 적이 있다"는 신호가 되게 한다.
+        if data.fiveHourHighCount > 0 {
+            skeleton ? addSkeletonLabel(menu)
+                     : addColoredLabel(menu, "  " + t("⚠️ 5시간 한도 \(data.highRatioPercent)%+ 도달: \(data.fiveHourHighCount)회",
+                                                      "⚠️ 5-hour limit hit \(data.highRatioPercent)%+: \(data.fiveHourHighCount)×"),
+                                       color: .systemOrange)
+        }
+        // 관측이 얕을 때 이를 숨기면 사용자가 2주짜리 데이터로 플랜을 바꾼다 — 이 기능이 하려는 일과
+        // 정반대다. 그래서 충분히 쌓이기 전까지는 매번 명시한다.
+        if data.isBuilding {
+            skeleton ? addSkeletonLabel(menu)
+                     : addLabel(menu, "  " + t("ⓘ 데이터 수집 중 (\(data.observedWeeks)/\(data.retainWeeks)주) — \(LIMIT_TREND_MIN_WEEKS)주 이상 쌓인 뒤 판단 권장",
+                                               "ⓘ Collecting data (\(data.observedWeeks)/\(data.retainWeeks) weeks) — wait for \(LIMIT_TREND_MIN_WEEKS)+ weeks"))
+        }
+        menu.addItem(.separator())
     }
 
     // 주간/월별 섹션 렌더러(두 기간이 같은 코드를 쓴다 — 헤더 문구와 "월말 예상" 줄만 다르다).
@@ -4273,6 +4452,25 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshResetAnchorUI() {
         resetAnchorItem?.title = resetAnchorMenuTitle()
         refreshResetAnchorSubmenuRows()
+    }
+
+    // 매 refresh마다 서버 실측 스냅샷을 한도 소진 이력에 적립한다. 스냅샷은 매 턴 덮어써지므로
+    // 여기서 훔쳐보지 않으면 그 창의 피크는 영영 회수할 수 없다 — 그래서 앱이 도는 동안에는
+    // 조건 없이 항상 호출한다(게이팅하면 놓친 창이 빈칸으로 남는다).
+    //
+    // 값이 실제로 달라질 때만 디스크에 쓴다. 같은 창을 계속 보는 동안(대부분의 시간)은 결과가
+    // 동일하므로, 이 가드가 없으면 30초마다 UserDefaults 쓰기가 발생한다.
+    //
+    // defaults는 **셀프테스트 주입 지점**이다. 기본값 `.standard`로 두고 테스트가 그대로 호출하면
+    // 픽스처 관측이 사용자의 진짜 이력에 섞여 들어간다 — 실제로 한 번 그렇게 오염시켰고(픽스처의
+    // "30%" 주간 창이 실사용 기록에 남았다), 실기 확인에서야 드러났다. GamificationSettings/
+    // ExchangeRateStore가 이미 같은 이유로 defaults를 인자로 받는다.
+    func updateLimitHistory(rateLimits: RateLimitsCache?, now: Date = Date(),
+                            defaults: UserDefaults = .standard) {
+        let updated = recordLimitPeaks(cachedLimitHistory, observing: rateLimits, now: now)
+        guard updated != cachedLimitHistory else { return }
+        cachedLimitHistory = updated
+        LimitHistoryStore.save(updated, defaults: defaults)
     }
 
     // rate-limits-cache.json에서 읽은 서버 실측값으로 앵커를 자동 적용한다. 자동 동기화가 꺼져
@@ -4706,6 +4904,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  currency: currencyDisplay(currency: CurrencySettings.currency(),
                                                            rate: cachedExchangeRate, now: now),
                                  week: periods.week, month: periods.month,
+                                 limitTrend: makeLimitTrendSection(from: cachedLimitHistory),
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -5426,6 +5625,142 @@ func runSelfTests() -> Never {
     }
     check(autoResetAnchor(from: RateLimitsCache(fiveHour: nil, sevenDay: nil), now: rlNow) == nil,
           "autoResetAnchor: fiveHour 필드가 없으면 nil")
+
+    // ── 한도 소진 이력(recordLimitPeaks / makeLimitTrendSection) ──
+    // 스냅샷 소스에서 시계열을 만드는 부분이라, 창 전환·중복 관측·stale 조합이 전부 회귀 지점이다.
+    //
+    // 이 블록은 사용자의 진짜 이력이 담긴 .standard를 절대 건드리면 안 된다. 시작 시점 값을
+    // 떠 두고 끝에서 대조해, 앞으로 누가 테스트를 추가하다 기본 defaults로 저장 경로를 부르면
+    // 즉시 드러나게 한다(오염은 조용해서 실기 확인 전엔 아무도 모른다 — 실제로 그랬다).
+    let standardLimitHistoryBefore = UserDefaults.standard.object(forKey: "limitHistory") as? Data
+    func window(_ pct: Double, endsIn seconds: Int, from base: Date) -> RateLimitWindow {
+        RateLimitWindow(usedPercentage: pct, resetsAt: Int(base.timeIntervalSince1970) + seconds)
+    }
+    let lhNow = parseISO8601("2026-08-20T12:00:00.000Z")!
+    let weekA = window(30, endsIn: 2 * 86_400, from: lhNow)          // 현재 주간 창
+    let weekB = window(10, endsIn: 9 * 86_400, from: lhNow)          // 다음 주간 창(창 전환 후)
+
+    // 같은 창을 여러 번 관측하면 **최대값**만 남아야 한다. 30초마다 도는 앱이라 같은 창을 수백 번
+    // 보게 되는데, 마지막 값을 덮어쓰면 피크를 지나 사용률이 리셋 직전에 낮게 관측될 때 피크가 사라진다.
+    var lh = recordLimitPeaks(.empty, observing: RateLimitsCache(fiveHour: nil, sevenDay: weekA), now: lhNow)
+    check(lh.weeklyPeaks.count == 1 && lh.weeklyPeaks.first?.peakPercent == 30,
+          "recordLimitPeaks: 첫 관측이 주간 피크로 기록됨")
+    lh = recordLimitPeaks(lh, observing: RateLimitsCache(fiveHour: nil, sevenDay: window(75, endsIn: 2 * 86_400, from: lhNow)), now: lhNow)
+    check(lh.weeklyPeaks.count == 1 && lh.weeklyPeaks.first?.peakPercent == 75,
+          "recordLimitPeaks: 같은 창 재관측은 행을 늘리지 않고 최대값으로 갱신")
+    lh = recordLimitPeaks(lh, observing: RateLimitsCache(fiveHour: nil, sevenDay: window(40, endsIn: 2 * 86_400, from: lhNow)), now: lhNow)
+    check(lh.weeklyPeaks.first?.peakPercent == 75,
+          "recordLimitPeaks: 이후 낮은 관측이 와도 피크는 내려가지 않는다(마지막값 덮어쓰기 금지)")
+    lh = recordLimitPeaks(lh, observing: RateLimitsCache(fiveHour: nil, sevenDay: weekB), now: lhNow)
+    check(lh.weeklyPeaks.count == 2 && lh.weeklyPeaks.last?.peakPercent == 10,
+          "recordLimitPeaks: resets_at이 바뀌면 새 창으로 분리 기록")
+
+    // stale(리셋 시각이 이미 지남) 관측은 반영하지 않는다 — statusLine이 한동안 안 돈 낡은 파일이다.
+    let staleWeek = RateLimitWindow(usedPercentage: 99, resetsAt: Int(lhNow.timeIntervalSince1970) - 60)
+    check(recordLimitPeaks(lh, observing: RateLimitsCache(fiveHour: nil, sevenDay: staleWeek), now: lhNow) == lh,
+          "recordLimitPeaks: stale한 창은 무시(이력 오염 방지)")
+    check(recordLimitPeaks(lh, observing: nil, now: lhNow) == lh,
+          "recordLimitPeaks: rateLimits 자체가 nil이면 이력 불변")
+
+    // 5시간 창: "임계 이상을 쳤다"는 사실을 **창당 한 번만** 센다. 중복을 막지 않으면 한 번의
+    // 고사용이 30초 간격으로 수백 회 계수돼 통계가 무의미해진다.
+    let hot = window(95, endsIn: 3_600, from: lhNow)
+    var lf = recordLimitPeaks(.empty, observing: RateLimitsCache(fiveHour: hot, sevenDay: nil), now: lhNow)
+    lf = recordLimitPeaks(lf, observing: RateLimitsCache(fiveHour: hot, sevenDay: nil), now: lhNow)
+    lf = recordLimitPeaks(lf, observing: RateLimitsCache(fiveHour: window(97, endsIn: 3_600, from: lhNow), sevenDay: nil), now: lhNow)
+    check(lf.fiveHourHighWindowEnds.count == 1,
+          "recordLimitPeaks: 같은 5시간 창의 반복 관측은 1회로만 계수")
+    lf = recordLimitPeaks(lf, observing: RateLimitsCache(fiveHour: window(93, endsIn: 20_000, from: lhNow), sevenDay: nil), now: lhNow)
+    check(lf.fiveHourHighWindowEnds.count == 2, "recordLimitPeaks: 다른 5시간 창은 따로 계수")
+    let mild = window(89, endsIn: 40_000, from: lhNow)
+    check(recordLimitPeaks(lf, observing: RateLimitsCache(fiveHour: mild, sevenDay: nil), now: lhNow).fiveHourHighWindowEnds.count == 2,
+          "recordLimitPeaks: 임계(90%) 미만은 계수하지 않음")
+
+    // 보관 기간: 오래된 주간 창은 버린다(무한 증식 방지).
+    var many = LimitHistory.empty
+    for i in 0..<(LIMIT_HISTORY_WEEKS + 5) {
+        many = recordLimitPeaks(many,
+                                observing: RateLimitsCache(fiveHour: nil,
+                                                           sevenDay: window(Double(i), endsIn: (i + 1) * 7 * 86_400, from: lhNow)),
+                                now: lhNow)
+    }
+    check(many.weeklyPeaks.count == LIMIT_HISTORY_WEEKS,
+          "recordLimitPeaks: 주간 이력은 \(LIMIT_HISTORY_WEEKS)개로 제한")
+    check(many.weeklyPeaks.first?.peakPercent == 5,
+          "recordLimitPeaks: 오래된 쪽부터 버린다(최신 \(LIMIT_HISTORY_WEEKS)개 유지)")
+
+    // 표시 뷰모델
+    check(makeLimitTrendSection(from: .empty) == nil,
+          "makeLimitTrendSection: 기록이 없으면 nil(섹션 자체가 사라짐 — 기존 화면 불변)")
+    if let trend = makeLimitTrendSection(from: lh) {
+        check(trend.peaks == [75, 10], "makeLimitTrendSection: 오래된 → 최신 순 피크 배열")
+        check(trend.maxPercent == 75 && abs(trend.avgPercent - 42.5) < 1e-9,
+              "makeLimitTrendSection: 최고/평균")
+        check(trend.observedWeeks == 2 && trend.isBuilding,
+              "makeLimitTrendSection: \(LIMIT_TREND_MIN_WEEKS)주 미만이면 '수집 중'으로 표시")
+    } else {
+        check(false, "makeLimitTrendSection: 기록이 있으면 non-nil이어야 함")
+    }
+
+    // 스파크라인 스케일은 0~100 고정 — 데이터 최대값으로 정규화하면 3%와 90%가 같은 높이로 보인다.
+    check(limitSparkline([0]) == "▁" && limitSparkline([100]) == "█",
+          "limitSparkline: 0% → 최소 막대, 100% → 최대 막대")
+    check(limitSparkline([3, 3, 3]) == "▁▁▁",
+          "limitSparkline: 낮은 값만 있어도 막대가 차지 않는다(자기 정규화 금지)")
+    check(limitSparkline([50]) == "▅", "limitSparkline: 50% → 중간 막대")
+    check(limitSparkline([150]) == "█" && limitSparkline([-10]) == "▁",
+          "limitSparkline: 범위 밖 값도 0~100으로 클램프(인덱스 이탈 방지)")
+
+    // 배선 회귀: 순수 함수가 값을 만들어도 어댑터·스켈레톤이 옮기지 않으면 화면엔 안 나온다.
+    // (updateLimitHistory는 .standard에 쓰므로 여기선 호출하지 않고, cachedLimitHistory에 직접
+    //  주입해 어댑터 → BlockDisplayData 경로만 시험한다 — 사용자 도메인 오염 금지 원칙.)
+    let trendApp = ClaudeMonitorApp()
+    trendApp.cachedLimitHistory = lh
+    let trendWired = trendApp.makeBlockDisplayData(fromEntries: [], reader: UsageDataReader(), now: lhNow)
+    check(trendWired.limitTrend?.observedWeeks == 2,
+          "makeBlockDisplayData(fromEntries:): 한도 추이가 BlockDisplayData까지 배선됨")
+    check(trendWired.asLoadingSkeleton()?.limitTrend != nil,
+          "asLoadingSkeleton(): 한도 추이도 전파(새로고침 중 섹션이 사라지지 않음)")
+    let emptyTrendApp = ClaudeMonitorApp()
+    emptyTrendApp.cachedLimitHistory = .empty
+    check(emptyTrendApp.makeBlockDisplayData(fromEntries: [], reader: UsageDataReader(), now: lhNow).limitTrend == nil,
+          "makeBlockDisplayData: 기록이 없으면 limitTrend는 nil(섹션 생략 — 기존 사용자 화면 불변)")
+
+    // updateLimitHistory: 값이 안 바뀌면 저장을 건너뛴다(30초마다 UserDefaults 쓰기 방지).
+    // **반드시 격리 suite를 주입한다** — 기본값 .standard로 부르면 아래 픽스처 관측(30% 주간 창)이
+    // 사용자의 진짜 한도 이력에 영구히 섞인다. 실제로 한 번 그렇게 오염시켰다.
+    let dedupSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let dd = UserDefaults(suiteName: dedupSuite) {
+        let dedupApp = ClaudeMonitorApp()
+        dedupApp.cachedLimitHistory = .empty
+        let obs = RateLimitsCache(fiveHour: nil, sevenDay: weekA)
+        dedupApp.updateLimitHistory(rateLimits: obs, now: lhNow, defaults: dd)
+        let afterFirst = dedupApp.cachedLimitHistory
+        check(afterFirst.weeklyPeaks.count == 1, "updateLimitHistory: 첫 관측이 캐시에 반영됨")
+        check(LimitHistoryStore.load(defaults: dd) == afterFirst,
+              "updateLimitHistory: 첫 관측이 디스크에도 기록됨")
+        dedupApp.updateLimitHistory(rateLimits: obs, now: lhNow, defaults: dd)
+        check(dedupApp.cachedLimitHistory == afterFirst,
+              "updateLimitHistory: 같은 관측 반복은 이력을 바꾸지 않는다")
+        dd.removePersistentDomain(forName: dedupSuite)
+    } else {
+        check(false, "updateLimitHistory: 전용 suite 생성 성공해야 함")
+    }
+    // 사용자 도메인 불변 확인 — 위 테스트들이 .standard의 limitHistory를 건드리지 않았어야 한다.
+    // (인자 도메인이 이 키를 덮는 경우는 없다 — data 타입이라 -limitHistory 인자로 주입 불가.)
+    check(UserDefaults.standard.object(forKey: "limitHistory") as? Data == standardLimitHistoryBefore,
+          "셀프테스트는 .standard의 한도 이력을 오염시키지 않는다")
+
+    // 영속화 왕복(격리 suite)
+    let lhSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let ld = UserDefaults(suiteName: lhSuite) {
+        check(LimitHistoryStore.load(defaults: ld) == .empty, "LimitHistoryStore: 저장 전엔 빈 이력")
+        LimitHistoryStore.save(lh, defaults: ld)
+        check(LimitHistoryStore.load(defaults: ld) == lh, "LimitHistoryStore: 저장/조회 왕복")
+        ld.removePersistentDomain(forName: lhSuite)
+    } else {
+        check(false, "LimitHistoryStore: 전용 suite 생성 성공해야 함")
+    }
 
     // rateLimitResetIfExceeded — 순수 함수(유휴 화면의 "한도 도달" 구분 근거)
     let exceededWindow = RateLimitWindow(usedPercentage: 100.0, resetsAt: Int(rlNow.timeIntervalSince1970) + 3600)
