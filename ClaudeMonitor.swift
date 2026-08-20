@@ -2495,47 +2495,46 @@ struct StatsCache: Codable {
 
     // ── 주간/월별 기간 조회 ──
     //
-    // 현재 기간과 **직전 기간을 함께** 돌려준다. 따로 조회하면 안 되는 이유는 아래 타임존 폴백
-    // 때문이다: todayPeriod()와 마찬가지로 CLI가 로컬 기준 키를 쓰는지 UTC 기준 키를 쓰는지 알 수
-    // 없어 로컬 1차 → UTC 폴백 2단으로 매칭하는데, 현재 기간만 UTC로 넘어가고 직전 기간은 로컬로
-    // 매칭되면 "이번 주"와 "지난 주"가 서로 다른 기준의 구간을 가리켜 비교 자체가 무의미해진다.
-    // 그래서 **하나의 타임존을 골라 두 키를 함께 만든다**.
+    // 현재 기간과 **직전 기간을 함께** 돌려준다 — 따로 조회하면 두 값이 서로 다른 기준의 구간을
+    // 가리킬 여지가 생기고, 그러면 비교 자체가 무의미해진다.
+    //
+    // **키는 로컬 타임존으로만 만든다.** 처음엔 todayPeriod()를 본떠 "로컬 1차 → UTC 폴백" 2단으로
+    // 매칭했는데, 주/월에서는 그 폴백이 **직전 기간을 현재 기간으로 둔갑시킨다**: KST 사용자가
+    // 일요일 새벽 03:00(=UTC로는 아직 토요일 18:00)에 아직 이번 주를 시작하지 않았다면 로컬 키
+    // ("2026-08-23")는 없고 UTC 키("2026-08-16")는 있어서, 지난 주 합계가 "이번 주"로 렌더되고
+    // "지난 주" 자리엔 그 전 주가 온다. 월은 더 나쁘고 **매달 재현된다** — 1일 00:00~09:00 KST에
+    // 첫 사용 전이면 "2026-09"가 없고 UTC가 "2026-08"로 떨어져 8월 한 달치가 통째로 "이번 달"이 된다.
+    // CLI는 daily/weekly/monthly 키를 로컬 기준으로 쓰므로(실데이터 확인) 이 폴백은 이득 없이
+    // 오답만 만든다. 키가 없으면 그냥 nil — 사용이 없는 기간은 섹션을 생략하는 것이 옳은 동작이다.
     //
     // 배열 순서(마지막 원소가 최신)를 신뢰하지 않고 키를 직접 계산해 매칭하는 것도 의도적이다 —
     // stats-cache의 배열 순서는 CLI 구현 세부사항이고, `models` 배열 순서를 신뢰했다가 겪은
     // "최근 사용 모델" 버그와 같은 종류의 함정이다.
-    private func periodLookupZones() -> [TimeZone] {
-        var zones: [TimeZone] = [.current]
-        if let utc = TimeZone(identifier: "UTC"), utc != TimeZone.current { zones.append(utc) }
-        return zones
-    }
-
-    func weekPeriods(now: Date = Date()) -> (current: PeriodStats, previous: PeriodStats?, start: Date, timeZone: TimeZone)? {
+    // timeZone은 셀프테스트 주입 지점이다(now:와 같은 패턴). 위 폴백 버그는 로컬 타임존이 UTC보다
+    // 앞선 지역에서, 그것도 주/월 경계 직후에만 드러나므로, 머신의 실제 타임존에 의존하는 테스트로는
+    // 재현되지 않는다 — 실제로 처음 쓴 회귀 테스트가 그래서 폴백을 되살려도 통과했다.
+    func weekPeriods(now: Date = Date(), timeZone: TimeZone = .current) -> (current: PeriodStats, previous: PeriodStats?, start: Date, timeZone: TimeZone)? {
         guard let rows = weekly?.weekly, !rows.isEmpty else { return nil }
-        for tz in periodLookupZones() {
-            let start = gregorianWeekStart(now, timeZone: tz)
-            guard let cur = rows.first(where: { $0.week == gregorianDayString(start, timeZone: tz) }) else { continue }
-            let prevStart = gregorianCalendar(timeZone: tz).date(byAdding: .day, value: -7, to: start)
-            let prev = prevStart.flatMap { ps in
-                rows.first(where: { $0.week == gregorianDayString(ps, timeZone: tz) })
-            }
-            return (cur, prev, start, tz)
+        let tz = timeZone
+        let start = gregorianWeekStart(now, timeZone: tz)
+        guard let cur = rows.first(where: { $0.week == gregorianDayString(start, timeZone: tz) }) else { return nil }
+        let prevStart = gregorianCalendar(timeZone: tz).date(byAdding: .day, value: -7, to: start)
+        let prev = prevStart.flatMap { ps in
+            rows.first(where: { $0.week == gregorianDayString(ps, timeZone: tz) })
         }
-        return nil
+        return (cur, prev, start, tz)
     }
 
-    func monthPeriods(now: Date = Date()) -> (current: PeriodStats, previous: PeriodStats?, start: Date, timeZone: TimeZone)? {
+    func monthPeriods(now: Date = Date(), timeZone: TimeZone = .current) -> (current: PeriodStats, previous: PeriodStats?, start: Date, timeZone: TimeZone)? {
         guard let rows = monthly?.monthly, !rows.isEmpty else { return nil }
-        for tz in periodLookupZones() {
-            let start = gregorianMonthStart(now, timeZone: tz)
-            guard let cur = rows.first(where: { $0.month == gregorianMonthString(start, timeZone: tz) }) else { continue }
-            let prevStart = gregorianCalendar(timeZone: tz).date(byAdding: .month, value: -1, to: start)
-            let prev = prevStart.flatMap { ps in
-                rows.first(where: { $0.month == gregorianMonthString(ps, timeZone: tz) })
-            }
-            return (cur, prev, start, tz)
+        let tz = timeZone
+        let start = gregorianMonthStart(now, timeZone: tz)
+        guard let cur = rows.first(where: { $0.month == gregorianMonthString(start, timeZone: tz) }) else { return nil }
+        let prevStart = gregorianCalendar(timeZone: tz).date(byAdding: .month, value: -1, to: start)
+        let prev = prevStart.flatMap { ps in
+            rows.first(where: { $0.month == gregorianMonthString(ps, timeZone: tz) })
         }
-        return nil
+        return (cur, prev, start, tz)
     }
 }
 
@@ -5705,6 +5704,43 @@ func runSelfTests() -> Never {
               "asLoadingSkeleton(): 주간/월별도 함께 전파(새로고침 중 섹션이 사라지지 않음)")
     } else {
         check(false, "주간/월별 픽스처 디코드 성공해야 함")
+    }
+
+    // 회귀: **직전 기간이 현재 기간으로 둔갑하면 안 된다.**
+    //
+    // 예전엔 로컬 키가 없을 때 UTC 키로 폴백했는데, UTC보다 앞선 타임존에서는 그 UTC 키가
+    // **직전** 주/달을 가리켰다. KST 기준 일요일 03:00은 UTC로는 아직 토요일 18:00이라,
+    // 이번 주를 아직 시작하지 않았으면 로컬 키("2026-08-23")는 없고 UTC 키("2026-08-16")는 있어서
+    // 지난 주 합계가 "이번 주"로 렌더됐다. 월은 매달 1일 00:00~09:00 KST마다 재현되며 지난달
+    // 한 달치가 통째로 "이번 달"이 됐다.
+    //
+    // 타임존과 시각을 **둘 다 주입**해야 재현된다 — 머신 로컬 타임존과 `Date()`에 기대면 그 좁은
+    // 시간대를 때리지 못해 폴백을 되살려도 테스트가 통과한다(처음 쓴 회귀 테스트가 실제로 그랬다).
+    let kst = TimeZone(identifier: "Asia/Seoul")!
+    let kstSundayEarly = parseISO8601("2026-08-22T18:00:00.000Z")!   // KST 2026-08-23(일) 03:00
+    let kstMonthStartEarly = parseISO8601("2026-08-31T18:00:00.000Z")! // KST 2026-09-01 03:00
+    let prevOnlyJSON = """
+    {
+      "blocks": { "blocks": [] },
+      "weekly": { "weekly": [ { "week":"2026-08-16","totalTokens":500,"totalCost":50.0 } ] },
+      "monthly": { "monthly": [ { "month":"2026-08","totalTokens":9000,"totalCost":300.0 } ] }
+    }
+    """
+    if let scPrevOnly = try? JSONDecoder().decode(StatsCache.self, from: Data(prevOnlyJSON.utf8)) {
+        // 전제 확인: 이 시각·타임존 조합에서 로컬 주 키와 UTC 주 키가 실제로 다르다.
+        check(gregorianDayString(gregorianWeekStart(kstSundayEarly, timeZone: kst), timeZone: kst) == "2026-08-23"
+              && gregorianDayString(gregorianWeekStart(kstSundayEarly, timeZone: tzUTC), timeZone: tzUTC) == "2026-08-16",
+              "회귀 전제: KST 일요일 새벽엔 로컬 주 키(8/23)와 UTC 주 키(8/16)가 갈린다")
+        check(scPrevOnly.weekPeriods(now: kstSundayEarly, timeZone: kst) == nil,
+              "weekPeriods: 이번 주 행이 없으면 nil — 지난 주 행을 '이번 주'로 잡지 않는다(UTC 폴백 금지)")
+        check(scPrevOnly.monthPeriods(now: kstMonthStartEarly, timeZone: kst) == nil,
+              "monthPeriods: 이번 달 행이 없으면 nil — 지난 달 행을 '이번 달'로 잡지 않는다(매달 1일 재현)")
+        // 같은 픽스처라도 그 기간 안에 있으면 정상적으로 잡혀야 한다(위 단정이 "항상 nil"로
+        // 통과하는 무의미한 테스트가 아님을 고정한다).
+        check(scPrevOnly.weekPeriods(now: parseISO8601("2026-08-20T03:00:00.000Z")!, timeZone: kst)?.current.totalCost == 50.0,
+              "weekPeriods: 해당 주 안에서는 정상 매칭(위 nil 단정이 공허하지 않음)")
+    } else {
+        check(false, "직전 기간 전용 픽스처 디코드 성공해야 함")
     }
 
     // 현재 기간 행이 없으면(주가 막 바뀌었거나 CLI 보관 기간 밖) 섹션 자체를 생략한다 —
