@@ -106,6 +106,57 @@ func gregorianDayFormatter(timeZone: TimeZone) -> DateFormatter {
 func gregorianDayString(_ date: Date, timeZone: TimeZone = .current) -> String {
     gregorianDayFormatter(timeZone: timeZone).string(from: date)
 }
+
+// 그레고리력 기준 "yyyy-MM" 문자열 — CLI가 stats-cache.json의 monthly[].month에 쓰는 키 형식.
+// 위 gregorianDayString과 완전히 같은 이유로 달력/로케일을 명시한다(불교력이면 "2569-08"이 나와
+// 영원히 매칭되지 않는다). 별도 포매터를 만들지 않고 일(day) 키에서 앞 7자를 잘라 파생시킨다 —
+// 두 번째 DateFormatter를 두면 한쪽만 고치는 실수가 가능해지기 때문(formatKRW/환율 행이
+// krwGroupedNumber 하나를 공유하는 것과 같은 취지).
+func gregorianMonthString(_ date: Date, timeZone: TimeZone = .current) -> String {
+    String(gregorianDayString(date, timeZone: timeZone).prefix(7))
+}
+
+// 그레고리력 + 지정 타임존 캘린더. `Calendar.current`를 쓰면 안 되는 이유는 위와 같다 —
+// 게다가 주 경계 계산에서는 달력 체계뿐 아니라 **firstWeekday**까지 로케일을 따라가므로
+// (한국·미국=일요일, 독일·프랑스=월요일) 같은 순간이 사용자마다 다른 주에 속하게 된다.
+func gregorianCalendar(timeZone: TimeZone = .current) -> Calendar {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = timeZone
+    cal.locale = Locale(identifier: "en_US_POSIX")
+    return cal
+}
+
+// 그 날짜가 속한 주의 시작(일요일 00:00). **일요일 고정은 CLI 규약이다** — stats-cache.json의
+// weekly[].week 키가 그 주 일요일 날짜이므로, 여기서 월요일 시작(ISO)을 쓰면 키가 어긋나 주간
+// 섹션이 통째로 비거나 한 주 밀린 값을 보여준다. 그래서 캘린더의 firstWeekday를 신뢰하지 않고
+// 요일 번호(일=1)에서 직접 뺀다.
+//
+// `dateComponents([.yearForWeekOfYear, .weekOfYear])` + `date(from:)` 조합을 쓰지 않는 이유:
+// 그쪽은 `minimumDaysInFirstWeek`에 따라 연말·연초 경계에서 결과가 달라지는데, 아래 요일 산술은
+// 그런 설정 의존이 없다. 날짜 가감은 `Calendar.date(byAdding:)`이라 DST 전환 주(하루가 23/25시간)
+// 에서도 정확하다.
+func gregorianWeekStart(_ date: Date, timeZone: TimeZone = .current) -> Date {
+    let cal = gregorianCalendar(timeZone: timeZone)
+    let dayStart = cal.startOfDay(for: date)
+    let daysSinceSunday = cal.component(.weekday, from: dayStart) - 1   // .weekday: 일=1
+    return cal.date(byAdding: .day, value: -daysSinceSunday, to: dayStart) ?? dayStart
+}
+
+// 그 날짜가 속한 달의 시작(1일 00:00).
+func gregorianMonthStart(_ date: Date, timeZone: TimeZone = .current) -> Date {
+    let cal = gregorianCalendar(timeZone: timeZone)
+    let comps = cal.dateComponents([.year, .month], from: date)
+    return cal.date(from: comps) ?? cal.startOfDay(for: date)
+}
+
+// 기간 시작일부터 now까지의 경과 일수(오늘 포함, 최소 1). 일평균의 **분모**다 — 아직 오지 않은
+// 날까지 분모에 넣으면 평균이 인위적으로 낮아지고, 그 평균을 외삽한 "월말 예상"도 함께 과소평가된다.
+func elapsedDayCount(from start: Date, to now: Date, timeZone: TimeZone = .current) -> Int {
+    let cal = gregorianCalendar(timeZone: timeZone)
+    let days = cal.dateComponents([.day], from: cal.startOfDay(for: start),
+                                  to: cal.startOfDay(for: now)).day ?? 0
+    return max(1, days + 1)
+}
 func parseISO8601(_ s: String?) -> Date? {
     guard let s = s else { return nil }
     return parseISO8601(s)
@@ -2441,6 +2492,51 @@ struct StatsCache: Codable {
     }
 
     var cumulative: PeriodStats? { monthly?.totals ?? daily?.totals }
+
+    // ── 주간/월별 기간 조회 ──
+    //
+    // 현재 기간과 **직전 기간을 함께** 돌려준다. 따로 조회하면 안 되는 이유는 아래 타임존 폴백
+    // 때문이다: todayPeriod()와 마찬가지로 CLI가 로컬 기준 키를 쓰는지 UTC 기준 키를 쓰는지 알 수
+    // 없어 로컬 1차 → UTC 폴백 2단으로 매칭하는데, 현재 기간만 UTC로 넘어가고 직전 기간은 로컬로
+    // 매칭되면 "이번 주"와 "지난 주"가 서로 다른 기준의 구간을 가리켜 비교 자체가 무의미해진다.
+    // 그래서 **하나의 타임존을 골라 두 키를 함께 만든다**.
+    //
+    // 배열 순서(마지막 원소가 최신)를 신뢰하지 않고 키를 직접 계산해 매칭하는 것도 의도적이다 —
+    // stats-cache의 배열 순서는 CLI 구현 세부사항이고, `models` 배열 순서를 신뢰했다가 겪은
+    // "최근 사용 모델" 버그와 같은 종류의 함정이다.
+    private func periodLookupZones() -> [TimeZone] {
+        var zones: [TimeZone] = [.current]
+        if let utc = TimeZone(identifier: "UTC"), utc != TimeZone.current { zones.append(utc) }
+        return zones
+    }
+
+    func weekPeriods(now: Date = Date()) -> (current: PeriodStats, previous: PeriodStats?, start: Date, timeZone: TimeZone)? {
+        guard let rows = weekly?.weekly, !rows.isEmpty else { return nil }
+        for tz in periodLookupZones() {
+            let start = gregorianWeekStart(now, timeZone: tz)
+            guard let cur = rows.first(where: { $0.week == gregorianDayString(start, timeZone: tz) }) else { continue }
+            let prevStart = gregorianCalendar(timeZone: tz).date(byAdding: .day, value: -7, to: start)
+            let prev = prevStart.flatMap { ps in
+                rows.first(where: { $0.week == gregorianDayString(ps, timeZone: tz) })
+            }
+            return (cur, prev, start, tz)
+        }
+        return nil
+    }
+
+    func monthPeriods(now: Date = Date()) -> (current: PeriodStats, previous: PeriodStats?, start: Date, timeZone: TimeZone)? {
+        guard let rows = monthly?.monthly, !rows.isEmpty else { return nil }
+        for tz in periodLookupZones() {
+            let start = gregorianMonthStart(now, timeZone: tz)
+            guard let cur = rows.first(where: { $0.month == gregorianMonthString(start, timeZone: tz) }) else { continue }
+            let prevStart = gregorianCalendar(timeZone: tz).date(byAdding: .month, value: -1, to: start)
+            let prev = prevStart.flatMap { ps in
+                rows.first(where: { $0.month == gregorianMonthString(ps, timeZone: tz) })
+            }
+            return (cur, prev, start, tz)
+        }
+        return nil
+    }
 }
 
 final class StatsCacheReader {
@@ -2684,6 +2780,108 @@ struct AllTimeSectionData {
     let totalCost: Double
 }
 
+// ── 주간/월별 기간 섹션 ──
+//
+// 주와 월이 같은 구조체를 공유한다. 두 섹션의 차이는 ① 헤더 라벨 ② "월말 예상"의 유무뿐이고,
+// 그 둘 다 아래 필드로 표현되므로 별도 타입을 만들 이유가 없다.
+//
+// **금액은 전부 USD 원값(Double)이다.** 어댑터가 formatCost/formatMoney를 부르지 않는다는
+// 규칙(BlockSectionData.burnRateCostPerHour 주석 참고)을 따른다 — 표시 통화는 사용자 설정이라
+// 포맷은 렌더링 시점에 딱 한 번 일어나야 한다.
+struct PeriodSectionData {
+    enum Kind { case week, month }
+    let kind: Kind
+    // 주: 그 주 일요일의 "yyyy-MM-dd", 월: "yyyy-MM". CLI 키와 같은 문자열이라 사용자가 어떤
+    // 구간을 보고 있는지 모호하지 않다(로케일 축약 날짜 표기는 "8/16"이 8월 16일인지 16월 8일인지
+    // 지역마다 달라진다).
+    let periodKey: String
+    let totalTokens: Int
+    let totalCost: Double          // USD
+    let dailyAvgCost: Double       // USD/일 — totalCost ÷ elapsedDays
+    let elapsedDays: Int
+    // 직전 기간(지난 주/지난 달)의 **완결된** 총액. 없으면 nil(캐시 보관 기간을 벗어났거나 첫 주/첫 달).
+    // 진행 중인 기간과의 증감률(%)은 일부러 계산하지 않는다 — 3일 지난 이번 주와 완결된 지난 주를
+    // 나눈 "-70%"는 절약한 게 아니라 아직 안 지난 것뿐이라 오독을 부른다. 참고치로 나란히만 둔다.
+    let prevTotalCost: Double?
+    // 기간 말 예상 비용(일평균 × 기간 전체 일수). 월 섹션에서만, 그리고 아직 기간이 끝나지 않았을
+    // 때만 채운다(끝난 기간은 예상 == 실제라 줄만 늘어난다). 외삽이므로 렌더링 시 "≈"를 붙인다.
+    let projectedCost: Double?
+}
+
+// 파생 지표(경과일·일평균·기간 말 예상) 산식이 사는 **유일한** 자리. 1차 경로와 폴백 경로가
+// 각자 계산하면 데이터 소스가 바뀌는 순간 같은 화면이 다른 일평균을 보여준다 — 리셋 앵커에서
+// 드롭다운과 타이틀이 갈라졌던 것과 같은 종류의 버그다. 그래서 두 어댑터가 이 함수만 호출한다.
+// periodKey도 CLI 행에서 꺼내지 않고 start에서 파생시킨다(두 경로가 문자 단위로 같아야 한다).
+func makePeriodSection(kind: PeriodSectionData.Kind, start: Date, timeZone: TimeZone,
+                       totalTokens: Int, totalCost: Double, prevTotalCost: Double?,
+                       now: Date) -> PeriodSectionData {
+    let elapsed = elapsedDayCount(from: start, to: now, timeZone: timeZone)
+    let avg = totalCost / Double(elapsed)
+    let periodKey: String
+    let totalDays: Int
+    switch kind {
+    case .week:
+        periodKey = gregorianDayString(start, timeZone: timeZone)
+        totalDays = 7
+    case .month:
+        // 28~31일이 달마다 다르므로 달력에 직접 묻는다(윤년 포함).
+        periodKey = gregorianMonthString(start, timeZone: timeZone)
+        totalDays = gregorianCalendar(timeZone: timeZone).range(of: .day, in: .month, for: start)?.count ?? elapsed
+    }
+    // 외삽은 월 섹션에서만, 그리고 기간이 아직 남아 있을 때만 한다. 주는 7일이라 하루 편차가
+    // 예상치를 크게 흔들어 노이즈에 가깝고, 끝난 기간은 예상 == 실제라 줄만 늘어난다.
+    let projected: Double? = (kind == .month && elapsed < totalDays) ? avg * Double(totalDays) : nil
+    return PeriodSectionData(kind: kind, periodKey: periodKey, totalTokens: totalTokens,
+                             totalCost: totalCost, dailyAvgCost: avg, elapsedDays: elapsed,
+                             prevTotalCost: prevTotalCost, projectedCost: projected)
+}
+
+// stats-cache(1차) 경로 어댑터. CLI가 이미 집계해 둔 weekly/monthly 행을 그대로 쓴다 —
+// 비용이 CLI 실측(costUSD)이라 폴백 경로의 PRICING 추정보다 정확하다.
+func makePeriodSections(fromCache stats: StatsCache, now: Date = Date())
+        -> (week: PeriodSectionData?, month: PeriodSectionData?) {
+    let week = stats.weekPeriods(now: now).map {
+        makePeriodSection(kind: .week, start: $0.start, timeZone: $0.timeZone,
+                          totalTokens: $0.current.totalTokens ?? 0, totalCost: $0.current.totalCost ?? 0,
+                          prevTotalCost: $0.previous?.totalCost, now: now)
+    }
+    let month = stats.monthPeriods(now: now).map {
+        makePeriodSection(kind: .month, start: $0.start, timeZone: $0.timeZone,
+                          totalTokens: $0.current.totalTokens ?? 0, totalCost: $0.current.totalCost ?? 0,
+                          prevTotalCost: $0.previous?.totalCost, now: now)
+    }
+    return (week, month)
+}
+
+// 폴백(JSONL) 경로 어댑터. stats-cache가 없을 때만 쓰이며 비용은 PRICING 기반 **추정치**다
+// (이 경로는 이미 "추정 모드" 배너가 떠 있으므로 섹션별 추가 고지는 하지 않는다).
+// 주의: JSONL은 CLI가 오래된 프로젝트 디렉터리를 정리하면 사라지므로, 이 경로의 월간 합계는
+// 보관 기간을 벗어난 만큼 과소집계될 수 있다(1차 경로에는 없는 한계).
+func makePeriodSections(fromEntries cachedAll: [UsageEntry], now: Date = Date())
+        -> (week: PeriodSectionData?, month: PeriodSectionData?) {
+    let tz = TimeZone.current
+    let cal = gregorianCalendar(timeZone: tz)
+
+    // 사용이 전혀 없는 기간은 섹션 자체를 생략한다 — 0으로 채운 행을 그리면 "이번 달 $0"이
+    // 실제 집계 결과처럼 읽힌다(캐시 경로도 CLI가 사용 없는 기간의 행을 아예 쓰지 않아 결과가 같다).
+    func section(_ kind: PeriodSectionData.Kind, start: Date, prevStart: Date?) -> PeriodSectionData? {
+        let current = UsageStats(entries: cachedAll.filter { $0.timestamp >= start })
+        guard current.count > 0 else { return nil }
+        let prev: Double? = prevStart.flatMap { ps -> Double? in
+            let s = UsageStats(entries: cachedAll.filter { $0.timestamp >= ps && $0.timestamp < start })
+            return s.count > 0 ? s.totalCost : nil
+        }
+        return makePeriodSection(kind: kind, start: start, timeZone: tz,
+                                 totalTokens: current.totalTokens, totalCost: current.totalCost,
+                                 prevTotalCost: prev, now: now)
+    }
+
+    let weekStart = gregorianWeekStart(now, timeZone: tz)
+    let monthStart = gregorianMonthStart(now, timeZone: tz)
+    return (section(.week, start: weekStart, prevStart: cal.date(byAdding: .day, value: -7, to: weekStart)),
+            section(.month, start: monthStart, prevStart: cal.date(byAdding: .month, value: -1, to: monthStart)))
+}
+
 struct BlockSectionData {
     let windowText: String?          // "start → end"; nil = 시각 파싱 실패(드문 케이스)
     let outputTokens: Int
@@ -2734,16 +2932,27 @@ struct BlockDisplayData {
     // currencyContext()가 유일한 판정자이므로 메뉴바 타이틀과 어긋날 수 없다. .none이면 금액이
     // formatCost와 동일해지고 환율 행·배너가 통째로 사라진다(달러 모드 = 기존 화면 그대로).
     let currency: CurrencyDisplay
+    // 주간/월별 집계 섹션 — 해당 기간에 사용이 없거나 CLI 보관 기간을 벗어나면 nil이라 섹션 자체가
+    // 사라진다. State의 연관값이 아니라 최상위 필드인 이유는 serverLimits/currency와 같다: 연관값에
+    // 넣으면 .loading/.ready 두 case와 모든 해체 지점을 함께 고쳐야 하고, 한쪽을 놓치면 메뉴가 열린
+    // 채 새로고침될 때 섹션이 사라졌다 다시 나타나며 메뉴 높이가 튄다.
+    let week: PeriodSectionData?
+    let month: PeriodSectionData?
 
-    // 커스텀 init: anchorIsEstimating/rateLimitReset/serverLimits에 기본값을 주기 위함 — Swift의
-    // synthesized memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지 않는다.
+    // 커스텀 init: anchorIsEstimating/rateLimitReset/serverLimits/week/month에 기본값을 주기 위함 —
+    // Swift의 synthesized memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지
+    // 않는다. 기본값 nil이 곧 회귀 가드다: 이 필드를 모르는 기존 호출부·셀프테스트가 수정 없이
+    // 컴파일되고 통과하는 것이 "기존 사용자 화면 불변"의 증거다(통화 기능 도입 때와 같은 방식).
     init(isEstimate: Bool, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil,
-         serverLimits: ServerLimitsSectionData? = nil, currency: CurrencyDisplay = .none, state: State) {
+         serverLimits: ServerLimitsSectionData? = nil, currency: CurrencyDisplay = .none,
+         week: PeriodSectionData? = nil, month: PeriodSectionData? = nil, state: State) {
         self.isEstimate = isEstimate
         self.anchorIsEstimating = anchorIsEstimating
         self.rateLimitReset = rateLimitReset
         self.serverLimits = serverLimits
         self.currency = currency
+        self.week = week
+        self.month = month
         self.state = state
     }
 }
@@ -2754,10 +2963,11 @@ extension BlockDisplayData {
     func asLoadingSkeleton() -> BlockDisplayData? {
         guard case .ready(let block, let model, let today, let allTime) = state else { return nil }
         // currency도 반드시 함께 전파한다 — 빠뜨리면 메뉴가 열린 채 새로고침될 때 금액이
-        // 달러로 한 프레임 되돌아가 행 폭이 흔들린다.
+        // 달러로 한 프레임 되돌아가 행 폭이 흔들린다. week/month도 같은 이유로 전파한다
+        // (빠뜨리면 새로고침 중에만 두 섹션이 통째로 사라져 메뉴 높이가 튄다).
         return BlockDisplayData(isEstimate: isEstimate, anchorIsEstimating: anchorIsEstimating,
                                  rateLimitReset: rateLimitReset, serverLimits: serverLimits,
-                                 currency: currency,
+                                 currency: currency, week: week, month: month,
                                  state: .loading(block: block, model: model, today: today, allTime: allTime))
     }
 }
@@ -3549,11 +3759,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let rateLimitReset = active == nil ? rateLimitResetIfExceeded(cachedRateLimits, now: now) : nil
 
+        // 주간/월별은 리셋 앵커의 영향을 받지 않는다 — 앵커는 5시간 블록 경계를 옮기는 설정이고,
+        // 주/월 경계는 달력이 정한다("오늘"/"전체 누적" 섹션이 앵커와 무관한 것과 같은 이유).
+        let periods = makePeriodSections(fromCache: stats, now: now)
+
         return BlockDisplayData(isEstimate: false, anchorIsEstimating: anchorIsEstimating,
                                  rateLimitReset: rateLimitReset,
                                  serverLimits: makeServerLimitsSection(from: cachedRateLimits, now: now),
                                  currency: currencyDisplay(currency: CurrencySettings.currency(),
                                                            rate: cachedExchangeRate, now: now),
+                                 week: periods.week, month: periods.month,
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -3568,12 +3783,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         case .loading(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
+                                 week: data.week, month: data.month,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
                                  currency: data.currency, skeleton: true, into: menu)
 
         case .ready(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
+                                 week: data.week, month: data.month,
                                  isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
                                  currency: data.currency, skeleton: false, into: menu)
@@ -3584,7 +3801,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 그린다. 섹션 헤더와 "데이터 없음"류 정적 안내문은 skeleton 여부와 무관하게 항상 실제
     // 텍스트를 쓴다(refresh마다 안 바뀌는 텍스트를 흐리게 하면 레이아웃 점프만 커짐). ──
     private func renderBlockSections(block: BlockSectionData?, model: ModelSectionData?, today: TodaySectionData,
-                                      allTime: AllTimeSectionData?, isEstimate: Bool, anchorIsEstimating: Bool,
+                                      allTime: AllTimeSectionData?,
+                                      week: PeriodSectionData? = nil, month: PeriodSectionData? = nil,
+                                      isEstimate: Bool, anchorIsEstimating: Bool,
                                       rateLimitReset: Date?, serverLimits: ServerLimitsSectionData? = nil,
                                       currency: CurrencyDisplay = .none,
                                       skeleton: Bool, into menu: NSMenu) {
@@ -3750,6 +3969,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
+        // ── Week / Month Sections ──
+        // "오늘"과 "전체 누적" 사이 — 시간 범위가 짧은 것에서 긴 것 순으로 읽히도록 배치한다.
+        // 데이터가 없으면(해당 기간 사용 없음/캐시 보관 기간 밖) 각 섹션이 통째로 사라진다.
+        if let week = week { renderPeriodSection(week, currency: currency, skeleton: skeleton, into: menu) }
+        if let month = month { renderPeriodSection(month, currency: currency, skeleton: skeleton, into: menu) }
+
         // ── All-Time Section (캐시 경로는 stats.cumulative 없으면 통째로 생략) ──
         if let allTime = allTime {
             addSectionHeader(menu, t("📊  전체 누적", "📊  All-Time Total"))
@@ -3775,6 +4000,46 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !skeleton {
             appendGamificationSection(menu, currency: currency)
         }
+    }
+
+    // 주간/월별 섹션 렌더러(두 기간이 같은 코드를 쓴다 — 헤더 문구와 "월말 예상" 줄만 다르다).
+    // 금액 포맷이 일어나는 유일한 지점이며 전부 formatMoney를 거친다 — 어댑터는 USD 원값만 넘긴다.
+    private func renderPeriodSection(_ data: PeriodSectionData, currency: CurrencyDisplay,
+                                      skeleton: Bool, into menu: NSMenu) {
+        switch data.kind {
+        case .week:
+            addSectionHeader(menu, t("📅  이번 주 (\(data.periodKey)~)", "📅  This Week (\(data.periodKey)~)"))
+        case .month:
+            addSectionHeader(menu, t("🗓  이번 달 (\(data.periodKey))", "🗓  This Month (\(data.periodKey))"))
+        }
+        skeleton ? addSkeletonLabel(menu)
+                 : addLabel(menu, "  " + t("전체 토큰: \(formatTokens(data.totalTokens))",
+                                           "Total Tokens: \(formatTokens(data.totalTokens))"))
+        let total = formatMoney(data.totalCost, currency.context)
+        skeleton ? addSkeletonLabel(menu)
+                 : addLabel(menu, "  " + t("예상 비용: \(total)", "Estimated Cost: \(total)"))
+
+        let avg = formatMoney(data.dailyAvgCost, currency.context)
+        skeleton ? addSkeletonLabel(menu)
+                 : addLabel(menu, "  " + t("일평균: \(avg)/일 (\(data.elapsedDays)일 경과)",
+                                           "Daily Avg: \(avg)/day (\(data.elapsedDays) days in)"))
+
+        // "≈"는 이 값이 관측치가 아니라 일평균을 외삽한 추정임을 밝히는 표시다 — 떼면 실측
+        // 합계와 구분되지 않는다.
+        if let projected = data.projectedCost {
+            let text = formatMoney(projected, currency.context)
+            skeleton ? addSkeletonLabel(menu)
+                     : addLabel(menu, "  " + t("월말 예상: ≈\(text)", "Projected: ≈\(text)"))
+        }
+        // 진행 중인 기간과 완결된 직전 기간을 나눈 증감률(%)은 일부러 계산하지 않는다 —
+        // 3일 지난 이번 주의 "-70%"는 절약이 아니라 아직 지나지 않은 날 때문이다.
+        if let prev = data.prevTotalCost {
+            let text = formatMoney(prev, currency.context)
+            let label = data.kind == .week ? t("지난 주: \(text)", "Last week: \(text)")
+                                           : t("지난 달: \(text)", "Last month: \(text)")
+            skeleton ? addSkeletonLabel(menu) : addLabel(menu, "  " + label)
+        }
+        menu.addItem(.separator())
     }
 
     // 모델명 컬럼 정렬(오늘 섹션·모델별 분해 섹션 공용)
@@ -4435,11 +4700,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let allTime = AllTimeSectionData(totalTokens: allStats.totalTokens, totalCost: allStats.totalCost)
 
         let rateLimitReset = activeBlock == nil ? rateLimitResetIfExceeded(self.cachedRateLimits, now: now) : nil
+        let periods = makePeriodSections(fromEntries: cachedAll, now: now)
 
         return BlockDisplayData(isEstimate: true, rateLimitReset: rateLimitReset,
                                  serverLimits: makeServerLimitsSection(from: self.cachedRateLimits, now: now),
                                  currency: currencyDisplay(currency: CurrencySettings.currency(),
                                                            rate: cachedExchangeRate, now: now),
+                                 week: periods.week, month: periods.month,
                                  state: .ready(block: block, model: model, today: today, allTime: allTime))
     }
 
@@ -5277,6 +5544,221 @@ func runSelfTests() -> Never {
     } else {
         check(false, "stats-cache JSON 디코드 성공해야 함")
     }
+
+    // ── 주/월 날짜 키 헬퍼 (타임존 명시 → 머신 로컬 설정과 무관하게 결정적) ──
+    let tzUTC = TimeZone(identifier: "UTC")!
+    func weekKeyUTC(_ iso: String) -> String {
+        gregorianDayString(gregorianWeekStart(parseISO8601(iso)!, timeZone: tzUTC), timeZone: tzUTC)
+    }
+    check(weekKeyUTC("2026-08-20T12:00:00.000Z") == "2026-08-16",
+          "gregorianWeekStart: 목요일(8/20) → 그 주 일요일(8/16)")
+    check(weekKeyUTC("2026-08-16T00:00:00.000Z") == "2026-08-16",
+          "gregorianWeekStart: 일요일 자정은 그 자신이 주 시작(경계 포함)")
+    check(weekKeyUTC("2026-08-22T23:59:59.000Z") == "2026-08-16",
+          "gregorianWeekStart: 토요일 23:59는 아직 같은 주")
+    check(weekKeyUTC("2026-08-23T00:00:00.000Z") == "2026-08-23",
+          "gregorianWeekStart: 다음 일요일 자정부터 새 주")
+    check(weekKeyUTC("2027-01-01T05:00:00.000Z") == "2026-12-27",
+          "gregorianWeekStart: 연말 넘김 — 2027-01-01(금)의 주 시작은 2026-12-27(일)")
+
+    // firstWeekday 회귀: 주 시작 요일은 로케일을 따라가면 안 된다(독일·프랑스 등은 월요일 시작).
+    // stats-cache의 week 키는 **일요일** 날짜이므로 월요일 시작을 쓰면 키가 통째로 어긋난다.
+    var mondayFirstCal = Calendar(identifier: .gregorian)
+    mondayFirstCal.timeZone = tzUTC
+    mondayFirstCal.firstWeekday = 2
+    let sundayInstant = parseISO8601("2026-08-16T12:00:00.000Z")!
+    let mondayFirstStart = mondayFirstCal.date(from: mondayFirstCal.dateComponents(
+        [.yearForWeekOfYear, .weekOfYear], from: sundayInstant))!
+    check(gregorianDayString(mondayFirstStart, timeZone: tzUTC) != "2026-08-16",
+          "테스트 전제: 월요일 시작 달력은 일요일(8/16)을 직전 주로 묶는다(\(gregorianDayString(mondayFirstStart, timeZone: tzUTC)))")
+    check(weekKeyUTC("2026-08-16T12:00:00.000Z") == "2026-08-16",
+          "gregorianWeekStart: firstWeekday 로케일 설정과 무관하게 항상 일요일 시작(CLI week 키 규약)")
+
+    check(gregorianMonthString(parseISO8601("2026-08-20T12:00:00.000Z")!, timeZone: tzUTC) == "2026-08",
+          "gregorianMonthString: yyyy-MM 키")
+    check(gregorianDayString(gregorianMonthStart(parseISO8601("2026-08-20T12:00:00.000Z")!, timeZone: tzUTC), timeZone: tzUTC) == "2026-08-01",
+          "gregorianMonthStart: 그 달 1일 00:00")
+    check(elapsedDayCount(from: parseISO8601("2026-08-16T00:00:00.000Z")!,
+                          to: parseISO8601("2026-08-20T23:00:00.000Z")!, timeZone: tzUTC) == 5,
+          "elapsedDayCount: 8/16~8/20 = 5일(오늘 포함)")
+    check(elapsedDayCount(from: parseISO8601("2026-08-20T01:00:00.000Z")!,
+                          to: parseISO8601("2026-08-20T23:00:00.000Z")!, timeZone: tzUTC) == 1,
+          "elapsedDayCount: 같은 날 = 1일(0으로 나누는 일 없음)")
+    // DST 회귀: 미국 동부 2026-03-08(일)은 봄 DST 전환일이라 그 주가 167시간이다.
+    // 초 단위 산술(7*86400)로 주를 되돌리면 하루가 밀린다.
+    if let tzNY = TimeZone(identifier: "America/New_York") {
+        let dstThursday = parseISO8601("2026-03-12T17:00:00.000Z")!   // 뉴욕 3/12(목) 13:00 EDT
+        let dstWeekStart = gregorianWeekStart(dstThursday, timeZone: tzNY)
+        check(gregorianDayString(dstWeekStart, timeZone: tzNY) == "2026-03-08",
+              "gregorianWeekStart: DST 전환 주에도 주 시작은 3/8(일)")
+        let prevWeekStart = gregorianCalendar(timeZone: tzNY).date(byAdding: .day, value: -7, to: dstWeekStart)!
+        check(gregorianDayString(prevWeekStart, timeZone: tzNY) == "2026-03-01",
+              "직전 주 계산: DST 전환을 건너도 정확히 7일 전 일요일(3/1)")
+    }
+
+    // ── 주간/월별 섹션 (1차 캐시 경로) ──
+    //
+    // 픽스처 키는 프로덕션 헬퍼가 아니라 **독립적인 방법**으로 만든다(그래야 자기충족적 테스트가
+    // 되지 않는다 — CLAUDE.md의 불교력 픽스처 교훈): 요일은 POSIX 그레고리력 포매터의 요일
+    // **이름**("Sunday")으로, 월 키는 날짜 문자열의 앞 7자를 잘라, 직전 달은 정수 산술로 구한다.
+    let weekdayNameFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.dateFormat = "EEEE"
+        return f
+    }()
+    let periodNow = Date()
+    // 정오 기준점 — DST(±1시간)가 있어도 86400초 가감이 날짜를 건너뛰지 않는다.
+    var sundayProbe = Calendar.current.startOfDay(for: periodNow).addingTimeInterval(12 * 3600)
+    var probeSteps = 0
+    while weekdayNameFormatter.string(from: sundayProbe) != "Sunday" && probeSteps < 8 {
+        sundayProbe = sundayProbe.addingTimeInterval(-86400)
+        probeSteps += 1
+    }
+    let expectedWeekKey = gregorianFixtureFormatter.string(from: sundayProbe)
+    let expectedPrevWeekKey = gregorianFixtureFormatter.string(from: sundayProbe.addingTimeInterval(-7 * 86400))
+    let expectedWeekElapsed = probeSteps + 1
+    let todayKey = gregorianFixtureFormatter.string(from: periodNow)
+    let expectedMonthKey = String(todayKey.prefix(7))
+    let expectedMonthElapsed = Int(todayKey.suffix(2))!
+    let curYear = Int(todayKey.prefix(4))!
+    let curMonth = Int(expectedMonthKey.suffix(2))!
+    let expectedPrevMonthKey = curMonth == 1
+        ? String(format: "%04d-12", curYear - 1)
+        : String(format: "%04d-%02d", curYear, curMonth - 1)
+    let expectedDaysInMonth: Int = {
+        let table = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        if curMonth == 2 && ((curYear % 4 == 0 && curYear % 100 != 0) || curYear % 400 == 0) { return 29 }
+        return table[curMonth - 1]
+    }()
+
+    // 배열 순서를 **일부러 최신 → 과거로 뒤집어** 둔다(실제 CLI는 과거 → 최신 순으로 쓴다).
+    // 조회가 배열 순서(예: rows.last)에 의존하면 여기서 즉시 드러난다 — models 배열 순서를
+    // 신뢰했다가 겪은 "최근 사용 모델" 버그와 같은 종류의 함정을 막는 픽스처 설계다.
+    let periodJSON = """
+    {
+      "blocks": { "blocks": [] },
+      "daily": { "daily": [], "totals": {"totalTokens":1,"totalCost":0.1} },
+      "weekly": { "weekly": [
+        { "week":"__WEEK__","totalTokens":1000,"totalCost":20.0 },
+        { "week":"__PREV_WEEK__","totalTokens":500,"totalCost":50.0 }
+      ], "totals": {"totalTokens":1500,"totalCost":70.0} },
+      "monthly": { "monthly": [
+        { "month":"__MONTH__","totalTokens":4000,"totalCost":120.0 },
+        { "month":"__PREV_MONTH__","totalTokens":9000,"totalCost":300.0 }
+      ], "totals": {"totalTokens":13000,"totalCost":420.0} }
+    }
+    """
+    .replacingOccurrences(of: "__PREV_WEEK__", with: expectedPrevWeekKey)
+    .replacingOccurrences(of: "__WEEK__", with: expectedWeekKey)
+    .replacingOccurrences(of: "__PREV_MONTH__", with: expectedPrevMonthKey)
+    .replacingOccurrences(of: "__MONTH__", with: expectedMonthKey)
+
+    if let scPeriod = try? JSONDecoder().decode(StatsCache.self, from: Data(periodJSON.utf8)) {
+        check(scPeriod.weekPeriods(now: periodNow)?.current.totalCost == 20.0,
+              "weekPeriods: 배열 순서가 아니라 계산한 week 키로 현재 주를 매칭")
+        check(scPeriod.weekPeriods(now: periodNow)?.previous?.totalCost == 50.0,
+              "weekPeriods: 직전 주(7일 전 일요일 키)도 함께 매칭")
+        check(scPeriod.monthPeriods(now: periodNow)?.current.totalCost == 120.0,
+              "monthPeriods: yyyy-MM 키로 현재 달 매칭")
+        check(scPeriod.monthPeriods(now: periodNow)?.previous?.totalCost == 300.0,
+              "monthPeriods: 직전 달(연초 넘김 포함 정수 산술)도 함께 매칭")
+
+        let sections = makePeriodSections(fromCache: scPeriod, now: periodNow)
+        if let w = sections.week {
+            check(w.kind == .week && w.periodKey == expectedWeekKey, "주간 섹션: kind/periodKey")
+            check(w.totalTokens == 1000 && w.totalCost == 20.0, "주간 섹션: CLI 실측 합계 그대로")
+            check(w.elapsedDays == expectedWeekElapsed,
+                  "주간 섹션: 경과일 = 일요일부터 오늘까지(오늘 포함) \(expectedWeekElapsed)일")
+            check(abs(w.dailyAvgCost - 20.0 / Double(expectedWeekElapsed)) < 1e-9,
+                  "주간 섹션: 일평균 = 총비용 ÷ 경과일")
+            check(w.prevTotalCost == 50.0, "주간 섹션: 지난 주 총액 참고치")
+            check(w.projectedCost == nil, "주간 섹션: 기간 말 예상은 월 섹션 전용(주는 nil)")
+        } else {
+            check(false, "주간 섹션: 캐시에 현재 주 행이 있으면 non-nil이어야 함")
+        }
+        if let m = sections.month {
+            check(m.kind == .month && m.periodKey == expectedMonthKey, "월간 섹션: kind/periodKey")
+            check(m.totalTokens == 4000 && m.totalCost == 120.0, "월간 섹션: CLI 실측 합계 그대로")
+            check(m.elapsedDays == expectedMonthElapsed,
+                  "월간 섹션: 경과일 = 이번 달 1일부터 오늘까지 \(expectedMonthElapsed)일")
+            check(m.prevTotalCost == 300.0, "월간 섹션: 지난 달 총액 참고치")
+            let expectedProjection = 120.0 / Double(expectedMonthElapsed) * Double(expectedDaysInMonth)
+            if expectedMonthElapsed < expectedDaysInMonth {
+                check(m.projectedCost.map { abs($0 - expectedProjection) < 1e-9 } == true,
+                      "월간 섹션: 월말 예상 = 일평균 × 그 달 전체 일수(\(expectedDaysInMonth)일)")
+            } else {
+                check(m.projectedCost == nil, "월간 섹션: 달의 마지막 날엔 예상 == 실제라 줄을 생략")
+            }
+        } else {
+            check(false, "월간 섹션: 캐시에 현재 달 행이 있으면 non-nil이어야 함")
+        }
+        // 배선 회귀: 순수 함수가 값을 만들어도 어댑터가 BlockDisplayData에 담지 않으면 화면엔
+        // 아무것도 안 나온다. 그리고 asLoadingSkeleton()이 전파를 빠뜨리면 메뉴가 열린 채
+        // 새로고침될 때만 두 섹션이 사라져 메뉴 높이가 튄다(currency에서 실제로 겪은 종류).
+        let periodApp = ClaudeMonitorApp()
+        let wired = periodApp.makeBlockDisplayData(fromCache: scPeriod, cachedAll: [], now: periodNow)
+        check(wired.week?.totalCost == 20.0 && wired.month?.totalCost == 120.0,
+              "makeBlockDisplayData(fromCache:): 주간/월별 섹션이 BlockDisplayData까지 배선됨")
+        check(wired.asLoadingSkeleton()?.week != nil && wired.asLoadingSkeleton()?.month != nil,
+              "asLoadingSkeleton(): 주간/월별도 함께 전파(새로고침 중 섹션이 사라지지 않음)")
+    } else {
+        check(false, "주간/월별 픽스처 디코드 성공해야 함")
+    }
+
+    // 현재 기간 행이 없으면(주가 막 바뀌었거나 CLI 보관 기간 밖) 섹션 자체를 생략한다 —
+    // 0으로 채운 행을 그리면 "이번 달 $0"이 실제 사용량처럼 읽힌다.
+    let emptyPeriodJSON = #"{"blocks":{"blocks":[]},"weekly":{"weekly":[]},"monthly":{"monthly":[]}}"#
+    if let scEmpty = try? JSONDecoder().decode(StatsCache.self, from: Data(emptyPeriodJSON.utf8)) {
+        let sections = makePeriodSections(fromCache: scEmpty, now: periodNow)
+        check(sections.week == nil && sections.month == nil,
+              "주간/월별 섹션: 매칭되는 행이 없으면 nil(섹션 생략)")
+    } else {
+        check(false, "빈 주간/월별 픽스처 디코드 성공해야 함")
+    }
+
+    // ── 주간/월별 섹션 (폴백 JSONL 경로) ──
+    // 이번 주 시작 이후/이전 엔트리를 섞어 넣어 윈도우 필터링이 실제로 걸리는지 본다.
+    let weekStartLocal = gregorianWeekStart(periodNow)
+    let monthStartLocal = gregorianMonthStart(periodNow)
+    func tokenEntry(_ ts: Date, out: Int) -> UsageEntry {
+        UsageEntry(timestamp: ts, model: "claude-sonnet-4-5", inputTokens: 0, outputTokens: out,
+                   cacheReadTokens: 0, cacheWriteTokens: 0)
+    }
+    let periodEntries = [
+        tokenEntry(weekStartLocal.addingTimeInterval(3600), out: 100),          // 이번 주 안
+        tokenEntry(periodNow.addingTimeInterval(-60), out: 200),                // 이번 주 안(방금)
+        tokenEntry(weekStartLocal.addingTimeInterval(-3600), out: 400),         // 지난 주
+        tokenEntry(monthStartLocal.addingTimeInterval(-3600), out: 800)         // 지난 달
+    ]
+    let entrySections = makePeriodSections(fromEntries: periodEntries, now: periodNow)
+    if let w = entrySections.week {
+        check(w.totalTokens == 300, "주간 섹션(폴백): 이번 주 윈도우 밖 엔트리는 제외(100+200)")
+        check(w.prevTotalCost != nil, "주간 섹션(폴백): 지난 주 엔트리가 있으면 참고치 채움")
+    } else {
+        check(false, "주간 섹션(폴백): 이번 주 엔트리가 있으면 non-nil이어야 함")
+    }
+    if let m = entrySections.month {
+        // 이번 주 시작이 이번 달 안이면 월 합계는 300 + (지난 주 400 중 이번 달에 속한 몫)이라
+        // 머신 날짜에 따라 달라진다. 대신 "월 합계 ≥ 주 합계"라는 불변식만 단정한다.
+        check(m.totalTokens >= (entrySections.week?.totalTokens ?? 0),
+              "월간 섹션(폴백): 월 합계는 주 합계 이상(윈도우 포함 관계)")
+        check(m.elapsedDays == expectedMonthElapsed, "월간 섹션(폴백): 경과일은 캐시 경로와 동일 산식")
+    } else {
+        check(false, "월간 섹션(폴백): 이번 달 엔트리가 있으면 non-nil이어야 함")
+    }
+    check(makePeriodSections(fromEntries: [], now: periodNow).week == nil,
+          "주간 섹션(폴백): 엔트리가 없으면 nil(섹션 생략)")
+
+    // 폴백 경로도 같은 배선을 거쳐야 한다(1차 경로만 고치고 폴백을 놓치는 실수 방지).
+    let entriesWireApp = ClaudeMonitorApp()
+    let entriesWired = entriesWireApp.makeBlockDisplayData(fromEntries: periodEntries,
+                                                           reader: UsageDataReader(), now: periodNow)
+    check(entriesWired.week?.totalTokens == 300,
+          "makeBlockDisplayData(fromEntries:): 주간 섹션이 BlockDisplayData까지 배선됨")
+    check(entriesWired.month != nil,
+          "makeBlockDisplayData(fromEntries:): 월간 섹션이 BlockDisplayData까지 배선됨")
 
     // 부분 드리프트 견딤: monthly 없으면 daily.totals 폴백, 활성 블록 없음
     let partialJSON = #"{"blocks":{"blocks":[]},"daily":{"daily":[],"totals":{"totalTokens":5,"totalCost":0.5}}}"#
