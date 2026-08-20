@@ -5819,17 +5819,42 @@ func runSelfTests() -> Never {
     // 배선 회귀: 순수 함수가 값을 만들어도 어댑터·스켈레톤이 옮기지 않으면 화면엔 안 나온다.
     // (updateLimitHistory는 .standard에 쓰므로 여기선 호출하지 않고, cachedLimitHistory에 직접
     //  주입해 어댑터 → BlockDisplayData 경로만 시험한다 — 사용자 도메인 오염 금지 원칙.)
+    // reader는 반드시 projects 디렉터리가 **존재하는** 임시 홈을 가리켜야 한다. 엔트리 0개를
+    // 넘기는데 그 디렉터리까지 없으면 makeBlockDisplayData(fromEntries:)가 .noData로 조기 반환해
+    // limitTrend를 채우기 전에 빠져나가고, 이 테스트는 검증하려던 배선을 아예 타지 않는다.
+    // 실제 홈(UsageDataReader())을 쓰면 "개발자 머신에는 ~/.claude/projects가 있다"는 우연에
+    // 기대게 되어 **CI 같은 깨끗한 환경에서만 실패한다** — 실제로 그렇게 한 번 깨졌고, 같은 함정을
+    // 이미 한 번 고친 자리가 아래 "유휴 화면 한도 도달 배선 회귀" 블록이다.
+    let trendHome = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ClaudeMonitorSelfTest.trend.\(UUID().uuidString)")
+    let trendReader = UsageDataReader(homeDir: trendHome)
+    try? FileManager.default.createDirectory(at: trendReader.projectsDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: trendHome) }
+
     let trendApp = ClaudeMonitorApp()
     trendApp.cachedLimitHistory = doneHistory
-    let trendWired = trendApp.makeBlockDisplayData(fromEntries: [], reader: UsageDataReader(), now: lhNow)
+    let trendWired = trendApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow)
     check(trendWired.limitTrend?.observedWeeks == 2,
           "makeBlockDisplayData(fromEntries:): 한도 추이가 BlockDisplayData까지 배선됨")
     check(trendWired.asLoadingSkeleton()?.limitTrend != nil,
           "asLoadingSkeleton(): 한도 추이도 전파(새로고침 중 섹션이 사라지지 않음)")
     let emptyTrendApp = ClaudeMonitorApp()
     emptyTrendApp.cachedLimitHistory = .empty
-    check(emptyTrendApp.makeBlockDisplayData(fromEntries: [], reader: UsageDataReader(), now: lhNow).limitTrend == nil,
+    check(emptyTrendApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow).limitTrend == nil,
           "makeBlockDisplayData: 기록이 없으면 limitTrend는 nil(섹션 생략 — 기존 사용자 화면 불변)")
+
+    // 위 임시 홈이 왜 필요한지를 메커니즘 자체로 고정한다: projects 디렉터리가 **없으면** 엔트리 0개일 때
+    // .noData로 조기 반환하므로 이력이 있어도 limitTrend가 실리지 않는다. 이 단정이 있으면 누가
+    // trendReader를 UsageDataReader()로 되돌렸을 때 "왜 CI에서만 깨지는가"를 코드에서 바로 읽을 수 있다.
+    // ($HOME을 바꿔서는 재현되지 않는다 — macOS는 홈을 환경변수가 아니라 사용자 레코드에서 해석한다.)
+    let missingHome = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ClaudeMonitorSelfTest.missing.\(UUID().uuidString)")
+    let missingReader = UsageDataReader(homeDir: missingHome)   // 디렉터리를 만들지 않는다
+    let noDataApp = ClaudeMonitorApp()
+    noDataApp.cachedLimitHistory = doneHistory
+    let noDataResult = noDataApp.makeBlockDisplayData(fromEntries: [], reader: missingReader, now: lhNow)
+    check(noDataResult.limitTrend == nil,
+          "makeBlockDisplayData(fromEntries:): projects 디렉터리가 없으면 .noData로 조기 반환 — 이 경로엔 limitTrend가 실리지 않는다")
 
     // updateLimitHistory: 값이 안 바뀌면 저장을 건너뛴다(30초마다 UserDefaults 쓰기 방지).
     // **반드시 격리 suite를 주입한다** — 기본값 .standard로 부르면 아래 픽스처 관측(30% 주간 창)이
