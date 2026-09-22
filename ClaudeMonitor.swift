@@ -262,19 +262,6 @@ enum TitleSettings {
 enum TitleFieldColor: String, CaseIterable {
     case defaultColor = "default", red, orange, yellow, green, blue, purple, gray
 
-    var swatch: String {  // 순환 버튼에 표시할 스와치
-        switch self {
-        case .defaultColor: return "⚪"
-        case .red:    return "🔴"
-        case .orange: return "🟠"
-        case .yellow: return "🟡"
-        case .green:  return "🟢"
-        case .blue:   return "🔵"
-        case .purple: return "🟣"
-        case .gray:   return "⚫"
-        }
-    }
-
     // nil이면 렌더링 시 NSColor.labelColor(다크/라이트 자동) 사용
     var nsColor: NSColor? {
         switch self {
@@ -287,29 +274,6 @@ enum TitleFieldColor: String, CaseIterable {
         case .purple: return .systemPurple
         case .gray:   return .systemGray
         }
-    }
-
-    var next: TitleFieldColor {
-        let all = TitleFieldColor.allCases
-        let idx = all.firstIndex(of: self)!
-        return all[(idx + 1) % all.count]
-    }
-}
-
-extension TitleSettings {
-    private static func colorKey(_ field: TitleField) -> String { "titleColor_\(field.rawValue)" }
-
-    static func color(for field: TitleField, defaults: UserDefaults = .standard) -> TitleFieldColor {
-        guard let raw = defaults.string(forKey: colorKey(field)), let c = TitleFieldColor(rawValue: raw) else { return .defaultColor }
-        return c
-    }
-
-    static func setColor(_ color: TitleFieldColor, for field: TitleField, defaults: UserDefaults = .standard) {
-        defaults.set(color.rawValue, forKey: colorKey(field))
-    }
-
-    static func cycleColor(for field: TitleField, defaults: UserDefaults = .standard) {
-        setColor(color(for: field, defaults: defaults).next, for: field, defaults: defaults)
     }
 }
 
@@ -571,7 +535,6 @@ func migrateLegacyDefaultsIfNeeded(defaults: UserDefaults = .standard,
     guard let legacy = legacyDefaults else { return }
 
     let keys = TitleField.allCases.map(\.defaultsKey)
-        + TitleField.allCases.map { "titleColor_\($0.rawValue)" }
         + ["titleFieldsOrder", "titleSeparator", "titleIcon", "refreshIntervalSeconds"]
     for key in keys {
         guard defaults.object(forKey: key) == nil, let value = legacy.object(forKey: key) else { continue }
@@ -2326,12 +2289,19 @@ struct TitleContext {
     let todayCost: Double
     let cumulativeTokens: Int
     let currency: CurrencyContext  // 기본 .usd — 기존 호출부/테스트의 "$" 출력이 그대로 유지된다
+    // 동적 색상 입력. nil/0이면 해당 필드는 labelColor로 렌더된다(titleFieldRatio 참고).
+    let blockRatio: Double?        // blockUsageRatio() 결과
+    let elapsedRatio: Double?      // 블록 경과율 0~1
+    let bestDayTokens: Int
+    let bestDayCost: Double
 
     // moodTier 이후 추가되는 필드는 전부 기본값을 줘 기존 호출부가 그대로 컴파일되게 한다.
     init(outputTokens: Int, totalTokens: Int, cost: Double, remainingText: String?, model: String?,
          moodTier: MoodTier? = nil,
          todayTokens: Int = 0, todayCost: Double = 0, cumulativeTokens: Int = 0,
-         currency: CurrencyContext = .usd) {
+         currency: CurrencyContext = .usd,
+         blockRatio: Double? = nil, elapsedRatio: Double? = nil,
+         bestDayTokens: Int = 0, bestDayCost: Double = 0) {
         self.outputTokens = outputTokens
         self.totalTokens = totalTokens
         self.cost = cost
@@ -2342,6 +2312,10 @@ struct TitleContext {
         self.todayCost = todayCost
         self.cumulativeTokens = cumulativeTokens
         self.currency = currency
+        self.blockRatio = blockRatio
+        self.elapsedRatio = elapsedRatio
+        self.bestDayTokens = bestDayTokens
+        self.bestDayCost = bestDayCost
     }
 }
 
@@ -2350,7 +2324,105 @@ let titleIconGlyph = "⌨"
 // idle/no-data 고정 문자열과 launch placeholder도 이 값을 공유해 커스터마이징과 어긋나지 않게 한다.
 func titleIconPrefix() -> String { "\(titleIconGlyph) " }
 
-struct TitlePart { let text: String; let color: TitleFieldColor }
+// MARK: - Title Dynamic Colors (수치/비율 → 색)
+
+// 정지점은 MoodTier 신호등 배색과 같은 system 색 — 무드 아이콘과 타이틀이 한 색 언어를 쓴다.
+let usageColorStops: [NSColor] = [.systemGreen, .systemYellow, .systemOrange, .systemRed]
+
+// 순수 함수: ratio가 떨어지는 정지점 구간(lower 인덱스)과 구간 내 보간 비율. NaN/무한대는 0으로 본다.
+func usageColorSegment(_ ratio: Double, stopCount: Int = usageColorStops.count) -> (index: Int, fraction: Double) {
+    let r = ratio.isFinite ? min(max(ratio, 0), 1) : 0
+    let segments = stopCount - 1
+    let pos = r * Double(segments)
+    let idx = min(Int(pos), segments - 1)
+    return (idx, pos - Double(idx))
+}
+
+// blended(withFraction:of:)는 호출 시점 외관으로 굳은 정적 색을 돌려주므로 dynamicProvider로 감싼다 —
+// 그러지 않으면 다크/라이트 전환 후 다음 refresh까지 반대 테마용 색이 남는다.
+func usageColor(ratio: Double) -> NSColor {
+    let seg = usageColorSegment(ratio)
+    let from = usageColorStops[seg.index], to = usageColorStops[seg.index + 1]
+    return NSColor(name: nil) { appearance in
+        var result = from
+        appearance.performAsCurrentDrawingAppearance {
+            if let a = from.usingColorSpace(.sRGB), let b = to.usingColorSpace(.sRGB),
+               let mixed = a.blended(withFraction: CGFloat(seg.fraction), of: b) {
+                result = mixed
+            }
+        }
+        return result
+    }
+}
+
+// 모델 family 고정색 — usageColorStops가 덮는 빨강~초록(색상각 0°~120°) 바깥에서만 고른다.
+// 그 범위 안의 색을 쓰면 모델명이 "사용량 경고"로 오독된다. 새 family는 MODEL_FAMILIES와 함께 여기에도 추가하고,
+// 기존 family와 색상각이 18° 이상 떨어져야 한다(셀프테스트 단정).
+func modelFamilyColor(_ family: String) -> NSColor? {
+    switch family {
+    case "opus":   return .systemPurple
+    case "sonnet": return .systemBlue
+    case "haiku":  return .systemMint
+    case "fable":  return .systemIndigo
+    case "mythos": return NSColor(srgbRed: 0.90, green: 0.25, blue: 0.75, alpha: 1)
+    default:       return nil
+    }
+}
+
+// 두 타이틀 경로(makeTitleContext/updateStatusBarTitleFromEntries)가 이 함수만 써야 같은 블록에 같은 색이 나온다.
+func blockUsageRatio(serverFiveHour: RateLimitWindow?, warning: UsageWarning?,
+                     elapsedRatio: Double, now: Date = Date()) -> Double {
+    if let w = serverFiveHour, let pct = w.usedPercentage, pct.isFinite, !w.isStale(now: now) {
+        return pct / 100
+    }
+    if let w = warning { return w.ratio }
+    return elapsedRatio
+}
+
+// 누적값이 직전 마일스톤에서 다음 마일스톤까지 얼마나 왔는지(0~1). 마지막 마일스톤 뒤로는 ×10씩 연장한다 —
+// 연장이 없으면 1B를 넘은 사용자의 누적 토큰이 영구히 빨강으로 고정된다.
+func milestoneProgress(_ value: Int, milestones: [Int] = tokenMilestones) -> Double {
+    guard let first = milestones.first, value > 0 else { return 0 }
+    let v = Double(value)
+    var lower = 0.0, upper = Double(first), idx = 0
+    while v >= upper {
+        lower = upper
+        idx += 1
+        upper = idx < milestones.count ? Double(milestones[idx]) : upper * 10
+    }
+    return (v - lower) / (upper - lower)
+}
+
+// 필드별 색 결정용 비율. nil이면 비율을 정할 근거가 없다는 뜻(labelColor로 렌더).
+func titleFieldRatio(_ field: TitleField, _ ctx: TitleContext) -> Double? {
+    switch field {
+    case .outputTokens, .totalTokens, .cost: return ctx.blockRatio
+    case .remainingTime:    return ctx.elapsedRatio
+    case .todayTokens:      return ctx.bestDayTokens > 0 ? Double(ctx.todayTokens) / Double(ctx.bestDayTokens) : nil
+    case .todayCost:        return ctx.bestDayCost > 0 ? ctx.todayCost / ctx.bestDayCost : nil
+    case .cumulativeTokens: return milestoneProgress(ctx.cumulativeTokens)
+    case .model:            return nil
+    }
+}
+
+// 동적 NSColor는 동등 비교가 안 되므로 색의 출처를 담고 렌더링 시점에만 해석한다.
+enum TitlePartColor: Equatable {
+    case label
+    case fixed(TitleFieldColor)
+    case usage(Double)
+    case model(family: String)
+
+    var nsColor: NSColor {
+        switch self {
+        case .label:             return .labelColor
+        case .fixed(let c):      return c.nsColor ?? .labelColor
+        case .usage(let r):      return usageColor(ratio: r)
+        case .model(let family): return modelFamilyColor(family) ?? .labelColor
+        }
+    }
+}
+
+struct TitlePart { let text: String; let color: TitlePartColor }
 
 func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     var parts: [TitlePart] = []
@@ -2358,18 +2430,21 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
     // statusItem.button.image로 렌더링되므로(moodImageToApply(tier:) 참고) 여기서는 글리프
     // 텍스트를 만들지 않는다. OFF면 고정 ⌨ 아이콘 텍스트를 그대로 쓴다.
     if ctx.moodTier == nil {
-        parts.append(TitlePart(text: titleIconGlyph, color: .defaultColor))
+        parts.append(TitlePart(text: titleIconGlyph, color: .label))
     }
     for field in TitleSettings.enabledFieldsInOrder() {
+        let color: TitlePartColor = titleFieldRatio(field, ctx).map { .usage($0) } ?? .label
         switch field {
-        case .outputTokens:     parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: TitleSettings.color(for: field)))
-        case .totalTokens:      parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: TitleSettings.color(for: field)))
-        case .cost:             parts.append(TitlePart(text: formatMoney(ctx.cost, ctx.currency), color: TitleSettings.color(for: field)))
-        case .remainingTime:    if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: TitleSettings.color(for: field))) }
-        case .model:            if let m = ctx.model { parts.append(TitlePart(text: shortModelName(m), color: TitleSettings.color(for: field))) }
-        case .todayTokens:      parts.append(TitlePart(text: formatTokens(ctx.todayTokens), color: TitleSettings.color(for: field)))
-        case .todayCost:        parts.append(TitlePart(text: formatMoney(ctx.todayCost, ctx.currency), color: TitleSettings.color(for: field)))
-        case .cumulativeTokens: parts.append(TitlePart(text: formatTokens(ctx.cumulativeTokens), color: TitleSettings.color(for: field)))
+        case .outputTokens:     parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: color))
+        case .totalTokens:      parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: color))
+        case .cost:             parts.append(TitlePart(text: formatMoney(ctx.cost, ctx.currency), color: color))
+        case .remainingTime:    if let r = ctx.remainingText { parts.append(TitlePart(text: r, color: color)) }
+        case .model:            if let m = ctx.model {
+                                    parts.append(TitlePart(text: shortModelName(m), color: .model(family: parseModelVersion(m).family)))
+                                }
+        case .todayTokens:      parts.append(TitlePart(text: formatTokens(ctx.todayTokens), color: color))
+        case .todayCost:        parts.append(TitlePart(text: formatMoney(ctx.todayCost, ctx.currency), color: color))
+        case .cumulativeTokens: parts.append(TitlePart(text: formatTokens(ctx.cumulativeTokens), color: color))
         }
     }
     return parts
@@ -3540,7 +3615,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func activeCelebrationBadge() -> TitlePart? {
         guard TitleSettings.isFunModeFeatureEnabled(.celebrations) else { return nil }
         guard let text = celebrationBadgeText, let expires = celebrationBadgeExpiresAt, expires > Date() else { return nil }
-        return TitlePart(text: text, color: .green)
+        return TitlePart(text: text, color: .fixed(.green))
     }
 
     func buildMenu() {
@@ -3673,9 +3748,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if moodEnabled {
             // 무드 아이콘은 텍스트 글리프가 아니라 statusItem.button.image로 렌더링되므로(applyMood
             // 참고) 여기서는 label만 붙인다.
-            parts.append(TitlePart(text: label, color: .defaultColor))
+            parts.append(TitlePart(text: label, color: .label))
         } else {
-            parts.append(TitlePart(text: "\(titleIconPrefix())\(label)".trimmingCharacters(in: .whitespaces), color: .defaultColor))
+            parts.append(TitlePart(text: "\(titleIconPrefix())\(label)".trimmingCharacters(in: .whitespaces), color: .label))
         }
         renderTitle(parts: parts, warning: nil)
     }
@@ -3720,6 +3795,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             resetText = resetCountdownText(for: b)
             elapsedRatio = b.elapsedRatio()
         }
+        let best = GamificationSettings.load()
         let ctx = TitleContext(outputTokens: anchored?.stats.outputTokens ?? b.tokenCounts.outputTokens,
                                totalTokens: anchored?.stats.totalTokens ?? b.totalTokens,
                                cost: anchored?.stats.totalCost ?? b.costUSD,
@@ -3730,7 +3806,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                todayCost: gamificationTodayCost,
                                cumulativeTokens: stats.cumulative?.totalTokens ?? 0,
                                currency: currencyContext(currency: CurrencySettings.currency(),
-                                                         rate: cachedExchangeRate))
+                                                         rate: cachedExchangeRate),
+                               blockRatio: blockUsageRatio(serverFiveHour: cachedRateLimits?.fiveHour, warning: warning,
+                                                           elapsedRatio: elapsedRatio, now: now),
+                               elapsedRatio: elapsedRatio,
+                               bestDayTokens: best.bestDayTokens,
+                               bestDayCost: best.bestDayCost)
         return (ctx, warning)
     }
 
@@ -3775,6 +3856,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if let b = block {
             let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
             applyMood(moodTier)
+            let best = GamificationSettings.load()
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
                                    totalTokens: blockStats.totalTokens,
                                    cost: blockStats.totalCost,
@@ -3785,7 +3867,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    todayCost: gamificationTodayCost,
                                    cumulativeTokens: UsageStats(entries: cachedAll).totalTokens,
                                    currency: currencyContext(currency: CurrencySettings.currency(),
-                                                             rate: cachedExchangeRate))
+                                                             rate: cachedExchangeRate),
+                                   blockRatio: blockUsageRatio(serverFiveHour: cachedRateLimits?.fiveHour, warning: warning,
+                                                               elapsedRatio: b.progress),
+                                   elapsedRatio: b.progress,
+                                   bestDayTokens: best.bestDayTokens,
+                                   bestDayCost: best.bestDayCost)
             renderTitle(parts: titlePartsWithBadge(ctx), warning: warning)
         }
     }
@@ -4613,17 +4700,10 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let idx = TitleField.allCases.firstIndex(of: field)!  // 순서와 무관한 안정적 식별자
 
         let checkbox = NSButton(checkboxWithTitle: field.label, target: self, action: #selector(toggleTitleFieldCheckbox(_:)))
-        checkbox.frame = NSRect(x: 14, y: 2, width: 150, height: 18)
+        checkbox.frame = NSRect(x: 14, y: 2, width: 180, height: 18)
         checkbox.state = TitleSettings.isEnabled(field) ? .on : .off
         checkbox.tag = idx
         row.addSubview(checkbox)
-
-        let colorButton = NSButton(title: TitleSettings.color(for: field).swatch, target: self, action: #selector(cycleTitleFieldColorButton(_:)))
-        colorButton.frame = NSRect(x: 166, y: 1, width: 26, height: 20)
-        colorButton.tag = idx
-        // 아이콘 전용 버튼(스와치 이모지)이라 VoiceOver가 이모지만 읽으면 무슨 기능인지 알 수 없다.
-        colorButton.setAccessibilityLabel(t("\(field.label) 색상 변경", "Change \(field.label) color"))
-        row.addSubview(colorButton)
 
         let up = NSButton(title: "▲", target: self, action: #selector(moveTitleFieldUpButton(_:)))
         up.frame = NSRect(x: 198, y: 1, width: 20, height: 20)
@@ -4677,11 +4757,6 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func moveTitleFieldDownButton(_ sender: NSButton) {
         TitleSettings.move(TitleField.allCases[sender.tag], direction: .down)
-        refreshTitleFieldsSubmenu()
-    }
-
-    @objc func cycleTitleFieldColorButton(_ sender: NSButton) {
-        TitleSettings.cycleColor(for: TitleField.allCases[sender.tag])
         refreshTitleFieldsSubmenu()
     }
 
@@ -5101,7 +5176,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
     // (남은 시간은 메뉴 안에 표시되므로 타이틀에서는 생략)
-    // 평상시엔 항목별 커스텀 색(TitlePart.color)을 적용하되, 항상 attributedTitle을 써서
+    // 평상시엔 항목별 동적 색(TitlePart.color)을 적용하되, 항상 attributedTitle을 써서
     // 비포커스 화면(다중 디스플레이)에서 plain title이 자동으로 dim되는 것을 방지한다.
     func renderTitle(parts: [TitlePart], warning: UsageWarning?) {
         guard let button = statusItem.button else { return }
@@ -5127,14 +5202,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             result.append(NSAttributedString(string: part.text, attributes: [
                 .font: font,
-                .foregroundColor: part.color.nsColor ?? NSColor.labelColor
+                .foregroundColor: part.color.nsColor
             ]))
         }
         button.attributedTitle = result
     }
 
     func renderTitle(plain text: String, warning: UsageWarning?) {
-        renderTitle(parts: [TitlePart(text: text, color: .defaultColor)], warning: warning)
+        renderTitle(parts: [TitlePart(text: text, color: .label)], warning: warning)
     }
 
     @objc func manualRefresh() {
@@ -6595,7 +6670,7 @@ func runSelfTests() -> Never {
     let noMoodCtx = TitleContext(outputTokens: 0, totalTokens: 0, cost: 0, remainingText: nil, model: nil)
     if let staticPart = buildTitleParts(noMoodCtx).first {
         check(staticPart.text == titleIconGlyph, "mood: moodTier nil이면 고정 정적 아이콘 그대로(회귀 가드)")
-        check(staticPart.color == .defaultColor, "mood: moodTier nil이면 기본 색(회귀 가드)")
+        check(staticPart.color == .label, "mood: moodTier nil이면 기본 색(회귀 가드)")
     } else {
         check(false, "mood: buildTitleParts가 아이콘 파트를 반환해야 함")
     }
@@ -6972,19 +7047,71 @@ func runSelfTests() -> Never {
         check(false, "moodGlyphTheme: 전용 UserDefaults suite 생성 성공해야 함")
     }
 
-    // TitleSettings.color (전용 suite)
-    let colorSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
-    if let cd = UserDefaults(suiteName: colorSuite) {
-        check(TitleSettings.color(for: .cost, defaults: cd) == .defaultColor, "color: 기본값 = defaultColor")
-        TitleSettings.setColor(.red, for: .cost, defaults: cd)
-        check(TitleSettings.color(for: .cost, defaults: cd) == .red, "color: 저장/조회 왕복")
-        TitleSettings.cycleColor(for: .cost, defaults: cd)
-        check(TitleSettings.color(for: .cost, defaults: cd) == .orange, "color: cycleColor는 팔레트의 다음 색으로 이동")
-        check(TitleFieldColor.gray.next == .defaultColor, "color: 팔레트 마지막(gray) 다음은 defaultColor로 순환")
-        cd.removePersistentDomain(forName: colorSuite)
-    } else {
-        check(false, "color: 전용 UserDefaults suite 생성 성공해야 함")
+    // 동적 색상 — 보간 구간 산정
+    func segEq(_ r: Double, _ i: Int, _ f: Double) -> Bool {
+        let seg = usageColorSegment(r); return seg.index == i && abs(seg.fraction - f) < 1e-9
     }
+    check(segEq(0, 0, 0), "usageColorSegment: 0 → 첫 정지점(초록)")
+    check(segEq(1, 2, 1), "usageColorSegment: 1 → 마지막 구간 끝(빨강)")
+    check(segEq(0.5, 1, 0.5), "usageColorSegment: 0.5 → 노랑~주황 구간 중간")
+    check(segEq(1.7, 2, 1) && segEq(-0.3, 0, 0), "usageColorSegment: 범위 밖 비율은 0~1로 자른다")
+    check(segEq(.nan, 0, 0) && segEq(.infinity, 0, 0), "usageColorSegment: NaN/무한대는 0으로 본다(크래시 방지)")
+    if let aqua = NSAppearance(named: .aqua) {
+        var ok = false
+        aqua.performAsCurrentDrawingAppearance {
+            if let a = usageColor(ratio: 0).usingColorSpace(.sRGB), let g = NSColor.systemGreen.usingColorSpace(.sRGB),
+               let z = usageColor(ratio: 1).usingColorSpace(.sRGB), let r = NSColor.systemRed.usingColorSpace(.sRGB) {
+                ok = abs(a.redComponent - g.redComponent) < 0.01 && abs(a.greenComponent - g.greenComponent) < 0.01
+                    && abs(z.redComponent - r.redComponent) < 0.01 && abs(z.greenComponent - r.greenComponent) < 0.01
+            }
+        }
+        check(ok, "usageColor: 끝점은 systemGreen/systemRed로 해석된다")
+    }
+
+    // 모델 고정색 — 모든 family에 색이 있고, 사용량 그라디언트(빨강~초록, 색상각 0°~120°)와 겹치지 않는다
+    var familyHues: [CGFloat] = []
+    for family in MODEL_FAMILIES {
+        guard let c = modelFamilyColor(family)?.usingColorSpace(.sRGB) else {
+            check(false, "modelFamilyColor: \(family)에 고정색이 있어야 함"); continue
+        }
+        familyHues.append(c.hueComponent)
+        check(c.hueComponent > 0.40 && c.hueComponent < 0.90,
+              "modelFamilyColor: \(family) 색상각(\(Int(c.hueComponent * 360))°)이 사용량 그라디언트 범위 밖")
+    }
+    let sortedHues = familyHues.sorted()
+    let minHueGap = zip(sortedHues, sortedHues.dropFirst()).map { $1 - $0 }.min() ?? 1
+    check(minHueGap >= 0.05, "modelFamilyColor: family끼리 색상각이 18° 이상 떨어진다(최소 \(Int(minHueGap * 360))°)")
+    check(modelFamilyColor("") == nil, "modelFamilyColor: 미상 family는 nil(labelColor)")
+
+    // blockUsageRatio 우선순위: 신선한 서버 % ▸ 예산 경고 비율 ▸ 경과율
+    let brNow = Date(timeIntervalSince1970: 1_800_000_000)
+    let brFresh = RateLimitWindow(usedPercentage: 72, resetsAt: Int(brNow.timeIntervalSince1970) + 600)
+    let brStale = RateLimitWindow(usedPercentage: 72, resetsAt: Int(brNow.timeIntervalSince1970) - 600)
+    let brWarn = UsageWarning(ratio: 0.4, level: .none)
+    check(abs(blockUsageRatio(serverFiveHour: brFresh, warning: brWarn, elapsedRatio: 0.1, now: brNow) - 0.72) < 1e-9,
+          "blockUsageRatio: 신선한 서버 실측 %가 최우선")
+    check(blockUsageRatio(serverFiveHour: brStale, warning: brWarn, elapsedRatio: 0.1, now: brNow) == 0.4,
+          "blockUsageRatio: 서버 값이 stale이면 예산 비율")
+    check(blockUsageRatio(serverFiveHour: nil, warning: nil, elapsedRatio: 0.1, now: brNow) == 0.1,
+          "blockUsageRatio: 서버·예산 모두 없으면 경과율")
+
+    // milestoneProgress: 직전~다음 마일스톤 사이 진행률, 마지막 마일스톤 뒤로는 ×10 연장
+    check(milestoneProgress(0) == 0 && milestoneProgress(500_000) == 0.5, "milestoneProgress: 첫 마일스톤(1M) 전")
+    check(milestoneProgress(1_000_000) == 0, "milestoneProgress: 마일스톤 도달 시 다음 구간 시작(0)")
+    check(milestoneProgress(5_500_000) == 0.5, "milestoneProgress: 1M~10M 구간 중간")
+    check(milestoneProgress(5_500_000_000) == 0.5, "milestoneProgress: 1B 초과는 10B까지 연장(영구 빨강 방지)")
+
+    // titleFieldRatio: 필드별 비율 원천
+    let ratioCtx = TitleContext(outputTokens: 1, totalTokens: 1, cost: 1, remainingText: "1h", model: "claude-opus-5",
+                                todayTokens: 300, todayCost: 2, cumulativeTokens: 500_000,
+                                blockRatio: 0.8, elapsedRatio: 0.3, bestDayTokens: 1_200, bestDayCost: 0)
+    check(titleFieldRatio(.totalTokens, ratioCtx) == 0.8 && titleFieldRatio(.outputTokens, ratioCtx) == 0.8
+          && titleFieldRatio(.cost, ratioCtx) == 0.8, "titleFieldRatio: 블록 계열 필드는 blockRatio를 공유")
+    check(titleFieldRatio(.remainingTime, ratioCtx) == 0.3, "titleFieldRatio: 남은 시간은 경과율")
+    check(titleFieldRatio(.todayTokens, ratioCtx) == 0.25, "titleFieldRatio: 오늘 토큰 ÷ 최고 일일 토큰")
+    check(titleFieldRatio(.todayCost, ratioCtx) == nil, "titleFieldRatio: 최고 기록이 0이면 근거 없음(nil)")
+    check(titleFieldRatio(.cumulativeTokens, ratioCtx) == 0.5, "titleFieldRatio: 누적 토큰은 마일스톤 진행률")
+    check(titleFieldRatio(.model, ratioCtx) == nil, "titleFieldRatio: 모델명은 동적 색 대상이 아니다")
 
     // RefreshSettings.interval (전용 suite)
     let refreshSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
@@ -7003,8 +7130,6 @@ func runSelfTests() -> Never {
     let savedEnabled2 = Dictionary(uniqueKeysWithValues: TitleField.allCases.map {
         ($0, UserDefaults.standard.object(forKey: $0.defaultsKey))
     })
-    let savedCostColor = UserDefaults.standard.string(forKey: "titleColor_cost")
-    let savedModelColor = UserDefaults.standard.string(forKey: "titleColor_model")
     setEnabled([.outputTokens, .cost, .model])
     UserDefaults.standard.set(["model", "cost", "outputTokens"], forKey: "titleFieldsOrder")
     TitleSettings.setSeparator(.pipe)
@@ -7013,17 +7138,19 @@ func runSelfTests() -> Never {
     TitleSettings.setSeparator(.none)
     check(buildTitleText(titleCtx) == "⌨Sonnet 4.5$4.2012.3K", "title: 구분자 없음 조합")
     TitleSettings.setSeparator(.space)
-    TitleSettings.setColor(.blue, for: .cost)
-    UserDefaults.standard.removeObject(forKey: "titleColor_model")  // 이 검증은 model이 미지정(defaultColor)임을 전제로 함
-    let coloredParts = buildTitleParts(titleCtx)
-    check(coloredParts.first(where: { $0.text == "$4.20" })?.color == .blue,
-          "buildTitleParts: 지정한 필드(cost)에 커스텀 색이 붙는다")
-    check(coloredParts.first(where: { $0.text == "Sonnet 4.5" })?.color == .defaultColor,
-          "buildTitleParts: 색을 지정하지 않은 필드(model)는 defaultColor 유지")
-    if let sc = savedCostColor { UserDefaults.standard.set(sc, forKey: "titleColor_cost") }
-    else { UserDefaults.standard.removeObject(forKey: "titleColor_cost") }
-    if let smc = savedModelColor { UserDefaults.standard.set(smc, forKey: "titleColor_model") }
-    else { UserDefaults.standard.removeObject(forKey: "titleColor_model") }
+    let plainParts = buildTitleParts(titleCtx)
+    check(plainParts.first(where: { $0.text == "$4.20" })?.color == .label,
+          "buildTitleParts: 비율 근거가 없으면(blockRatio nil) 기본 색")
+    check(plainParts.first(where: { $0.text == "Sonnet 4.5" })?.color == .model(family: "sonnet"),
+          "buildTitleParts: 모델명은 family 고정색")
+    let dynCtx = TitleContext(outputTokens: 12_300, totalTokens: 50_000, cost: 4.2,
+                              remainingText: nil, model: "claude-sonnet-4-5", blockRatio: 0.65)
+    let dynParts = buildTitleParts(dynCtx)
+    check(dynParts.first(where: { $0.text == "$4.20" })?.color == .usage(0.65)
+          && dynParts.first(where: { $0.text == "12.3K" })?.color == .usage(0.65),
+          "buildTitleParts: 블록 계열 필드는 blockRatio로 동적 색")
+    check(dynParts.first(where: { $0.text == "Sonnet 4.5" })?.color == .model(family: "sonnet"),
+          "buildTitleParts: 비율이 있어도 모델명은 고정색 유지")
     if let so = savedOrder { UserDefaults.standard.set(so, forKey: "titleFieldsOrder") }
     else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
     if let ss = savedSeparator { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
@@ -7411,13 +7538,11 @@ func runSelfTests() -> Never {
     let newSuite = "ClaudeMonitorSelfTest.new.\(UUID().uuidString)"
     if let legacy = UserDefaults(suiteName: legacySuite), let new = UserDefaults(suiteName: newSuite) {
         legacy.set(true, forKey: TitleField.outputTokens.defaultsKey)
-        legacy.set("blue", forKey: "titleColor_cost")
         legacy.set(["cost", "model"], forKey: "titleFieldsOrder")
         new.set(false, forKey: TitleField.model.defaultsKey)  // 새 도메인에 이미 있는 값은 보존돼야 함
 
         migrateLegacyDefaultsIfNeeded(defaults: new, legacyDefaults: legacy)
         check(new.bool(forKey: TitleField.outputTokens.defaultsKey), "migrate: 구 도메인 값이 새 도메인으로 복사됨")
-        check(new.string(forKey: "titleColor_cost") == "blue", "migrate: 필드별 색상 키도 복사됨")
         check((new.array(forKey: "titleFieldsOrder") as? [String]) == ["cost", "model"], "migrate: 순서 키도 복사됨")
         check(new.bool(forKey: TitleField.model.defaultsKey) == false, "migrate: 새 도메인에 이미 있던 값은 덮어쓰지 않음")
 
