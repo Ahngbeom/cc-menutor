@@ -6,11 +6,6 @@ macOS 메뉴바에서 Claude Code 5시간 블록 사용량을 실시간으로 �
 > "Claude"·"Claude Code"는 Anthropic PBC의 상표이며, 이 앱이 읽는 로컬 사용량 데이터를 식별하기 위해 **설명 목적으로만** 사용합니다.
 
 <p align="center">
-  <img src="docs/images/dropdown.png" alt="cc-menutor 드롭다운 메뉴 (다크 모드)" width="259"><br>
-  <sub>메뉴바 타이틀과 드롭다운 — 실제 앱 화면(다크 모드, 수치는 가상 데이터)</sub>
-</p>
-
-<p align="center">
   <img src="docs/images/menubar-dynamic-colors.gif" alt="사용 비율에 따라 메뉴바 항목 색이 초록에서 빨강으로 바뀌는 모습" width="640"><br>
   <sub>사용 비율에 따라 바뀌는 메뉴바 색 — 앱 코드로 렌더링한 예시(값은 가상)</sub>
 </p>
