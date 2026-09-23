@@ -333,6 +333,14 @@ extension TitleSettings {
     }
 }
 
+extension TitleSettings {
+    // 기본은 꺼짐 — 투명 메뉴바(macOS 26)에서 색 글자는 배경화면에 따라 읽히지 않을 수 있고, 메뉴바가 배경에 맞춰
+    // 보정해 주는 것은 labelColor뿐이다. 기본을 켜짐으로 바꾸려면 그 가독성부터 다시 재야 한다.
+    private static let colorsKey = "titleColorsEnabled"
+    static func colorsEnabled(defaults: UserDefaults = .standard) -> Bool { defaults.bool(forKey: colorsKey) }
+    static func setColorsEnabled(_ on: Bool, defaults: UserDefaults = .standard) { defaults.set(on, forKey: colorsKey) }
+}
+
 enum RefreshInterval: TimeInterval, CaseIterable {
     case sec10 = 10, sec30 = 30, min1 = 60, min5 = 300
     var label: String {
@@ -4812,8 +4820,30 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.view = titleFieldRowView(field: field, isFirst: idx == 0, isLast: idx == fields.count - 1)
             sub.addItem(item)
         }
+        // 필드 행 뒤에 둔다 — refreshTitleFieldsSubmenu()는 앞쪽 fields.count개 행만 다시 그린다.
+        sub.addItem(.separator())
+        let colorsItem = NSMenuItem()
+        colorsItem.view = titleColorsRowView()
+        sub.addItem(colorsItem)
         titleFieldsSubmenu = sub
         return sub
+    }
+
+    private func titleColorsRowView() -> NSView {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 246, height: 22))
+        let checkbox = NSButton(checkboxWithTitle: t("숫자 색 표시", "Color the numbers"), target: self,
+                                action: #selector(toggleTitleColorsCheckbox(_:)))
+        checkbox.frame = NSRect(x: 14, y: 2, width: 226, height: 18)
+        checkbox.state = TitleSettings.colorsEnabled() ? .on : .off
+        checkbox.toolTip = t("항목별로 사용 비율에 따라 색을 입힙니다. 투명 메뉴바에서는 배경화면에 따라 잘 안 보일 수 있습니다.",
+                             "Tints each item by how full it is. On a transparent menu bar some wallpapers can make the numbers hard to read.")
+        row.addSubview(checkbox)
+        return row
+    }
+
+    @objc func toggleTitleColorsCheckbox(_ sender: NSButton) {
+        TitleSettings.setColorsEnabled(sender.state == .on)
+        updateStatusBarTitle()
     }
 
     // 메뉴 트리 전체(statusItem.menu)는 건드리지 않고 타이틀과 이 서브메뉴의 행만 갱신 —
@@ -5262,27 +5292,29 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(flameProgressBarRow(ratio: nil))
     }
 
-    // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
-    // (남은 시간은 메뉴 안에 표시되므로 타이틀에서는 생략)
-    // 평상시엔 항목별 동적 색(TitlePart.color)을 적용하되, 항상 attributedTitle을 써서
-    // 비포커스 화면(다중 디스플레이)에서 plain title이 자동으로 dim되는 것을 방지한다.
+    // 항상 attributedTitle을 써서 비포커스 화면(다중 디스플레이)에서 plain title이 자동으로 dim되는 것을 방지한다.
     func renderTitle(parts: [TitlePart], warning: UsageWarning?) {
         guard let button = statusItem.button else { return }
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        if let w = warning, w.level != .none {
+        button.attributedTitle = composeTitle(parts: parts, warning: warning)
+    }
+
+    // 순수 조립 — statusItem 없이 셀프테스트가 호출할 수 있게 렌더링과 나눈다.
+    // 색이 켜져 있으면 항목별 색, 경고 시 전체를 주황/빨강으로 덮는다. 꺼져 있으면 글자는 모두 labelColor이고
+    // 경고는 굵기 + 이모지 ⚠️로만 알린다 — 주황으로 덮으면 투명 메뉴바에서 경고 순간에 숫자가 묻힌다.
+    func composeTitle(parts: [TitlePart], warning: UsageWarning?,
+                      colorsEnabled: Bool = TitleSettings.colorsEnabled()) -> NSAttributedString {
+        let warning = warning.flatMap { $0.level == .none ? nil : $0 }
+        let sep = TitleSettings.separator().rawValue
+        if let w = warning, colorsEnabled {
             let color: NSColor = (w.level == .crit) ? .systemRed : .systemOrange
-            // 색만으로는 색맹 등 일부 사용자에게 "지금 경고 상태"가 전달되지 않을 수 있어
-            // 굵기도 함께 올린다(평상시 타이틀은 .regular 그대로 유지).
-            let warnFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-            let plain = parts.map(\.text).joined(separator: TitleSettings.separator().rawValue)
-            let text = "\(plain) ⚠\(Int(w.ratio * 100))%"
-            button.attributedTitle = NSAttributedString(string: text, attributes: [
-                .font: warnFont,
+            // 색만으로는 색맹 등 일부 사용자에게 "지금 경고 상태"가 전달되지 않을 수 있어 굵기도 함께 올린다.
+            let plain = parts.map(\.text).joined(separator: sep)
+            return NSAttributedString(string: "\(plain) ⚠\(Int(w.ratio * 100))%", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
                 .foregroundColor: color
             ])
-            return
         }
-        let sep = TitleSettings.separator().rawValue
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: warning == nil ? .regular : .semibold)
         let result = NSMutableAttributedString()
         for (idx, part) in parts.enumerated() {
             if idx > 0 && !sep.isEmpty {
@@ -5290,10 +5322,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             result.append(NSAttributedString(string: part.text, attributes: [
                 .font: font,
-                .foregroundColor: part.color.nsColor
+                .foregroundColor: colorsEnabled ? part.color.nsColor : NSColor.labelColor
             ]))
         }
-        button.attributedTitle = result
+        if let w = warning {
+            result.append(NSAttributedString(string: " ⚠️\(Int(w.ratio * 100))%",
+                                             attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
+        }
+        return result
     }
 
     func renderTitle(plain text: String, warning: UsageWarning?) {
@@ -7359,6 +7395,41 @@ func runSelfTests() -> Never {
           "buildTitleParts: 블록 계열 필드는 limit 계열 + blockRatio")
     check(dynParts.first(where: { $0.text == "Sonnet 4.5" })?.color == .model(family: "sonnet"),
           "buildTitleParts: 비율이 있어도 모델명은 고정색 유지")
+
+    // 숫자 색 표시 설정 — 기본 꺼짐(투명 메뉴바 가독성, #19)
+    let colorsSuite = "ClaudeMonitorSelfTest.colors.\(UUID().uuidString)"
+    if let csd = UserDefaults(suiteName: colorsSuite) {
+        check(!TitleSettings.colorsEnabled(defaults: csd), "colorsEnabled: 기본값 = 꺼짐")
+        TitleSettings.setColorsEnabled(true, defaults: csd)
+        check(TitleSettings.colorsEnabled(defaults: csd), "colorsEnabled: 저장/조회 왕복")
+        csd.removePersistentDomain(forName: colorsSuite)
+    } else { check(false, "colorsEnabled: 전용 suite 생성 실패") }
+
+    // 조립 — 색이 꺼져 있으면 모든 글자가 labelColor. 켜져 있으면 계열·모델 색(v1.14 방식) 그대로.
+    let composeApp = ClaudeMonitorApp()
+    func foregrounds(_ a: NSAttributedString) -> [NSColor] {
+        var out: [NSColor] = []
+        a.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: a.length)) { v, _, _ in
+            if let c = v as? NSColor { out.append(c) }
+        }
+        return out
+    }
+    let offTitle = composeApp.composeTitle(parts: dynParts, warning: nil, colorsEnabled: false)
+    check(foregrounds(offTitle).allSatisfy { $0 == NSColor.labelColor }, "composeTitle: 색 꺼짐 → 모든 글자 labelColor")
+    let onTitle = composeApp.composeTitle(parts: dynParts, warning: nil, colorsEnabled: true)
+    check(foregrounds(onTitle).contains { $0 != NSColor.labelColor }, "composeTitle: 색 켜짐 → 항목별 색이 들어간다")
+    check(offTitle.string == onTitle.string, "composeTitle: 색 설정은 글자 내용을 바꾸지 않는다")
+    let warn = UsageWarning(ratio: 0.93, level: .warn)
+    let offWarn = composeApp.composeTitle(parts: dynParts, warning: warn, colorsEnabled: false)
+    check(offWarn.string.hasSuffix(" ⚠️93%") && foregrounds(offWarn).allSatisfy { $0 == NSColor.labelColor },
+          "composeTitle: 색 꺼짐 + 경고 → 글자는 labelColor, 이모지 ⚠️로만 알린다")
+    let offWarnFont = offWarn.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+    check(offWarnFont?.fontDescriptor.symbolicTraits.contains(.bold) == true, "composeTitle: 색 꺼짐 + 경고 → 굵게")
+    let onWarn = composeApp.composeTitle(parts: dynParts, warning: warn, colorsEnabled: true)
+    check(onWarn.string.hasSuffix(" ⚠93%") && foregrounds(onWarn).allSatisfy { $0 == NSColor.systemOrange },
+          "composeTitle: 색 켜짐 + 경고 → 예전 그대로 전체 주황 + ⚠%")
+    check(!composeApp.composeTitle(parts: dynParts, warning: UsageWarning(ratio: 0.5, level: .none), colorsEnabled: false)
+            .string.contains("⚠"), "composeTitle: level none이면 경고 표기 없음")
     if let so = savedOrder { UserDefaults.standard.set(so, forKey: "titleFieldsOrder") }
     else { UserDefaults.standard.removeObject(forKey: "titleFieldsOrder") }
     if let ss = savedSeparator { UserDefaults.standard.set(ss, forKey: "titleSeparator") }
