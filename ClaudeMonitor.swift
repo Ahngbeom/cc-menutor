@@ -2326,38 +2326,96 @@ func titleIconPrefix() -> String { "\(titleIconGlyph) " }
 
 // MARK: - Title Dynamic Colors (수치/비율 → 색)
 
-// 정지점은 MoodTier 신호등 배색과 같은 system 색 — 무드 아이콘과 타이틀이 한 색 언어를 쓴다.
-let usageColorStops: [NSColor] = [.systemGreen, .systemYellow, .systemOrange, .systemRed]
+// 항목 계열 — 색상각은 값과 무관하게 **고정**이고, 비율은 채도·명도만 움직인다. 그래서 같은 항목은
+// 값이 얼마든 늘 같은 색으로 읽히고, 진해지는 정도만 "얼마나 찼나"를 말한다.
+//
+// 계열을 나누는 기준은 "이 숫자가 어떤 질문에 답하는가"다. 값이 높을수록 나쁜 것은 limit뿐이며,
+// today(개인 최고 대비)·cumulative(마일스톤 진행률)는 높은 값이 경고가 아니므로 빨강을 쓰지 않는다.
+enum TitleColorFamily: String, CaseIterable {
+    case limit, today, cumulative
 
-// 순수 함수: ratio가 떨어지는 정지점 구간(lower 인덱스)과 구간 내 보간 비율. NaN/무한대는 0으로 본다.
-func usageColorSegment(_ ratio: Double, stopCount: Int = usageColorStops.count) -> (index: Int, fraction: Double) {
-    let r = ratio.isFinite ? min(max(ratio, 0), 1) : 0
-    let segments = stopCount - 1
-    let pos = r * Double(segments)
-    let idx = min(Int(pos), segments - 1)
-    return (idx, pos - Double(idx))
-}
-
-// blended(withFraction:of:)는 호출 시점 외관으로 굳은 정적 색을 돌려주므로 dynamicProvider로 감싼다 —
-// 그러지 않으면 다크/라이트 전환 후 다음 refresh까지 반대 테마용 색이 남는다.
-func usageColor(ratio: Double) -> NSColor {
-    let seg = usageColorSegment(ratio)
-    let from = usageColorStops[seg.index], to = usageColorStops[seg.index + 1]
-    return NSColor(name: nil) { appearance in
-        var result = from
-        appearance.performAsCurrentDrawingAppearance {
-            if let a = from.usingColorSpace(.sRGB), let b = to.usingColorSpace(.sRGB),
-               let mixed = a.blended(withFraction: CGFloat(seg.fraction), of: b) {
-                result = mixed
-            }
+    // 모델 고정색(민트 173°~자홍 313°)과 겹치지 않는 따뜻한 대역에서만 고른다 — 셀프테스트가 간격을 지킨다.
+    var hue: CGFloat {
+        switch self {
+        case .limit:      return 4 / 360     // 빨강 — 한계에 얼마나 가까운가
+        case .cumulative: return 40 / 360    // 호박 — 다음 마일스톤까지
+        case .today:      return 122 / 360   // 초록 — 개인 최고 기록 대비
         }
-        return result
+    }
+
+    // 비율 0→1 구간의 (채도 시작·끝, 명도 시작·끝). 라이트 메뉴바는 배경이 밝아 진해질수록 명도를
+    // **낮춰야** 진해 보이고, 다크는 반대로 올려야 한다. 최저 채도를 0.45 아래로 내리지 않는 이유는
+    // 그보다 탁해지면 세 계열이 전부 회갈색으로 수렴해 "어느 항목인가"가 사라지기 때문이다.
+    //
+    // limit의 다크 채도 상한만 0.80이다 — 완전 채도 빨강은 휘도가 낮아 어두운 배경에서 읽히지 않으므로,
+    // 채도를 낮춰 초록·파랑 성분을 띄우는 쪽이 오히려 밝다(명도를 올려서는 해결되지 않는다).
+    func ramp(isDark: Bool) -> (s0: CGFloat, s1: CGFloat, b0: CGFloat, b1: CGFloat) {
+        switch (self, isDark) {
+        case (.limit, false):      return (0.55, 1.00, 0.62, 0.42)
+        case (.limit, true):       return (0.45, 0.80, 0.72, 1.00)
+        case (.cumulative, false): return (0.55, 1.00, 0.52, 0.38)
+        case (.cumulative, true):  return (0.45, 0.95, 0.74, 1.00)
+        case (.today, false):      return (0.55, 1.00, 0.50, 0.36)
+        case (.today, true):       return (0.45, 0.95, 0.78, 1.00)
+        }
     }
 }
 
-// 모델 family 고정색 — usageColorStops가 덮는 빨강~초록(색상각 0°~120°) 바깥에서만 고른다.
-// 그 범위 안의 색을 쓰면 모델명이 "사용량 경고"로 오독된다. 새 family는 MODEL_FAMILIES와 함께 여기에도 추가하고,
-// 기존 family와 색상각이 18° 이상 떨어져야 한다(셀프테스트 단정).
+// 순수 함수 — 동적 NSColor는 동등 비교가 안 되므로 성분을 돌려주는 이쪽을 테스트한다.
+// NaN/무한대는 0으로 본다(크래시·검정색 렌더 방지).
+func usageColorComponents(ratio: Double, family: TitleColorFamily, isDark: Bool)
+        -> (hue: CGFloat, saturation: CGFloat, brightness: CGFloat) {
+    let r = CGFloat(ratio.isFinite ? min(max(ratio, 0), 1) : 0)
+    let ramp = family.ramp(isDark: isDark)
+    return (family.hue,
+            ramp.s0 + (ramp.s1 - ramp.s0) * r,
+            ramp.b0 + (ramp.b1 - ramp.b0) * r)
+}
+
+// HSB → sRGB를 직접 계산한다. NSColor(hue:...)는 **보정(calibrated) 색공간**이라 같은 성분이라도
+// sRGB와 다른 픽셀이 나오고, 그러면 램프 상수를 고를 때 잰 명암비와 실제 화면이 어긋난다.
+func hsbToSRGB(hue: CGFloat, saturation: CGFloat, brightness: CGFloat) -> (r: CGFloat, g: CGFloat, b: CGFloat) {
+    let h = (hue - hue.rounded(.down)) * 6
+    let sector = Int(h)
+    let f = h - CGFloat(sector)
+    let p = brightness * (1 - saturation)
+    let q = brightness * (1 - saturation * f)
+    let t = brightness * (1 - saturation * (1 - f))
+    switch sector {
+    case 0:  return (brightness, t, p)
+    case 1:  return (q, brightness, p)
+    case 2:  return (p, brightness, t)
+    case 3:  return (p, q, brightness)
+    case 4:  return (t, p, brightness)
+    default: return (brightness, p, q)
+    }
+}
+
+// 외관마다 램프가 다르므로 dynamicProvider로 감싼다 — 그러지 않으면 다크/라이트 전환 후 다음
+// refresh까지 반대 테마용 색이 남는다.
+func usageColor(ratio: Double, family: TitleColorFamily) -> NSColor {
+    NSColor(name: nil) { appearance in
+        let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let c = usageColorComponents(ratio: ratio, family: family, isDark: isDark)
+        let rgb = hsbToSRGB(hue: c.hue, saturation: c.saturation, brightness: c.brightness)
+        return NSColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1)
+    }
+}
+
+// 필드 → 계열. 블록 토큰·출력 토큰·비용·남은 시간은 전부 "이 블록을 얼마나 썼나"라 한 계열이다 —
+// 같은 비율을 쓰는 숫자들에 서로 다른 색을 주면 정보가 아니라 소음이 된다. nil은 동적 색 대상이 아니라는 뜻.
+func titleFieldFamily(_ field: TitleField) -> TitleColorFamily? {
+    switch field {
+    case .outputTokens, .totalTokens, .cost, .remainingTime: return .limit
+    case .todayTokens, .todayCost:                           return .today
+    case .cumulativeTokens:                                  return .cumulative
+    case .model:                                             return nil
+    }
+}
+
+// 모델 family 고정색 — 값 계열(TitleColorFamily, 4°~122°) 바깥의 차가운 대역에서만 고른다.
+// 그 대역 안의 색을 쓰면 모델명이 사용량 수치로 오독된다. 새 family는 MODEL_FAMILIES와 함께 여기에도
+// 추가하고, 기존 family와 18° 이상·값 계열과 40° 이상 떨어져야 한다(셀프테스트 단정).
 func modelFamilyColor(_ family: String) -> NSColor? {
     switch family {
     case "opus":   return .systemPurple
@@ -2409,14 +2467,14 @@ func titleFieldRatio(_ field: TitleField, _ ctx: TitleContext) -> Double? {
 enum TitlePartColor: Equatable {
     case label
     case fixed(TitleFieldColor)
-    case usage(Double)
+    case usage(family: TitleColorFamily, ratio: Double)
     case model(family: String)
 
     var nsColor: NSColor {
         switch self {
         case .label:             return .labelColor
         case .fixed(let c):      return c.nsColor ?? .labelColor
-        case .usage(let r):      return usageColor(ratio: r)
+        case .usage(let f, let r): return usageColor(ratio: r, family: f)
         case .model(let family): return modelFamilyColor(family) ?? .labelColor
         }
     }
@@ -2433,7 +2491,9 @@ func buildTitleParts(_ ctx: TitleContext) -> [TitlePart] {
         parts.append(TitlePart(text: titleIconGlyph, color: .label))
     }
     for field in TitleSettings.enabledFieldsInOrder() {
-        let color: TitlePartColor = titleFieldRatio(field, ctx).map { .usage($0) } ?? .label
+        // 계열과 비율이 **둘 다** 있어야 동적 색이 된다 — 모델명(계열 없음)과 근거 없는 비율(nil)은 기본색.
+        let color: TitlePartColor = titleFieldFamily(field)
+            .flatMap { family in titleFieldRatio(field, ctx).map { .usage(family: family, ratio: $0) } } ?? .label
         switch field {
         case .outputTokens:     parts.append(TitlePart(text: formatTokens(ctx.outputTokens), color: color))
         case .totalTokens:      parts.append(TitlePart(text: formatTokens(ctx.totalTokens), color: color))
@@ -7047,36 +7107,82 @@ func runSelfTests() -> Never {
         check(false, "moodGlyphTheme: 전용 UserDefaults suite 생성 성공해야 함")
     }
 
-    // 동적 색상 — 보간 구간 산정
-    func segEq(_ r: Double, _ i: Int, _ f: Double) -> Bool {
-        let seg = usageColorSegment(r); return seg.index == i && abs(seg.fraction - f) < 1e-9
-    }
-    check(segEq(0, 0, 0), "usageColorSegment: 0 → 첫 정지점(초록)")
-    check(segEq(1, 2, 1), "usageColorSegment: 1 → 마지막 구간 끝(빨강)")
-    check(segEq(0.5, 1, 0.5), "usageColorSegment: 0.5 → 노랑~주황 구간 중간")
-    check(segEq(1.7, 2, 1) && segEq(-0.3, 0, 0), "usageColorSegment: 범위 밖 비율은 0~1로 자른다")
-    check(segEq(.nan, 0, 0) && segEq(.infinity, 0, 0), "usageColorSegment: NaN/무한대는 0으로 본다(크래시 방지)")
-    if let aqua = NSAppearance(named: .aqua) {
-        var ok = false
-        aqua.performAsCurrentDrawingAppearance {
-            if let a = usageColor(ratio: 0).usingColorSpace(.sRGB), let g = NSColor.systemGreen.usingColorSpace(.sRGB),
-               let z = usageColor(ratio: 1).usingColorSpace(.sRGB), let r = NSColor.systemRed.usingColorSpace(.sRGB) {
-                ok = abs(a.redComponent - g.redComponent) < 0.01 && abs(a.greenComponent - g.greenComponent) < 0.01
-                    && abs(z.redComponent - r.redComponent) < 0.01 && abs(z.greenComponent - r.greenComponent) < 0.01
-            }
+    // 동적 색상 — 계열 안에서 색상각은 고정, 채도·명도만 이동
+    for family in TitleColorFamily.allCases {
+        for isDark in [false, true] {
+            let lo = usageColorComponents(ratio: 0, family: family, isDark: isDark)
+            let mid = usageColorComponents(ratio: 0.5, family: family, isDark: isDark)
+            let hi = usageColorComponents(ratio: 1, family: family, isDark: isDark)
+            let mode = isDark ? "다크" : "라이트"
+            check(lo.hue == family.hue && mid.hue == family.hue && hi.hue == family.hue,
+                  "usageColorComponents: \(family.rawValue)/\(mode) 색상각은 비율과 무관하게 고정")
+            check(lo.saturation < hi.saturation,
+                  "usageColorComponents: \(family.rawValue)/\(mode) 비율이 오르면 채도가 오른다(탁함 → 선명)")
+            check(abs(mid.saturation - (lo.saturation + hi.saturation) / 2) < 1e-9,
+                  "usageColorComponents: \(family.rawValue)/\(mode) 채도는 선형 보간")
+            check(lo.saturation >= 0.45,
+                  "usageColorComponents: \(family.rawValue)/\(mode) 0%에서도 계열이 읽히는 최저 채도 유지")
+            // 라이트는 진해질수록 어두워야, 다크는 밝아야 "진해진다"로 읽힌다.
+            check(isDark ? (hi.brightness > lo.brightness) : (hi.brightness < lo.brightness),
+                  "usageColorComponents: \(family.rawValue)/\(mode) 명도 방향이 배경에 맞다")
         }
-        check(ok, "usageColor: 끝점은 systemGreen/systemRed로 해석된다")
+    }
+    check(usageColorComponents(ratio: 1.7, family: .limit, isDark: false).saturation
+          == usageColorComponents(ratio: 1, family: .limit, isDark: false).saturation,
+          "usageColorComponents: 범위 밖 비율은 0~1로 자른다")
+    check(usageColorComponents(ratio: .nan, family: .limit, isDark: false).saturation
+          == usageColorComponents(ratio: 0, family: .limit, isDark: false).saturation,
+          "usageColorComponents: NaN은 0으로 본다(크래시·검정 렌더 방지)")
+
+    // 명암비 — 배경값은 라이트/다크 메뉴바 실측 근사치다.
+    func srgbLuminance(_ rgb: (r: CGFloat, g: CGFloat, b: CGFloat)) -> CGFloat {
+        func lin(_ c: CGFloat) -> CGFloat { c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
+        return 0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+    }
+    func contrastRatio(_ a: (r: CGFloat, g: CGFloat, b: CGFloat), _ b: (r: CGFloat, g: CGFloat, b: CGFloat)) -> CGFloat {
+        let la = srgbLuminance(a), lb = srgbLuminance(b)
+        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+    }
+    let lightBar: (r: CGFloat, g: CGFloat, b: CGFloat) = (0.925, 0.925, 0.937)
+    let darkBar: (r: CGFloat, g: CGFloat, b: CGFloat) = (0.137, 0.137, 0.157)
+    let contrastFloor: CGFloat = 3.5
+    for family in TitleColorFamily.allCases {
+        for isDark in [false, true] {
+            var worst: CGFloat = .greatestFiniteMagnitude
+            for step in 0...20 {
+                let c = usageColorComponents(ratio: Double(step) / 20, family: family, isDark: isDark)
+                let rgb = hsbToSRGB(hue: c.hue, saturation: c.saturation, brightness: c.brightness)
+                worst = min(worst, contrastRatio(rgb, isDark ? darkBar : lightBar))
+            }
+            check(worst >= contrastFloor,
+                  "명암비: \(family.rawValue)/\(isDark ? "다크" : "라이트") 전 구간 \(contrastFloor):1 이상 (실측 \(String(format: "%.2f", Double(worst))):1)")
+        }
     }
 
-    // 모델 고정색 — 모든 family에 색이 있고, 사용량 그라디언트(빨강~초록, 색상각 0°~120°)와 겹치지 않는다
+    // 필드 → 계열 배선. 같은 비율(blockRatio)을 쓰는 네 필드가 한 계열이어야 색이 갈리지 않는다.
+    check(titleFieldFamily(.totalTokens) == .limit && titleFieldFamily(.outputTokens) == .limit
+          && titleFieldFamily(.cost) == .limit && titleFieldFamily(.remainingTime) == .limit,
+          "titleFieldFamily: 블록 계열 네 필드는 모두 limit")
+    check(titleFieldFamily(.todayTokens) == .today && titleFieldFamily(.todayCost) == .today,
+          "titleFieldFamily: 오늘 두 필드는 today — 최고 기록 경신이 경고로 보이면 안 된다")
+    check(titleFieldFamily(.cumulativeTokens) == .cumulative, "titleFieldFamily: 누적 토큰은 cumulative")
+    check(titleFieldFamily(.model) == nil, "titleFieldFamily: 모델명은 동적 색 대상이 아니다")
+
+    // 계열끼리, 그리고 계열과 모델 고정색이 충분히 떨어져 있는지
+    let familyHueDegrees = TitleColorFamily.allCases.map { Double($0.hue) * 360 }.sorted()
+    let familyGap = zip(familyHueDegrees, familyHueDegrees.dropFirst()).map { $1 - $0 }.min() ?? 360
+    check(familyGap >= 30, "TitleColorFamily: 계열끼리 색상각 30° 이상 (최소 \(Int(familyGap))°)")
+
+    // 모델 고정색 — 모든 family에 색이 있고, 값 계열(4°~122°)과 겹치지 않는다
     var familyHues: [CGFloat] = []
     for family in MODEL_FAMILIES {
         guard let c = modelFamilyColor(family)?.usingColorSpace(.sRGB) else {
             check(false, "modelFamilyColor: \(family)에 고정색이 있어야 함"); continue
         }
         familyHues.append(c.hueComponent)
-        check(c.hueComponent > 0.40 && c.hueComponent < 0.90,
-              "modelFamilyColor: \(family) 색상각(\(Int(c.hueComponent * 360))°)이 사용량 그라디언트 범위 밖")
+        let gapToFamilies = familyHueDegrees.map { abs(Double(c.hueComponent) * 360 - $0) }.min() ?? 360
+        check(gapToFamilies >= 40,
+              "modelFamilyColor: \(family) 색상각(\(Int(c.hueComponent * 360))°)이 값 계열과 40° 이상 떨어짐 (실측 \(Int(gapToFamilies))°)")
     }
     let sortedHues = familyHues.sorted()
     let minHueGap = zip(sortedHues, sortedHues.dropFirst()).map { $1 - $0 }.min() ?? 1
@@ -7146,9 +7252,9 @@ func runSelfTests() -> Never {
     let dynCtx = TitleContext(outputTokens: 12_300, totalTokens: 50_000, cost: 4.2,
                               remainingText: nil, model: "claude-sonnet-4-5", blockRatio: 0.65)
     let dynParts = buildTitleParts(dynCtx)
-    check(dynParts.first(where: { $0.text == "$4.20" })?.color == .usage(0.65)
-          && dynParts.first(where: { $0.text == "12.3K" })?.color == .usage(0.65),
-          "buildTitleParts: 블록 계열 필드는 blockRatio로 동적 색")
+    check(dynParts.first(where: { $0.text == "$4.20" })?.color == .usage(family: .limit, ratio: 0.65)
+          && dynParts.first(where: { $0.text == "12.3K" })?.color == .usage(family: .limit, ratio: 0.65),
+          "buildTitleParts: 블록 계열 필드는 limit 계열 + blockRatio")
     check(dynParts.first(where: { $0.text == "Sonnet 4.5" })?.color == .model(family: "sonnet"),
           "buildTitleParts: 비율이 있어도 모델명은 고정색 유지")
     if let so = savedOrder { UserDefaults.standard.set(so, forKey: "titleFieldsOrder") }
