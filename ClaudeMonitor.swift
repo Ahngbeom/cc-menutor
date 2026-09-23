@@ -552,15 +552,14 @@ func migrateLegacyDefaultsIfNeeded(defaults: UserDefaults = .standard,
 
 // MARK: - Model Pricing (USD per million tokens)
 //
-// cacheRead/cacheWrite5m/cacheWrite1h는 Anthropic 공식 프롬프트 캐싱 배수(모델 불문 고정:
-// cache read = input×0.1, 5분 캐시 쓰기 = input×1.25, 1시간 캐시 쓰기 = input×2.0 —
-// docs.claude.com/en/docs/about-claude/pricing 2026-07-14 기준)로 input에서 파생한다.
-// 모델별로 이 4개 숫자를 각각 손으로 맞출 필요가 없어 새 모델 추가 시 input/output만
-// 넣으면 캐시 단가도 자동으로 정확해진다.
+// 캐시 단가는 input에서 공식 배수로 파생한다. 쓰기 배수는 전 모델 공통이지만 **읽기 배수는 모델마다 다르다** —
+// 새 모델을 넣을 땐 가격표의 "Cache hits" 열이 input×0.1인지부터 확인할 것. 틀리면 캐시 읽기가 대부분인
+// Claude Code 사용량에서 비용이 조용히 몇 배로 부풀고, matched=true라 경고도 뜨지 않는다.
 struct ModelPricing {
     let input: Double
     let output: Double
-    var cacheRead: Double { input * 0.1 }
+    var cacheReadMultiplier: Double = 0.1
+    var cacheRead: Double { input * cacheReadMultiplier }
     var cacheWrite5m: Double { input * 1.25 }
     var cacheWrite1h: Double { input * 2.0 }
 }
@@ -584,12 +583,16 @@ struct ModelVersionKey: Hashable {
 // matched=true라 "⚠ 미상 모델" 경고조차 뜨지 않아 조용히 틀렸다.
 //
 // 이제 parseModelVersion()이 두 표기를 모두 정규화하므로 순서 의존 없는 딕셔너리 조회로 끝난다.
-// 새 모델 추가 시 input/output만 넣으면 캐시 단가는 ModelPricing이 공식 배수로 파생한다.
 let VERSIONED_PRICING: [ModelVersionKey: ModelPricing] = [
+    // Fable / Mythos 5.1
+    ModelVersionKey(family: "fable",  major: 5, minor: 1):   ModelPricing(input: 10.0, output: 50.0, cacheReadMultiplier: 0.025),
+    ModelVersionKey(family: "mythos", major: 5, minor: 1):   ModelPricing(input: 10.0, output: 50.0, cacheReadMultiplier: 0.025),
     // Fable / Mythos 5
     ModelVersionKey(family: "fable",  major: 5, minor: nil): ModelPricing(input: 10.0, output: 50.0),
     ModelVersionKey(family: "mythos", major: 5, minor: nil): ModelPricing(input: 10.0, output: 50.0),
-    // Opus 5 및 4.5~4.8 (현행 티어)
+    // Opus 5.5
+    ModelVersionKey(family: "opus", major: 5, minor: 5):     ModelPricing(input: 4.0,  output: 20.0, cacheReadMultiplier: 0.05),
+    // Opus 5 및 4.5~4.8
     ModelVersionKey(family: "opus", major: 5, minor: nil):   ModelPricing(input: 5.0,  output: 25.0),
     ModelVersionKey(family: "opus", major: 4, minor: 8):     ModelPricing(input: 5.0,  output: 25.0),
     ModelVersionKey(family: "opus", major: 4, minor: 7):     ModelPricing(input: 5.0,  output: 25.0),
@@ -599,7 +602,8 @@ let VERSIONED_PRICING: [ModelVersionKey: ModelPricing] = [
     ModelVersionKey(family: "opus", major: 4, minor: 1):     ModelPricing(input: 15.0, output: 75.0),
     ModelVersionKey(family: "opus", major: 4, minor: nil):   ModelPricing(input: 15.0, output: 75.0),
     ModelVersionKey(family: "opus", major: 3, minor: nil):   ModelPricing(input: 15.0, output: 75.0),
-    // Sonnet 4.x / 3.x (Sonnet 5는 시간 의존 도입가라 아래 별도 분기)
+    // Sonnet 5 (현행) / 4.x / 3.x
+    ModelVersionKey(family: "sonnet", major: 5, minor: nil): ModelPricing(input: 2.0,  output: 10.0),
     ModelVersionKey(family: "sonnet", major: 4, minor: 6):   ModelPricing(input: 3.0,  output: 15.0),
     ModelVersionKey(family: "sonnet", major: 4, minor: 5):   ModelPricing(input: 3.0,  output: 15.0),
     ModelVersionKey(family: "sonnet", major: 4, minor: nil): ModelPricing(input: 3.0,  output: 15.0),
@@ -617,33 +621,14 @@ let DEFAULT_PRICING = ModelPricing(input: 3.0, output: 15.0)
 // 현행 티어**를 가리켜야 한다: 예전엔 opus=$15/$75(은퇴한 Opus 4.1 티어), haiku=$0.80/$4(은퇴한
 // 3.5 티어)를 써서 claude-opus-5가 3배 과대 추정됐다. 폴백은 matched=false이므로 사용자에겐
 // "⚠ 미상 모델 N종 (추정 단가 적용)" 배너로 고지된다.
+// 현행 = 그 family의 최신 버전(Fable/Mythos 5.1, Opus 5.5, Sonnet 5, Haiku 4.5)이며 캐시 읽기 배수까지 따라간다.
 let FAMILY_PRICING: [String: ModelPricing] = [
-    "fable":  ModelPricing(input: 10.0, output: 50.0),
-    "mythos": ModelPricing(input: 10.0, output: 50.0),
-    "opus":   ModelPricing(input: 5.0,  output: 25.0),
-    "sonnet": ModelPricing(input: 3.0,  output: 15.0),
+    "fable":  ModelPricing(input: 10.0, output: 50.0, cacheReadMultiplier: 0.025),
+    "mythos": ModelPricing(input: 10.0, output: 50.0, cacheReadMultiplier: 0.025),
+    "opus":   ModelPricing(input: 4.0,  output: 20.0, cacheReadMultiplier: 0.05),
+    "sonnet": ModelPricing(input: 2.0,  output: 10.0),
     "haiku":  ModelPricing(input: 1.0,  output: 5.0),
 ]
-
-// MARK: - Sonnet 5 도입가 (시간 한정)
-//
-// Sonnet 5는 2026-08-31까지 도입가(input $2/output $10)이고 2026-09-01부터 표준가(input
-// $3/output $15)로 전환된다(docs.claude.com/en/docs/about-claude/pricing, 2026-07-14 확인).
-// 실제 청구는 "그 요청이 발생한 시점"의 단가를 따르므로, 조회 시각(now)이 아니라 각
-// UsageEntry.timestamp로 판정해야 한다 — getPricing(at:)이 이 값을 받는다.
-// PRICING 정적 배열에 넣지 않고 별도 분기로 둔 이유: 시간에 따라 값이 바뀌는 유일한 케이스라
-// 정적 테이블에 억지로 끼워 넣기보다 이렇게 두는 편이 만료 후 통째로 걷어내기 쉽다.
-// 2026-09-01 이후엔 이 분기가 항상 표준가(= SONNET_5_STANDARD_PRICING = 일반 "sonnet" 패턴과
-// 동일값)로 귀결되므로 정확성 손실 없이 안전하게 제거 가능.
-private let sonnet5IntroPricingCutoffUTC: Date = {
-    var comps = DateComponents()
-    comps.year = 2026; comps.month = 9; comps.day = 1
-    var cal = Calendar(identifier: .gregorian)
-    cal.timeZone = TimeZone(identifier: "UTC")!
-    return cal.date(from: comps)!
-}()
-private let SONNET_5_INTRO_PRICING = ModelPricing(input: 2.0, output: 10.0)
-private let SONNET_5_STANDARD_PRICING = ModelPricing(input: 3.0, output: 15.0)
 
 // 실제 모델이 아닌 의사(pseudo) 모델 식별자 — 집계에서 제외한다(parseLines 참고).
 let SYNTHETIC_MODEL_NAMES: Set<String> = ["<synthetic>"]
@@ -698,11 +683,8 @@ func parseModelVersion(_ model: String) -> (family: String, major: Int?, minor: 
 // date: 단가 판정 기준 시점 — 기본값은 호출 시각이지만, 실제 청구 시점 기준으로 계산해야 하는
 // 호출부(UsageEntry.cost 등)는 반드시 해당 엔트리의 timestamp를 넘겨야 한다(Sonnet 5 도입가처럼
 // 시간에 따라 값이 바뀌는 모델이 있기 때문).
-func getPricing(for model: String, at date: Date = Date()) -> (pricing: ModelPricing, matched: Bool) {
+func getPricing(for model: String) -> (pricing: ModelPricing, matched: Bool) {
     let v = parseModelVersion(model)
-    if v.family == "sonnet", v.major == 5 {
-        return (date < sonnet5IntroPricingCutoffUTC ? SONNET_5_INTRO_PRICING : SONNET_5_STANDARD_PRICING, true)
-    }
     if let major = v.major,
        let p = VERSIONED_PRICING[ModelVersionKey(family: v.family, major: major, minor: v.minor)] {
         return (p, true)
@@ -778,7 +760,7 @@ struct UsageEntry {
         self.cacheWrite1hTokens = cacheWrite1hTokens
         self.dedupeKey = dedupeKey
 
-        let p = getPricing(for: model, at: timestamp).pricing
+        let p = getPricing(for: model).pricing
         let m = 1_000_000.0
         let cacheWrite5mTokens = cacheWriteTokens - cacheWrite1hTokens
         self.cost = Double(inputTokens) / m * p.input
@@ -1275,7 +1257,7 @@ struct UsageStats {
     // 정밀 단가 미매칭(추정 단가 적용) 모델 목록
     var unknownModels: [String] {
         var set = Set<String>()
-        for e in entries where !getPricing(for: e.model, at: e.timestamp).matched { set.insert(e.model) }
+        for e in entries where !getPricing(for: e.model).matched { set.insert(e.model) }
         return Array(set).sorted()
     }
 }
@@ -5438,28 +5420,34 @@ func runSelfTests() -> Never {
     check(unknown.matched == false, "비-claude 모델 미매칭")
     check(unknown.pricing.output == DEFAULT_PRICING.output, "미상 모델 DEFAULT 단가")
 
-    // 실측 모델 ID → 공식 단가 대조표(platform.claude.com/docs/en/about-claude/pricing, 2026-07-29).
-    // 이 표가 이번 회귀의 핵심이다: 예전 부분 문자열 테이블은 실제 로그에 등장하는 모델 ID 형태와
-    // 어긋나 Haiku 4.5를 4배 과소($0.25/$1.25), Opus 5를 3배 과대($15/$75) 계산했고 Haiku 쪽은
-    // matched=true라 "⚠ 미상 모델" 경고조차 뜨지 않았다. 실제 ID 문자열을 그대로 넣어야
-    // 의미가 있으므로 날짜 접미사가 붙은 형태까지 그대로 쓴다.
-    let officialPrices: [(model: String, input: Double, output: Double, matched: Bool)] = [
-        ("claude-fable-5",            10.0, 50.0, true),
-        ("claude-mythos-5",           10.0, 50.0, true),
-        ("claude-opus-5",              5.0, 25.0, true),
-        ("claude-opus-4-8",            5.0, 25.0, true),
-        ("claude-opus-4-7",            5.0, 25.0, true),
-        ("claude-opus-4-1-20250805",  15.0, 75.0, true),
-        ("claude-sonnet-4-6",          3.0, 15.0, true),
-        ("claude-sonnet-4-5",          3.0, 15.0, true),
-        ("claude-3-5-sonnet-20241022", 3.0, 15.0, true),
-        ("claude-haiku-4-5-20251001",  1.0,  5.0, true),
-        ("claude-3-5-haiku-20241022",  0.80, 4.0, true),
+    // 실측 모델 ID → 공식 단가 대조표(platform.claude.com/docs/en/about-claude/pricing, 2026-09-23).
+    // 가격표의 다섯 열을 전부 대조한다 — 캐시 읽기 배수가 모델마다 달라 입력·출력만으로는 틀린 단가가 통과한다.
+    // 실제 ID 문자열을 그대로 넣어야 의미가 있으므로 날짜 접미사가 붙은 형태까지 그대로 쓴다.
+    let officialPrices: [(model: String, input: Double, write5m: Double, write1h: Double, read: Double, output: Double, matched: Bool)] = [
+        ("claude-fable-5-1",          10.0, 12.50, 20.0, 0.25, 50.0, true),
+        ("claude-mythos-5-1",         10.0, 12.50, 20.0, 0.25, 50.0, true),
+        ("claude-fable-5",            10.0, 12.50, 20.0, 1.00, 50.0, true),
+        ("claude-mythos-5",           10.0, 12.50, 20.0, 1.00, 50.0, true),
+        ("claude-opus-5-5",            4.0,  5.00,  8.0, 0.20, 20.0, true),
+        ("claude-opus-5",              5.0,  6.25, 10.0, 0.50, 25.0, true),
+        ("claude-opus-4-8",            5.0,  6.25, 10.0, 0.50, 25.0, true),
+        ("claude-opus-4-7",            5.0,  6.25, 10.0, 0.50, 25.0, true),
+        ("claude-opus-4-1-20250805",  15.0, 18.75, 30.0, 1.50, 75.0, true),
+        ("claude-sonnet-5",            2.0,  2.50,  4.0, 0.20, 10.0, true),
+        ("claude-sonnet-4-6",          3.0,  3.75,  6.0, 0.30, 15.0, true),
+        ("claude-sonnet-4-5",          3.0,  3.75,  6.0, 0.30, 15.0, true),
+        ("claude-3-5-sonnet-20241022", 3.0,  3.75,  6.0, 0.30, 15.0, true),
+        ("claude-haiku-4-5-20251001",  1.0,  1.25,  2.0, 0.10,  5.0, true),
+        ("claude-3-5-haiku-20241022",  0.80, 1.00,  1.6, 0.08,  4.0, true),
     ]
     for row in officialPrices {
         let got = getPricing(for: row.model)
-        check(got.pricing.input == row.input && got.pricing.output == row.output,
-              "공식 단가: \(row.model) = $\(row.input)/$\(row.output) (실제 $\(got.pricing.input)/$\(got.pricing.output))")
+        let p = got.pricing
+        func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-9 }
+        check(near(p.input, row.input) && near(p.output, row.output),
+              "공식 단가: \(row.model) 입력·출력 = $\(row.input)/$\(row.output) (실제 $\(p.input)/$\(p.output))")
+        check(near(p.cacheWrite5m, row.write5m) && near(p.cacheWrite1h, row.write1h) && near(p.cacheRead, row.read),
+              "공식 단가: \(row.model) 캐시 쓰기 5분·1시간·읽기 = $\(row.write5m)/$\(row.write1h)/$\(row.read) (실제 $\(p.cacheWrite5m)/$\(p.cacheWrite1h)/$\(p.cacheRead))")
         check(got.matched == row.matched,
               "공식 단가: \(row.model)의 matched == \(row.matched)")
     }
@@ -5473,8 +5461,14 @@ func runSelfTests() -> Never {
     // 나올 때마다 조용히 틀린 쪽으로 떨어진다(Opus 5가 legacy $15/$75로 계산되던 버그).
     let futureOpus = getPricing(for: "claude-opus-9")
     check(futureOpus.matched == false, "미등록 Opus 버전은 폴백(matched=false)이라 ⚠배너로 고지됨")
-    check(futureOpus.pricing.input == 5.0 && futureOpus.pricing.output == 25.0,
-          "Opus family 폴백 = 현행 티어($5/$25), 은퇴한 legacy($15/$75) 아님")
+    check(futureOpus.pricing.input == 4.0 && futureOpus.pricing.output == 20.0 && abs(futureOpus.pricing.cacheRead - 0.20) < 1e-9,
+          "Opus family 폴백 = 현행 Opus 5.5($4/$20, 캐시 읽기 $0.20), 은퇴한 legacy($15/$75) 아님")
+    let futureSonnet = getPricing(for: "claude-sonnet-9")
+    check(futureSonnet.pricing.input == 2.0 && futureSonnet.pricing.output == 10.0,
+          "Sonnet family 폴백 = 현행 Sonnet 5($2/$10)")
+    let futureFable = getPricing(for: "claude-fable-9")
+    check(abs(futureFable.pricing.cacheRead - 0.25) < 1e-9,
+          "Fable family 폴백은 현행 5.1의 캐시 읽기 배수(0.025x → $0.25)까지 따라간다")
     let futureHaiku = getPricing(for: "claude-haiku-9")
     check(futureHaiku.pricing.input == 1.0 && futureHaiku.pricing.output == 5.0,
           "Haiku family 폴백 = 현행 티어($1/$5), 은퇴한 3.5($0.80/$4) 아님")
@@ -5500,25 +5494,7 @@ func runSelfTests() -> Never {
     }
     check(shortModelName("claude-fable-5") == "Fable 5", "shortModelName: fable family 인식")
 
-    // getPricing(at:) — Sonnet 5 도입가(2026-08-31까지 $2/$10) → 표준가(2026-09-01부터 $3/$15)
-    // 전환. 실제 커트오프 상수(sonnet5IntroPricingCutoffUTC) 기준 상대 오프셋으로 날짜를 만들어,
-    // 하드코딩한 epoch 값의 오프바이원/계산 실수 없이 항상 정확히 경계 양쪽을 가리키게 한다.
-    let wellBeforeCutoff = sonnet5IntroPricingCutoffUTC.addingTimeInterval(-86_400 * 30)  // 커트오프 30일 전
-    let wellAfterCutoff  = sonnet5IntroPricingCutoffUTC.addingTimeInterval(86_400 * 30)   // 커트오프 30일 후
-    check(getPricing(for: "claude-sonnet-5", at: wellBeforeCutoff).pricing.input == 2.0,
-          "sonnet-5: 커트오프 이전엔 도입가(input $2)")
-    check(getPricing(for: "claude-sonnet-5", at: wellBeforeCutoff).pricing.output == 10.0,
-          "sonnet-5: 커트오프 이전엔 도입가(output $10)")
-    check(getPricing(for: "claude-sonnet-5", at: wellAfterCutoff).pricing.input == 3.0,
-          "sonnet-5: 커트오프 이후엔 표준가(input $3)")
-    check(getPricing(for: "claude-sonnet-5", at: wellAfterCutoff).pricing.output == 15.0,
-          "sonnet-5: 커트오프 이후엔 표준가(output $15)")
-    check(getPricing(for: "claude-sonnet-5", at: sonnet5IntroPricingCutoffUTC).pricing.input == 3.0,
-          "sonnet-5: 커트오프 정각(2026-09-01 00:00 UTC)부터 표준가(경계값은 표준가 쪽에 포함)")
-    check(getPricing(for: "claude-sonnet-4-5", at: wellBeforeCutoff).pricing.input == 3.0,
-          "sonnet-4-5(Sonnet 4.5)는 sonnet-5 특수 분기를 타지 않고 기존 표준가 유지(오검출 방지)")
-
-    // ModelPricing 캐시 배수 파생(공식 고정 배수: read=0.1x, 5분 쓰기=1.25x, 1시간 쓰기=2.0x)
+    // ModelPricing 캐시 배수 파생(기본 read=0.1x, 5분 쓰기=1.25x, 1시간 쓰기=2.0x)
     let sonnetPricing = getPricing(for: "claude-sonnet-4-5").pricing
     check(abs(sonnetPricing.cacheRead - 0.30) < 1e-9, "sonnet cacheRead = input×0.1 = 0.30")
     check(abs(sonnetPricing.cacheWrite5m - 3.75) < 1e-9, "sonnet 5분 캐시 쓰기 = input×1.25 = 3.75")
@@ -5529,6 +5505,11 @@ func runSelfTests() -> Never {
                        inputTokens: 1_000_000, outputTokens: 1_000_000,
                        cacheReadTokens: 0, cacheWriteTokens: 0)
     check(abs(e.cost - 18.0) < 1e-6, "비용 = input 3 + output 15 = $18")
+
+    // cost: 캐시 읽기 배수가 모델별로 비용에 반영되는지 — Opus 5.5는 1M 캐시 읽기가 $0.20($0.50 아님)
+    let eOpus55Read = UsageEntry(timestamp: Date(), model: "claude-opus-5-5",
+                                 inputTokens: 0, outputTokens: 0, cacheReadTokens: 1_000_000, cacheWriteTokens: 0)
+    check(abs(eOpus55Read.cost - 0.20) < 1e-9, "cost: Opus 5.5 캐시 읽기 1M = $0.20")
 
     // cost: 캐시 쓰기가 5분/1시간 혼합일 때 각각 다른 단가가 적용되는지
     let eCacheMixed = UsageEntry(timestamp: Date(), model: "claude-sonnet-4-5",

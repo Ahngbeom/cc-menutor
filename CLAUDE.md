@@ -32,9 +32,10 @@ tail -f ~/.cc-menutor.log   # LaunchAgent 실행 시 stdout/stderr 로그
 
 ## 변경 시 주의점
 
-- **새 모델 추가 시**: `VERSIONED_PRICING`에 `ModelVersionKey(family:major:minor:)` 항목을 추가하면 비용과 표시명(`shortModelName()`)이 **함께** 따라온다 — 둘 다 `parseModelVersion()` 결과를 공유하기 때문이다. 새 family(예: 미래의 `fable` 계열)라면 `MODEL_FAMILIES`와 `FAMILY_PRICING`, 그리고 메뉴바 모델명 고정색 `modelFamilyColor()`에도 추가한다(셀프테스트가 `MODEL_FAMILIES` 전부에 색이 있는지 단정한다). 캐시 단가는 input에서 공식 배수로 파생되므로 input/output만 넣으면 된다.
+- **새 모델 추가 시**: `VERSIONED_PRICING`에 `ModelVersionKey(family:major:minor:)` 항목을 추가하면 비용과 표시명(`shortModelName()`)이 **함께** 따라온다 — 둘 다 `parseModelVersion()` 결과를 공유하기 때문이다. 새 family(예: 미래의 `fable` 계열)라면 `MODEL_FAMILIES`와 `FAMILY_PRICING`, 그리고 메뉴바 모델명 고정색 `modelFamilyColor()`에도 추가한다(셀프테스트가 `MODEL_FAMILIES` 전부에 색이 있는지 단정한다). 캐시 **쓰기** 단가는 input에서 공식 배수(5분 1.25x, 1시간 2x)로 파생되지만, **캐시 읽기 배수는 모델마다 다르다**(기본 0.1x, Opus 5.5 0.05x, Fable·Mythos 5.1 0.025x) — 가격표의 "Cache hits" 열이 input×0.1이 아니면 `cacheReadMultiplier:`를 지정한다. 0.1로 두면 토큰의 ~98%가 캐시 읽기인 실사용에서 추정 비용이 조용히 부풀고(Opus 5.5 미등록 시 실데이터 24시간분이 1.92배), matched=true라 경고도 안 뜬다.
   - **순서 의존이 없다**(딕셔너리 조회). 예전엔 `[(pattern, pricing)]` 배열을 `contains`로 훑어서 "구체적인 패턴을 앞에" 규칙을 지켜야 했는데, 실제 모델 ID가 신형(`claude-haiku-4-5`)과 구형(`claude-3-5-haiku`) 두 표기를 오간다는 걸 놓쳐 `haiku-3-5`/`sonnet-3-5`/`sonnet-3-7` 패턴이 **어디에도 매칭되지 않는 죽은 코드**가 됐고, 모든 Haiku가 포괄 패턴으로 떨어져 Haiku 4.5가 4배 과소 청구됐다(게다가 `matched=true`라 경고도 안 떴다). `FAMILY_PRICING`이 은퇴 티어를 가리켜 Opus 5는 3배 과대 추정됐다. **family 폴백은 반드시 현행 티어를 가리켜야 한다.**
-  - 회귀 가드: 셀프테스트의 `officialPrices` 표가 실제 모델 ID → 공식 단가를 직접 대조한다. 단가를 바꿀 땐 이 표도 같이 고친다.
+  - 회귀 가드: 셀프테스트의 `officialPrices` 표가 실제 모델 ID → 공식 단가를 **가격표 다섯 열 전부**(입력·5분 쓰기·1시간 쓰기·읽기·출력) 직접 대조한다. 입력·출력만 대조하던 때는 캐시 읽기 배수 차이를 놓쳤다. 단가를 바꿀 땐 이 표도 같이 고친다.
+  - **Sonnet 5는 $2/$10 고정이다.** 2026-09-01에 $3/$15로 오른다던 도입가 전환은 취소됐다(공식 가격표 공지) — 시간 의존 단가 분기는 제거했고 `getPricing`은 이제 시각 인자를 받지 않는다.
 - **메뉴바 글자 색은 기본 꺼짐이다(`TitleSettings.colorsEnabled`, 메뉴 「숫자 색 표시」)** — 끄면 모든 글자가 `labelColor`, 켜면 아래 계열 색. 기본을 끈 근거는 실측이다(#19): macOS 26 메뉴바는 배경화면이 비치고 「메뉴 막대 배경 보기」를 켜도 색이 배경화면에서 와서, 중간 밝기·고채도 배경에서 색 글자는 **활성 상태에서도** 1.2~2.3:1까지 떨어진다. 메뉴바가 배경에 맞춰 보정해 주는 건 `labelColor`뿐이다(실기에서 우리 글자가 시스템 시계와 같은 `#e5e5e5`로 렌더됨을 확인).
   - **아래 명암비 단정은 평평한 회색 메뉴바(#ECECEC/#1E1E1E)를 가정한다 — 투명 메뉴바에서는 성립하지 않는다.** 그래서 색을 켠 상태의 가독성은 보장하지 않으며, 기본값을 켜짐으로 되돌리려면 그 근거부터 다시 재야 한다.
   - 투명 메뉴바 위에 직접 올린 **색은 무엇이든**(글자·점·선) 같은 문제를 겪는다 — 후광(그림자)·항목별 파이 표식·중립 받침을 시뮬레이션으로 비교했고, 후광은 효과가 거의 없었고(17%) 받침은 비활성 상태를 전혀 개선하지 못했으며(0%) 파이 표식은 UI 리뷰에서 기각됐다.
