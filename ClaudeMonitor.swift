@@ -5052,13 +5052,15 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // ── 폴백 경로(JSONL 직접 파싱, 추정 단가) 뷰모델 어댑터 ──
     // now: 테스트 용이성을 위한 주입 지점(다른 makeBlockDisplayData 오버로드와 동일한 패턴).
-    func makeBlockDisplayData(fromEntries cachedAll: [UsageEntry], reader: UsageDataReader, now: Date = Date()) -> BlockDisplayData {
+    // anchor: 테스트 주입 지점. 기본값이 사용자 설정(.standard)이라 셀프테스트가 그대로 부르면 개발자 머신의 실제 리셋
+    // 앵커가 블록 창을 옮겨, 경과율에 의존하는 단정이 그 머신·그 시각에서만 깨진다(CI엔 앵커가 없어 통과한다).
+    func makeBlockDisplayData(fromEntries cachedAll: [UsageEntry], reader: UsageDataReader, now: Date = Date(),
+                              anchor: Date? = ResetAnchorSettings.anchor()) -> BlockDisplayData {
         let noData = cachedAll.isEmpty && !FileManager.default.fileExists(atPath: reader.projectsDir.path)
         if noData {
             return BlockDisplayData(isEstimate: true, state: .noData)
         }
 
-        let anchor = ResetAnchorSettings.anchor()
         let activeBlock = FiveHourBlock.active(from: cachedAll, now: now, anchor: anchor)
         let blockEntries: [UsageEntry]
         if let activeBlock = activeBlock {
@@ -5994,14 +5996,14 @@ func runSelfTests() -> Never {
 
     let trendApp = ClaudeMonitorApp()
     trendApp.cachedLimitHistory = doneHistory
-    let trendWired = trendApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow)
+    let trendWired = trendApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow, anchor: nil)
     check(trendWired.limitTrend?.observedWeeks == 2,
           "makeBlockDisplayData(fromEntries:): 한도 추이가 BlockDisplayData까지 배선됨")
     check(trendWired.asLoadingSkeleton()?.limitTrend != nil,
           "asLoadingSkeleton(): 한도 추이도 전파(새로고침 중 섹션이 사라지지 않음)")
     let emptyTrendApp = ClaudeMonitorApp()
     emptyTrendApp.cachedLimitHistory = .empty
-    check(emptyTrendApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow).limitTrend == nil,
+    check(emptyTrendApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow, anchor: nil).limitTrend == nil,
           "makeBlockDisplayData: 기록이 없으면 limitTrend는 nil(섹션 생략 — 기존 사용자 화면 불변)")
 
     // 위 임시 홈이 왜 필요한지를 메커니즘 자체로 고정한다: projects 디렉터리가 **없으면** 엔트리 0개일 때
@@ -6013,7 +6015,7 @@ func runSelfTests() -> Never {
     let missingReader = UsageDataReader(homeDir: missingHome)   // 디렉터리를 만들지 않는다
     let noDataApp = ClaudeMonitorApp()
     noDataApp.cachedLimitHistory = doneHistory
-    let noDataResult = noDataApp.makeBlockDisplayData(fromEntries: [], reader: missingReader, now: lhNow)
+    let noDataResult = noDataApp.makeBlockDisplayData(fromEntries: [], reader: missingReader, now: lhNow, anchor: nil)
     check(noDataResult.limitTrend == nil,
           "makeBlockDisplayData(fromEntries:): projects 디렉터리가 없으면 .noData로 조기 반환 — 이 경로엔 limitTrend가 실리지 않는다")
 
@@ -6416,7 +6418,7 @@ func runSelfTests() -> Never {
     // 폴백 경로도 같은 배선을 거쳐야 한다(1차 경로만 고치고 폴백을 놓치는 실수 방지).
     let entriesWireApp = ClaudeMonitorApp()
     let entriesWired = entriesWireApp.makeBlockDisplayData(fromEntries: periodEntries,
-                                                           reader: UsageDataReader(), now: periodNow)
+                                                           reader: UsageDataReader(), now: periodNow, anchor: nil)
     check(entriesWired.week?.totalTokens == 300,
           "makeBlockDisplayData(fromEntries:): 주간 섹션이 BlockDisplayData까지 배선됨")
     check(entriesWired.month != nil,
@@ -7728,13 +7730,13 @@ func runSelfTests() -> Never {
         let wireReader = UsageDataReader(homeDir: wireHome)
         try? FileManager.default.createDirectory(at: wireReader.projectsDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: wireHome) }
-        let idleData = wireApp.makeBlockDisplayData(fromEntries: [], reader: wireReader, now: wireNow)
+        let idleData = wireApp.makeBlockDisplayData(fromEntries: [], reader: wireReader, now: wireNow, anchor: nil)
         check(idleData.rateLimitReset == wireExceeded.resetsAtDate,
               "makeBlockDisplayData(fromEntries:): 활성 블록 없음 + 한도 도달 캐시 신선 → rateLimitReset 채워짐")
 
         let activeEntry = UsageEntry(timestamp: wireNow, model: "claude-sonnet-5",
                                       inputTokens: 0, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0)
-        let activeData = wireApp.makeBlockDisplayData(fromEntries: [activeEntry], reader: wireReader, now: wireNow)
+        let activeData = wireApp.makeBlockDisplayData(fromEntries: [activeEntry], reader: wireReader, now: wireNow, anchor: nil)
         check(activeData.rateLimitReset == nil,
               "makeBlockDisplayData(fromEntries:): 활성 블록이 있으면 한도 도달 캐시가 신선해도 rateLimitReset은 nil")
 
@@ -7752,7 +7754,7 @@ func runSelfTests() -> Never {
             UsageEntry(timestamp: Date(timeIntervalSince1970: t), model: "claude-sonnet-5",
                        inputTokens: 0, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0)
         }
-        let moodData = wireApp.makeBlockDisplayData(fromEntries: longRun, reader: wireReader, now: moodWireNow)
+        let moodData = wireApp.makeBlockDisplayData(fromEntries: longRun, reader: wireReader, now: moodWireNow, anchor: nil)
         if case .ready(let block?, _, _, _) = moodData.state {
             check(block.progressRatio >= 0.8, "무드 배선 픽스처: 경과율이 높아야 시나리오가 성립한다(\(Int(block.progressRatio * 100))%)")
             check(abs(block.moodRatio - 0.16) < 1e-9 && block.moodSource == .server,
