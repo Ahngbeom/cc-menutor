@@ -1448,13 +1448,14 @@ enum MoodTier: String, CaseIterable {
         case .critical: return "●"
         }
     }
-    var color: TitleFieldColor {
+    // 비율 없이 단계만 알 때(유휴 순환 전시, 시작 중 순환) 색을 정하는 대표 비율 — computeMood 구간의 중앙.
+    var representativeRatio: Double {
         switch self {
-        case .idle:     return .gray
-        case .calm:     return .green
-        case .warm:     return .yellow
-        case .hot:      return .orange
-        case .critical: return .red
+        case .idle:     return 0
+        case .calm:     return 0.17
+        case .warm:     return 0.50
+        case .hot:      return 0.78
+        case .critical: return 1.0
         }
     }
     var label: String {   // 드롭다운 범례용
@@ -1516,7 +1517,7 @@ let flameFlickerInterval: TimeInterval = 0.2   // 흔들림 재계산 주기(초
 let flameFlickerPeriod: TimeInterval = 1.6      // 메인(느린) 숨쉬기 흔들림 한 주기(초)
 
 // 유휴(활성 블록 없음) 상태 히어로 아이콘이 MoodTier.allCases(idle/calm/warm/hot/critical)를
-// 순환 전시하는 프레임 간격 — 진행률 실데이터가 없는 유휴 상태에서 flameColors(for:) 팔레트
+// 순환 전시하는 프레임 간격 — 진행률 실데이터가 없는 유휴 상태에서 moodColors 팔레트
 // 전체를 쇼케이스처럼 보여준다.
 let idleFlameCycleInterval: TimeInterval = 1.4
 
@@ -1545,29 +1546,28 @@ func moodRise(elapsed: TimeInterval, period: TimeInterval, phase: Double = 0) ->
     return CGFloat(t < 0 ? t + 1 : t)
 }
 
-// flame 무드 아이콘 전용 배색 — MoodTier.color(회색/초록/노랑/주황/빨강 "신호등" 배색)와
-// 동일한 4단계 색 진행(초록→노랑→주황→빨강)을 아이콘 자체의 outer/inner 2톤으로도 그대로
-// 표현한다. calm=초록, warm=노랑, hot=주황, critical=빨강으로 단계가 올라갈수록 색상환을
-// 따라 "차분한 색 → 위험한 색"으로 또렷이 구분되게 한다. inner가 nil이면(idle)
-// 코어 하이라이트 없이 완전히 식은 색만 쓴다 — idle은 활성 블록이 없는 상태라 실제로 "타는 중"이
-// 아니므로 불꽃 코어를 얹지 않는다.
-func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
-    switch tier {
-    case .idle:
-        return (NSColor(calibratedWhite: 0.55, alpha: 1), nil)
-    case .calm:
-        return (NSColor(calibratedRed: 0.13, green: 0.55, blue: 0.13, alpha: 1),
-                NSColor(calibratedRed: 0.45, green: 0.85, blue: 0.35, alpha: 1))
-    case .warm:
-        return (NSColor(calibratedRed: 0.85, green: 0.65, blue: 0.05, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.92, blue: 0.35, alpha: 1))
-    case .hot:
-        return (NSColor(calibratedRed: 0.90, green: 0.45, blue: 0.05, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.75, blue: 0.20, alpha: 1))
-    case .critical:
-        return (NSColor(calibratedRed: 0.85, green: 0.15, blue: 0.10, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.15, alpha: 1))
-    }
+// 겉색은 limit 램프 그대로다 — 같은 비율이면 옆 블록 숫자와 같은 색. 단계(tier)는 실루엣만 정한다.
+// 코어는 아이콘 면적 대부분을 덮으므로, 라이트에서 다크만큼 밝히면 밝은 메뉴바에 묻힌다(보정 폭이 다른 이유).
+// idle은 "타는 중"이 아니므로 코어 없는 식은 회색.
+func moodColors(tier: MoodTier, ratio: Double?, isDark: Bool) -> (outer: NSColor, inner: NSColor?) {
+    guard tier != .idle else { return (NSColor(calibratedWhite: 0.55, alpha: 1), nil) }
+    let c = usageColorComponents(ratio: ratio ?? tier.representativeRatio, family: .limit, isDark: isDark)
+    let outer = hsbToSRGB(hue: c.hue, saturation: c.saturation, brightness: c.brightness)
+    let inner = hsbToSRGB(hue: c.hue, saturation: c.saturation * (isDark ? 0.45 : 0.80),
+                          brightness: min(1, c.brightness + (isDark ? 0.35 : 0.12)))
+    return (NSColor(srgbRed: outer.r, green: outer.g, blue: outer.b, alpha: 1),
+            NSColor(srgbRed: inner.r, green: inner.g, blue: inner.b, alpha: 1))
+}
+
+// 이미지 drawingHandler 안에서 불러야 한다 — 핸들러 밖에서 외관을 정해 캡처하면 다크/라이트 전환 뒤에도
+// 옛 외관의 색으로 그려진다.
+func currentDrawingIsDark() -> Bool {
+    NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+}
+
+// 텍스트용 무드 색(드롭다운 유휴 순환 줄). idle은 아이콘과 같은 회색.
+func moodTextColor(tier: MoodTier) -> NSColor {
+    tier == .idle ? .systemGray : usageColor(ratio: tier.representativeRatio, family: .limit)
 }
 
 // 무드 아이콘 전용 커스텀 벡터 아이콘 — 이모지 🔥 대신 Core Graphics로 직접 그려 색 틴팅이
@@ -1577,10 +1577,10 @@ func flameColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
 // 겹쳐 칠한다 — 코어 바닥은 rect.minY 그대로 맞춰(가운데 정렬 아님) 밑에서부터 차오르는 것처럼
 // 보이게 하고, hot/critical에서는 코어를 살짝 키워(0.75) 격렬함을 강조한다.
 // idle(inner=nil)은 그라디언트 없이 식은 단색 그대로 — "타는 중"이 아니므로.
-func moodFlameImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+func moodFlameImage(tier: MoodTier, ratio: Double? = nil, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
-    let colors = flameColors(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
+        let colors = moodColors(tier: tier, ratio: ratio, isDark: currentDrawingIsDark())
         let silhouette = flameBezierPath(tier: tier, in: rect, elapsed: elapsed)
         if let inner = colors.inner {
             NSGraphicsContext.saveGraphicsState()
@@ -1699,9 +1699,10 @@ func thermometerRatio(for tier: MoodTier) -> CGFloat {
     }
 }
 
-// flame과 동일한 초록→노랑→주황→빨강 위험도 색 언어를 그대로 재사용한다 — 모양만 다르고 색
-// 코딩은 앱 전체에서 일관되게 유지하기 위함.
-func thermometerColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
+// flame과 같은 배색(moodColors) — 모양만 다르고 색 코딩은 앱 전체에서 일관되게 유지한다.
+func thermometerColors(for tier: MoodTier, ratio: Double?, isDark: Bool) -> (outer: NSColor, inner: NSColor?) {
+    moodColors(tier: tier, ratio: ratio, isDark: isDark)
+}
 
 // 구근 지름 0.72w — 과거 0.85w에서는 구근이 캔버스 높이의 2/3을 차지해 관 최대 높이(h -
 // 0.82·구근)가 구근 원 상단보다 낮았고, 관이 통째로 구근 안에 숨어 아이콘이 그냥 "색깔 원"으로
@@ -1761,10 +1762,10 @@ func thermometerBubbleRects(in rect: CGRect, elapsed: TimeInterval) -> [CGRect] 
 // flame과 동일한 outer/inner 2톤 오버레이 기법 — 같은 실루엣을 좁은 inset 영역에 다시 그려
 // 가운데가 밝게 빛나는 액주 하이라이트를 낸다. 채움보다 먼저 빈 관+구근 외곽선을 stroke해
 // "최대 눈금"을 항상 보여준다 — 구근 내부를 지나는 관 외곽선은 항상 가득 찬 구근 채움이 덮는다.
-func moodThermometerImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+func moodThermometerImage(tier: MoodTier, ratio: Double? = nil, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
-    let colors = thermometerColors(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
+        let colors = thermometerColors(for: tier, ratio: ratio, isDark: currentDrawingIsDark())
         NSColor(calibratedWhite: 0.6, alpha: 0.55).setStroke()
         let outline = thermometerFillPath(in: rect, ratio: 1.0)
         outline.lineWidth = 0.9
@@ -1796,7 +1797,9 @@ func moodThermometerImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage 
 // 배터리 UI 관례를 따라 outer/inner 2톤이 아니라 단일 톤 채움만 쓴다(막대 배터리는 보통 단색).
 // 채움은 연속 높이가 아니라 4칸 세그먼트다 — 11×14pt에서 5단계 연속 높이차는 인접 단계 간
 // 1~2pt 수준이라 판독이 어렵고, 칸 수(반 칸/1/2/3/4)로 이산화해야 단계가 한눈에 세어진다.
-func batteryColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
+func batteryColors(for tier: MoodTier, ratio: Double?, isDark: Bool) -> (outer: NSColor, inner: NSColor?) {
+    moodColors(tier: tier, ratio: ratio, isDark: isDark)
+}
 
 // 채워지는 칸 수 — idle은 "완전히 빈 것"과 구분되는 바닥 슬리버(반 칸, 회색)로 그려
 // "앱은 살아 있지만 블록이 없다"는 상태를 표현한다.
@@ -1846,11 +1849,11 @@ private func batterySegmentsPath(in rect: CGRect, segments: CGFloat) -> NSBezier
 // critical만 알파를 펄스시켜 "저전력 경고"처럼 깜빡인다 — 나머지 tier는 elapsed와 무관하게
 // 항상 정적(칸 수 고정, 깜빡임 없음). 깜빡일 때는 외곽선도 회색 대신 outer색으로 함께 물들여
 // 아이콘 전체가 경고색으로 숨쉬는 인상을 강화한다.
-func moodBatteryImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+func moodBatteryImage(tier: MoodTier, ratio: Double? = nil, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
-    let colors = batteryColors(for: tier)
     let pulse: CGFloat = tier == .critical ? 0.55 + 0.45 * moodPulse(elapsed: elapsed, period: 0.7) : 1.0
     let image = NSImage(size: size, flipped: false) { rect in
+        let colors = batteryColors(for: tier, ratio: ratio, isDark: currentDrawingIsDark())
         let outlineColor = tier == .critical
             ? colors.outer.withAlphaComponent(0.65 * pulse)
             : NSColor(calibratedWhite: 0.6, alpha: 0.65)
@@ -1874,7 +1877,9 @@ func moodBatteryImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
 // 바늘은 tier마다 다른 위치(0.06/0.28/0.50/0.72/0.93)에 있고, warm/hot은 미세하게 떨며
 // critical은 오른쪽 끝에 "박힌 채 파르르" 고주파로 잔떨림한다.
 
-func gaugeColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) { flameColors(for: tier) }
+func gaugeColors(for tier: MoodTier, ratio: Double?, isDark: Bool) -> (outer: NSColor, inner: NSColor?) {
+    moodColors(tier: tier, ratio: ratio, isDark: isDark)
+}
 
 private func gaugeCenter(in rect: CGRect) -> CGPoint {
     CGPoint(x: rect.midX, y: rect.minY + rect.height * 0.28)
@@ -1925,10 +1930,10 @@ private func gaugeSweepPath(in rect: CGRect, t: CGFloat) -> NSBezierPath {
 }
 
 // outer=바늘·스윕 arc, inner=중심 허브 점(있으면 더 밝은 강조색, 없으면 바늘과 같은 색).
-func moodGaugeImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+func moodGaugeImage(tier: MoodTier, ratio: Double? = nil, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
-    let colors = gaugeColors(for: tier)
     let image = NSImage(size: size, flipped: false) { rect in
+        let colors = gaugeColors(for: tier, ratio: ratio, isDark: currentDrawingIsDark())
         NSColor(calibratedWhite: 0.6, alpha: 0.55).setStroke()
         let arc = gaugeArcPath(in: rect)
         arc.lineWidth = 1.1
@@ -1959,10 +1964,10 @@ func moodGaugeImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
 // 별도 레이어(회색, 상승할수록 옅어짐)로 그린다 — 과거엔 산과 같은 path에 append돼 산과 같은
 // 색으로 칠해져 "바위 혹"처럼 보였다.
 //
-// flame의 초록→빨강 배색을 그대로 쓰면 "쉬고 있는 산"에 초록/노랑이 섞여 어색하므로 화산만
-// 예외적으로 전용 팔레트를 쓴다 — 낮은 단계는 회갈색 계열로 tier가 오를수록 점점 어둡고 붉게
-// 달아오르고, hot부터 크레이터 안쪽에 주황 용암 글로우(inner)가 나타난다.
-func volcanoColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
+// 몸통은 흙색 전용 팔레트, hot부터 나타나는 용암만 limit 램프다. 용암은 메뉴바가 아니라 어두운 바위 위에
+// 놓이므로 외관과 무관하게 다크 램프를 쓴다 — 라이트 램프의 짙은 적갈색은 바위에 묻힌다.
+func volcanoColors(for tier: MoodTier, ratio: Double?) -> (outer: NSColor, inner: NSColor?) {
+    let lava = moodColors(tier: tier, ratio: ratio, isDark: true).outer
     switch tier {
     case .idle:
         return (NSColor(calibratedRed: 0.50, green: 0.46, blue: 0.42, alpha: 1), nil)
@@ -1971,11 +1976,9 @@ func volcanoColors(for tier: MoodTier) -> (outer: NSColor, inner: NSColor?) {
     case .warm:
         return (NSColor(calibratedRed: 0.52, green: 0.42, blue: 0.30, alpha: 1), nil)
     case .hot:
-        return (NSColor(calibratedRed: 0.48, green: 0.30, blue: 0.20, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.20, alpha: 1))
+        return (NSColor(calibratedRed: 0.48, green: 0.30, blue: 0.20, alpha: 1), lava)
     case .critical:
-        return (NSColor(calibratedRed: 0.42, green: 0.22, blue: 0.16, alpha: 1),
-                NSColor(calibratedRed: 1.00, green: 0.45, blue: 0.12, alpha: 1))
+        return (NSColor(calibratedRed: 0.42, green: 0.22, blue: 0.16, alpha: 1), lava)
     }
 }
 
@@ -2039,9 +2042,9 @@ func volcanoLavaFragmentRects(in rect: CGRect, elapsed: TimeInterval) -> [CGRect
 // 레이어를 나눠 그린다. 글로우는 flame의 "실루엣을 축소해 다시 채우는" 기법 대신 분화구 노치
 // 위치에 작은 별도 원을 얹는다(산 실루엣을 그대로 축소하면 바위 모양이 작아질 뿐 "빛나는
 // 크레이터"로 보이지 않기 때문). idle은 산 하나만 — 완전히 정적.
-func moodVolcanoImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+func moodVolcanoImage(tier: MoodTier, ratio: Double? = nil, elapsed: TimeInterval = 0) -> NSImage {
     let size = CGSize(width: 11, height: 14)
-    let colors = volcanoColors(for: tier)
+    let colors = volcanoColors(for: tier, ratio: ratio)
     let image = NSImage(size: size, flipped: false) { rect in
         colors.outer.setFill()
         volcanoMountainPath(in: rect).fill()
@@ -2073,13 +2076,14 @@ func moodVolcanoImage(tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
 //
 // 현재 선택된 테마에 따라 적절한 렌더러로 위임하는 단일 진입점 — 호출부는 테마를 몰라도 되고,
 // 새 테마를 추가할 때 이 두 switch만 갱신하면 된다.
-func currentMoodImage(theme: MoodGlyphTheme, tier: MoodTier, elapsed: TimeInterval = 0) -> NSImage {
+// ratio가 nil이면 단계 대표 비율로 색을 정한다(유휴 순환처럼 실제 비율이 없는 곳).
+func currentMoodImage(theme: MoodGlyphTheme, tier: MoodTier, ratio: Double? = nil, elapsed: TimeInterval = 0) -> NSImage {
     switch theme {
-    case .flame:       return moodFlameImage(tier: tier, elapsed: elapsed)
-    case .thermometer: return moodThermometerImage(tier: tier, elapsed: elapsed)
-    case .battery:     return moodBatteryImage(tier: tier, elapsed: elapsed)
-    case .gauge:       return moodGaugeImage(tier: tier, elapsed: elapsed)
-    case .volcano:     return moodVolcanoImage(tier: tier, elapsed: elapsed)
+    case .flame:       return moodFlameImage(tier: tier, ratio: ratio, elapsed: elapsed)
+    case .thermometer: return moodThermometerImage(tier: tier, ratio: ratio, elapsed: elapsed)
+    case .battery:     return moodBatteryImage(tier: tier, ratio: ratio, elapsed: elapsed)
+    case .gauge:       return moodGaugeImage(tier: tier, ratio: ratio, elapsed: elapsed)
+    case .volcano:     return moodVolcanoImage(tier: tier, ratio: ratio, elapsed: elapsed)
     }
 }
 
@@ -2100,21 +2104,21 @@ func moodIconAnimates(theme: MoodGlyphTheme, tier: MoodTier) -> Bool {
 
 // statusItem.button.image에 대입할 이미지 — 무드 타이어가 있을 때만 non-nil. 그 외에는 nil을
 // 반환해 호출부가 "무드 아이콘이 꺼진 상태의 잔류 이미지 지우기"에도 그대로 쓸 수 있게 한다.
-func moodImageToApply(tier: MoodTier?) -> NSImage? {
+func moodImageToApply(tier: MoodTier?, ratio: Double? = nil) -> NSImage? {
     guard let tier = tier else { return nil }
     // refresh 트리거 시점에도 refreshFlameFlicker()가 매 0.2초마다 그리는 것과 동일한 "지금 시각"
     // 흔들림 프레임을 써야 한다 — elapsed를 0으로 고정하면 매 refresh마다 아이콘이 rest 포즈로
     // 스냅됐다가 최대 0.2초 뒤 흔들림 타이머가 되돌리는 깜빡임이 생긴다.
-    return currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
+    return currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier, ratio: ratio,
+                            elapsed: Date().timeIntervalSinceReferenceDate)
 }
 
-// 순수 함수: 활성 블록 여부 + 경과 비율(예산 미설정 시) + usageWarning 비율(예산 설정 시, 우선)로 tier 산출.
+// 순수 함수: 활성 블록 여부 + 블록 사용 비율(blockUsage()의 결과)로 tier 산출. 비율의 원천을 여기서
+// 고르지 않는다 — 고르는 순간 타이틀 숫자와 다른 값을 보게 된다(blockUsage 주석 참고).
 // 임계값은 warnAt(기본 WARN_RATIO=0.90)에서 파생되어, CLAUDE_MONITOR_WARN으로 임계값을 바꿔도
-// 무드 색(주황/빨강)과 실제 경고 배너가 어긋나지 않는다.
-func computeMood(hasActiveBlock: Bool, elapsedRatio: Double, warning: UsageWarning?,
-                  warnAt: Double = WARN_RATIO) -> MoodTier {
+// 무드 단계와 실제 경고 배너가 어긋나지 않는다.
+func computeMood(hasActiveBlock: Bool, ratio: Double, warnAt: Double = WARN_RATIO) -> MoodTier {
     guard hasActiveBlock else { return .idle }
-    let ratio = warning?.ratio ?? elapsedRatio
     // warnAt이 기본값(0.90)이면 scale은 정확히 1.0(IEEE754 x/x==1.0)이라 기존 0.34/0.67 경계와
     // 완전히 동일하게 나옴. CLAUDE_MONITOR_WARN로 warnAt이 바뀌면 hot/critical 경계뿐 아니라
     // calm/warm/hot 경계도 비례해서 따라가 무드 색이 실제 경고 임계값과 어긋나지 않게 한다.
@@ -2427,14 +2431,27 @@ func modelFamilyColor(_ family: String) -> NSColor? {
     }
 }
 
-// 두 타이틀 경로(makeTitleContext/updateStatusBarTitleFromEntries)가 이 함수만 써야 같은 블록에 같은 색이 나온다.
+// 블록이 "얼마나 찼나"의 원천. 드롭다운 「기분」 줄이 근거를 표기하는 데 쓴다.
+enum BlockUsageSource {
+    case server, budget, elapsed
+    var labelKo: String { switch self { case .server: return "서버"; case .budget: return "사용"; case .elapsed: return "경과" } }
+    var labelEn: String { switch self { case .server: return "server"; case .budget: return "used"; case .elapsed: return "elapsed" } }
+}
+
+// 블록 사용량의 **유일한 판정자** — 타이틀 두 경로, 드롭다운 두 어댑터, 무드 아이콘이 모두 이것만 쓴다.
+// 어느 한 곳이 원천을 따로 고르면 같은 블록을 두 값으로 말하게 된다.
+func blockUsage(serverFiveHour: RateLimitWindow?, warning: UsageWarning?,
+                elapsedRatio: Double, now: Date = Date()) -> (ratio: Double, source: BlockUsageSource) {
+    if let w = serverFiveHour, let pct = w.usedPercentage, pct.isFinite, !w.isStale(now: now) {
+        return (pct / 100, .server)
+    }
+    if let w = warning { return (w.ratio, .budget) }
+    return (elapsedRatio, .elapsed)
+}
+
 func blockUsageRatio(serverFiveHour: RateLimitWindow?, warning: UsageWarning?,
                      elapsedRatio: Double, now: Date = Date()) -> Double {
-    if let w = serverFiveHour, let pct = w.usedPercentage, pct.isFinite, !w.isStale(now: now) {
-        return pct / 100
-    }
-    if let w = warning { return w.ratio }
-    return elapsedRatio
+    blockUsage(serverFiveHour: serverFiveHour, warning: warning, elapsedRatio: elapsedRatio, now: now).ratio
 }
 
 // 누적값이 직전 마일스톤에서 다음 마일스톤까지 얼마나 왔는지(0~1). 마지막 마일스톤 뒤로는 ×10씩 연장한다 —
@@ -3217,7 +3234,8 @@ struct BlockSectionData {
     let burnRateCostPerHour: Double?
     let warning: UsageWarning?
     let moodTier: MoodTier?
-    let moodRatio: Double
+    let moodRatio: Double              // blockUsage().ratio — 타이틀 블록 숫자와 같은 값
+    let moodSource: BlockUsageSource
     let effectiveEnd: Date?           // 현재 표시 중인 블록의 유효 종료 시각(자연 계산이든 앵커
                                        // 기준이든) — "리셋 기준 시각" 입력창 프리필용
 }
@@ -3359,6 +3377,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 않도록 타이머를 멈추는 스위치(installPowerAndVisibilityObservers 참고).
     private(set) var moodAnimationSuspended = false
     private var lastMoodTier: MoodTier?  // 흔들림 타이머가 재사용할, 가장 최근 refresh에서 계산된 tier
+    private var lastMoodRatio: Double?   // 같은 이유로 색을 정할 비율도 함께 기억한다(없으면 흔들릴 때마다 대표색으로 튄다)
     private(set) var idleFlameCycleTimer: Timer?  // 유휴 상태 + 메뉴 열림일 때만 syncIdleFlameCycleTimer()가 시작/중지한다
     private(set) var idleFlameCycleIndex: Int = 0  // MoodTier.allCases 상의 현재 순환 프레임
     private(set) weak var idleHeroIconRow: NSMenuItem?  // tickIdleFlameCycle()이 전체 메뉴 재구성 없이 직접 patch할 유휴 히어로 행
@@ -3699,9 +3718,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // 재미 모드 OFF면 항상 nil(호출부가 기존 아이콘 로직을 그대로 타게 함). QA 테스트 override는
     // 재미 모드가 켜져 있을 때만 적용된다(꺼짐 상태에서 강제로 무드가 새어 나오지 않도록).
-    func resolveMood(hasActiveBlock: Bool, elapsedRatio: Double, warning: UsageWarning?) -> MoodTier? {
+    func resolveMood(hasActiveBlock: Bool, ratio: Double) -> MoodTier? {
         guard TitleSettings.isFunModeFeatureEnabled(.moodIcon) else { return nil }
-        return moodTestTierOverride() ?? computeMood(hasActiveBlock: hasActiveBlock, elapsedRatio: elapsedRatio, warning: warning)
+        return moodTestTierOverride() ?? computeMood(hasActiveBlock: hasActiveBlock, ratio: ratio)
     }
 
     // 실제 tier 재계산 없이 상태바 아이콘만 흔든다 — 타이머 자체의 시작/중지는 applyMood()가 호출하는
@@ -3713,7 +3732,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
               !moodAnimationSuspended,
               let tier = lastMoodTier,
               moodIconAnimates(theme: theme, tier: tier) else { return }
-        statusItem?.button?.image = currentMoodImage(theme: theme, tier: tier, elapsed: Date().timeIntervalSinceReferenceDate)
+        statusItem?.button?.image = currentMoodImage(theme: theme, tier: tier, ratio: lastMoodRatio,
+                                                     elapsed: Date().timeIntervalSinceReferenceDate)
     }
 
     // 무드 아이콘 on + 현재 선택된 테마가 애니메이션 단계 + 화면이 켜져 있고 저전력 모드가 아닐 때만
@@ -3740,13 +3760,14 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 무드 tier 변경 시 상태바 아이콘과 lastMoodTier를 항상 함께 갱신하는 단일 진입점 — 흔들림
     // 타이머 시작/중지 판단(syncFlameFlickerTimer())도 여기서 함께 처리해, 향후 호출부가 추가되거나
     // 복붙 실수가 나도 아이콘/lastMoodTier/타이머가 서로 어긋날 위험이 없다.
-    func applyMood(_ tier: MoodTier?) {
+    func applyMood(_ tier: MoodTier?, ratio: Double? = nil) {
         lastMoodTier = tier
+        lastMoodRatio = ratio
         // statusItem은 옵셔널 체이닝으로 접근 — 정상 실행 경로에서는 applicationDidFinishLaunching이
         // 항상 먼저 statusItem을 만들어 두므로 실질적으로 nil일 일이 없지만, 셀프테스트가 앱 생명주기
         // 없이 ClaudeMonitorApp() 인스턴스만 만들어 applyMood()를 직접 호출할 수 있게 허용한다(실제
         // NSStatusItem을 생성하면 테스트 실행 중 사용자의 진짜 메뉴바에 아이콘이 나타나므로 피해야 함).
-        statusItem?.button?.image = moodImageToApply(tier: tier)
+        statusItem?.button?.image = moodImageToApply(tier: tier, ratio: ratio)
         syncFlameFlickerTimer()
     }
 
@@ -3779,7 +3800,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             iconView.image = currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier)
         }
         if let field = view.subviews.compactMap({ $0 as? NSTextField }).first {
-            field.textColor = tier.color.nsColor ?? .labelColor
+            field.textColor = moodTextColor(tier: tier)
         }
     }
 
@@ -3855,20 +3876,21 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             resetText = resetCountdownText(for: b)
             elapsedRatio = b.elapsedRatio()
         }
+        let usage = blockUsage(serverFiveHour: cachedRateLimits?.fiveHour, warning: warning,
+                               elapsedRatio: elapsedRatio, now: now)
         let best = GamificationSettings.load()
         let ctx = TitleContext(outputTokens: anchored?.stats.outputTokens ?? b.tokenCounts.outputTokens,
                                totalTokens: anchored?.stats.totalTokens ?? b.totalTokens,
                                cost: anchored?.stats.totalCost ?? b.costUSD,
                                remainingText: resetText.isEmpty ? nil : resetText,
                                model: topModel ?? b.models.last,
-                               moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: elapsedRatio, warning: warning),
+                               moodTier: resolveMood(hasActiveBlock: true, ratio: usage.ratio),
                                todayTokens: gamificationTodayTokens,
                                todayCost: gamificationTodayCost,
                                cumulativeTokens: stats.cumulative?.totalTokens ?? 0,
                                currency: currencyContext(currency: CurrencySettings.currency(),
                                                          rate: cachedExchangeRate),
-                               blockRatio: blockUsageRatio(serverFiveHour: cachedRateLimits?.fiveHour, warning: warning,
-                                                           elapsedRatio: elapsedRatio, now: now),
+                               blockRatio: usage.ratio,
                                elapsedRatio: elapsedRatio,
                                bestDayTokens: best.bestDayTokens,
                                bestDayCost: best.bestDayCost)
@@ -3881,7 +3903,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             renderIdleTitle(idleTitleLabel())
             return
         }
-        applyMood(r.ctx.moodTier)
+        applyMood(r.ctx.moodTier, ratio: r.ctx.blockRatio)
         renderTitle(parts: titlePartsWithBadge(r.ctx), warning: r.warning)
     }
 
@@ -3914,8 +3936,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if block == nil {
             renderIdleTitle(idleTitleLabel())
         } else if let b = block {
-            let moodTier = resolveMood(hasActiveBlock: true, elapsedRatio: b.progress, warning: warning)
-            applyMood(moodTier)
+            let usage = blockUsage(serverFiveHour: cachedRateLimits?.fiveHour, warning: warning, elapsedRatio: b.progress)
+            let moodTier = resolveMood(hasActiveBlock: true, ratio: usage.ratio)
+            applyMood(moodTier, ratio: usage.ratio)
             let best = GamificationSettings.load()
             let ctx = TitleContext(outputTokens: blockStats.outputTokens,
                                    totalTokens: blockStats.totalTokens,
@@ -3928,8 +3951,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    cumulativeTokens: UsageStats(entries: cachedAll).totalTokens,
                                    currency: currencyContext(currency: CurrencySettings.currency(),
                                                              rate: cachedExchangeRate),
-                                   blockRatio: blockUsageRatio(serverFiveHour: cachedRateLimits?.fiveHour, warning: warning,
-                                                               elapsedRatio: b.progress),
+                                   blockRatio: usage.ratio,
                                    elapsedRatio: b.progress,
                                    bestDayTokens: best.bestDayTokens,
                                    bestDayCost: best.bestDayCost)
@@ -4048,6 +4070,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 return .none
             }()
+            let usage = blockUsage(serverFiveHour: cachedRateLimits?.fiveHour, warning: warning,
+                                   elapsedRatio: progressRatio, now: now)
             block = BlockSectionData(
                 windowText: windowText,
                 outputTokens: anchorStats?.outputTokens ?? b.tokenCounts.outputTokens,
@@ -4060,8 +4084,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 warningResetText: anchorWindow.map { formatTime($0.remaining) } ?? resetCountdownText(for: b),
                 burnRateCostPerHour: anchorWindow != nil ? nil : b.burnRate?.costPerHour,
                 warning: warning,
-                moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: progressRatio, warning: warning),
-                moodRatio: warning?.ratio ?? progressRatio,
+                moodTier: resolveMood(hasActiveBlock: true, ratio: usage.ratio),
+                moodRatio: usage.ratio,
+                moodSource: usage.source,
                 effectiveEnd: anchorWindow?.end ?? end
             )
         } else {
@@ -4165,16 +4190,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addSectionHeader(menu, t("⏱  5시간 블록 현황", "⏱  5-Hour Block Status"))
         if let b = block {
             isCurrentlyIdle = false
-            // 재미 모드(무드 아이콘) on/off와 무관하게 항상 계산되는 색 — 색상 코딩은 가독성
-            // 기능이지, 재미 모드가 게이팅하는 "기분" 표시 기능이 아니다. resolveMood()는
-            // 재미 모드가 꺼져 있으면 항상 nil을 반환하므로 여기서는 쓰지 않고, 그 안에서 쓰는
-            // moodTestTierOverride()/computeMood()를 직접 호출해 QA 오버라이드만 재사용한다.
-            let heroTier = moodTestTierOverride()
-                ?? computeMood(hasActiveBlock: true, elapsedRatio: b.progressRatio, warning: b.warning)
-            let heroColor = heroTier.color.nsColor ?? .labelColor
-            // hero 줄 앞에 작은 무드 아이콘을 붙인다 — 재미 모드(무드 아이콘) on/off와 무관하게
-            // heroColor와 같은 이유로 항상 표시. 현재 선택된 테마를 따른다.
-            let heroFlameIcon = currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: heroTier)
+            // 아이콘은 메뉴바 불꽃과 같은 할당량(moodRatio), 「N 남음」 글자·진행 바는 시간이라 경과율 램프.
+            // 재미 모드와 무관하게 항상 그리므로 resolveMood() 대신 computeMood()를 직접 부른다.
+            let heroOverride = moodTestTierOverride()
+            let heroTier = heroOverride ?? computeMood(hasActiveBlock: true, ratio: b.moodRatio)
+            let heroColor = usageColor(ratio: b.progressRatio, family: .limit)
+            let heroFlameIcon = currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: heroTier,
+                                                 ratio: heroOverride == nil ? b.moodRatio : nil)
 
             switch b.resetState {
             case .remaining(let text):
@@ -4188,7 +4210,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if b.showProgressBar {
                 skeleton ? addSkeletonProgressBar(menu)
-                         : addFlameProgressBar(menu, ratio: b.progressRatio, tier: heroTier)
+                         : addFlameProgressBar(menu, ratio: b.progressRatio)
             }
 
             if skeleton {
@@ -4219,13 +4241,13 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             if let tier = b.moodTier {
-                let scopeWord = t(b.warning != nil ? "사용" : "경과", b.warning != nil ? "used" : "elapsed")
+                let scopeWord = t(b.moodSource.labelKo, b.moodSource.labelEn)
                 skeleton ? addSkeletonLabel(menu)
-                         : addLabel(menu, "  \(tier.glyph) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier))
+                         : addLabel(menu, "  \(tier.glyph) " + t("기분: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))", "Mood: \(tier.label) (\(Int(b.moodRatio * 100))% \(scopeWord))"), image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: tier, ratio: b.moodRatio))
             }
         } else {
             isCurrentlyIdle = true
-            // 진행률 실데이터가 없으므로 대신 MoodTier.allCases 전체를 순환 전시해 flameColors(for:)
+            // 진행률 실데이터가 없으므로 대신 MoodTier.allCases 전체를 순환 전시해 moodColors
             // 팔레트를 유휴 상태에서도 보여준다 — 실제 순환은 tickIdleFlameCycle()이 idleHeroIconRow를
             // 직접 patch하며 진행하고, 여기서는 매 렌더 시점의 현재 프레임만 반영한다.
             let cycleTier = MoodTier.allCases[idleFlameCycleIndex % MoodTier.allCases.count]
@@ -4241,7 +4263,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 addLabel(menu, "  " + t("리셋 후 새 블록을 시작할 수 있습니다.", "A new block can start after the reset."))
             } else {
                 idleHeroIconRow = addHeroLabel(menu, "  " + t("현재 활성 블록 없음", "No active block right now"),
-                                                color: cycleTier.color.nsColor ?? .labelColor,
+                                                color: moodTextColor(tier: cycleTier),
                                                 image: currentMoodImage(theme: TitleSettings.moodGlyphTheme(), tier: cycleTier))
                 addLabel(menu, "  " + t("다음 메시지부터 새 블록이 시작됩니다.", "A new block will start with your next message."))
             }
@@ -4903,7 +4925,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func setMoodGlyphThemeButton(_ sender: NSButton) {
         let theme = MoodGlyphTheme.allCases[sender.tag]
         TitleSettings.setMoodGlyphTheme(theme)
-        applyMood(lastMoodTier)
+        applyMood(lastMoodTier, ratio: lastMoodRatio)
         refreshRadioSubmenu(moodThemeSubmenu, current: theme, action: #selector(setMoodGlyphThemeButton(_:))) { $0.label }
     }
 
@@ -5051,6 +5073,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let activeBlock = activeBlock {
             let rem = activeBlock.remaining
             let anchorMarker = anchor != nil ? " ⚓" : ""
+            let usage = blockUsage(serverFiveHour: self.cachedRateLimits?.fiveHour, warning: warning,
+                                   elapsedRatio: activeBlock.progress, now: now)
             block = BlockSectionData(
                 windowText: "\(formatTimeShort(activeBlock.start)) → \(formatTimeShort(activeBlock.end))\(anchorMarker)",
                 outputTokens: blockStats.outputTokens,
@@ -5063,8 +5087,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 warningResetText: formatTime(rem),
                 burnRateCostPerHour: nil,   // 폴백(JSONL) 경로엔 소모율 데이터가 없다
                 warning: warning,
-                moodTier: resolveMood(hasActiveBlock: true, elapsedRatio: activeBlock.progress, warning: warning),
-                moodRatio: warning?.ratio ?? activeBlock.progress,
+                moodTier: resolveMood(hasActiveBlock: true, ratio: usage.ratio),
+                moodRatio: usage.ratio,
+                moodSource: usage.source,
                 effectiveEnd: activeBlock.end
             )
         } else {
@@ -5168,12 +5193,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // ── 5시간 블록 진행률 전용 그래픽 캡슐 막대 ──
     // infoRowItem과 같은 컨벤션(row NSView를 만들어 NSMenuItem.view에 꽂고 isEnabled=false로 호버
-    // 하이라이트 억제)을 따르되, 텍스트가 아니라 CALayer 기반 트랙/채움 뷰를 그린다. 채움 색은
-    // flameColors(for:)(상태바 flame 아이콘과 동일 팔레트)를 그대로 재사용해, 재미 모드(무드 아이콘)
-    // on/off와 무관하게 항상 같은 색 언어를 쓴다(heroColor 계산부 주석과 같은 원칙 — 색상 코딩은
-    // 재미 모드 게이팅 대상이 아니라 가독성 기능). ratio가 nil이면 스켈레톤(빈 트랙만, 퍼센트 텍스트
-    // 없음) — addSkeletonLabel과 동일하게 값이 아직 없다는 신호만 준다.
-    private func flameProgressBarRow(ratio: Double?, tier: MoodTier) -> NSMenuItem {
+    // 하이라이트 억제)을 따르되, 텍스트가 아니라 CALayer 기반 트랙/채움 뷰를 그린다. CALayer는 정적
+    // CGColor라 메뉴를 만드는 시점의 외관으로 색을 확정한다. ratio가 nil이면 스켈레톤(빈 트랙만).
+    private func flameProgressBarRow(ratio: Double?) -> NSMenuItem {
         let leftInset: CGFloat = 14   // 다른 본문 줄과 좌측 정렬 맞춤
         let barWidth: CGFloat = 200
         let barHeight: CGFloat = 8
@@ -5208,8 +5230,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 fill.wantsLayer = true
                 let gradient = CAGradientLayer()
                 gradient.frame = fill.bounds
-                let colors = flameColors(for: tier)
-                gradient.colors = [colors.outer.cgColor, (colors.inner ?? colors.outer).cgColor]
+                let isDark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                gradient.colors = [0, clamped].map { r -> CGColor in
+                    let c = usageColorComponents(ratio: r, family: .limit, isDark: isDark)
+                    let rgb = hsbToSRGB(hue: c.hue, saturation: c.saturation, brightness: c.brightness)
+                    return CGColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1)
+                }
                 gradient.startPoint = CGPoint(x: 0, y: 0.5)
                 gradient.endPoint = CGPoint(x: 1, y: 0.5)
                 gradient.cornerRadius = barHeight / 2
@@ -5226,12 +5252,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func addFlameProgressBar(_ menu: NSMenu, ratio: Double, tier: MoodTier) {
-        menu.addItem(flameProgressBarRow(ratio: ratio, tier: tier))
+    private func addFlameProgressBar(_ menu: NSMenu, ratio: Double) {
+        menu.addItem(flameProgressBarRow(ratio: ratio))
     }
 
     private func addSkeletonProgressBar(_ menu: NSMenu) {
-        menu.addItem(flameProgressBarRow(ratio: nil, tier: .idle))
+        menu.addItem(flameProgressBarRow(ratio: nil))
     }
 
     // 경고 상태면 수치는 유지한 채 ⚠%를 덧붙이고 전체를 색(주황/빨강)으로 덮어써 항목별 색보다 우선시킨다.
@@ -6589,21 +6615,36 @@ func runSelfTests() -> Never {
     } else { check(false, "warn: 복합 한도 경고 반환되어야 함") }
 
     // MoodTier / computeMood (순수 함수 — 재미 모드 무드 아이콘 tier 산출)
-    check(computeMood(hasActiveBlock: false, elapsedRatio: 0.99, warning: nil) == .idle, "mood: 비활성 블록 → idle")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.0, warning: nil) == .calm, "mood: 0% → calm")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.33, warning: nil) == .calm, "mood: 33% → calm")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.339, warning: nil) == .calm, "mood: 33.9% → calm")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.34, warning: nil) == .warm, "mood: 34% → warm")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.66, warning: nil) == .warm, "mood: 66% → warm")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.67, warning: nil) == .hot, "mood: 67% → hot")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.89, warning: nil) == .hot, "mood: 89% → hot")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 0.90, warning: nil) == .critical, "mood: 90% → critical")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 1.0, warning: nil) == .critical, "mood: 100% → critical")
-    check(computeMood(hasActiveBlock: true, elapsedRatio: 1.5, warning: nil) == .critical, "mood: 150%(예산 초과) → critical")
+    check(computeMood(hasActiveBlock: false, ratio: 0.99) == .idle, "mood: 비활성 블록 → idle")
+    check(computeMood(hasActiveBlock: true, ratio: 0.0) == .calm, "mood: 0% → calm")
+    check(computeMood(hasActiveBlock: true, ratio: 0.33) == .calm, "mood: 33% → calm")
+    check(computeMood(hasActiveBlock: true, ratio: 0.339) == .calm, "mood: 33.9% → calm")
+    check(computeMood(hasActiveBlock: true, ratio: 0.34) == .warm, "mood: 34% → warm")
+    check(computeMood(hasActiveBlock: true, ratio: 0.66) == .warm, "mood: 66% → warm")
+    check(computeMood(hasActiveBlock: true, ratio: 0.67) == .hot, "mood: 67% → hot")
+    check(computeMood(hasActiveBlock: true, ratio: 0.89) == .hot, "mood: 89% → hot")
+    check(computeMood(hasActiveBlock: true, ratio: 0.90) == .critical, "mood: 90% → critical")
+    check(computeMood(hasActiveBlock: true, ratio: 1.0) == .critical, "mood: 100% → critical")
+    check(computeMood(hasActiveBlock: true, ratio: 1.5) == .critical, "mood: 150%(예산 초과) → critical")
+    // 무드는 블록 숫자와 같은 판정자(blockUsage)를 거친다 — 서버 %가 있으면 시간 경과가 아니라 할당량을 본다.
+    let moodNow = Date(timeIntervalSince1970: 1_800_000_000)
+    let moodReset = Int(moodNow.timeIntervalSince1970) + 1800
+    let lowServer = blockUsage(serverFiveHour: RateLimitWindow(usedPercentage: 16, resetsAt: moodReset),
+                               warning: nil, elapsedRatio: 0.92, now: moodNow)
+    check(lowServer.source == .server && computeMood(hasActiveBlock: true, ratio: lowServer.ratio) == .calm,
+          "mood: 서버 16% + 경과 92% → calm (시간만 흘렀다고 「한계 근접」이 되면 안 된다)")
+    let highServer = blockUsage(serverFiveHour: RateLimitWindow(usedPercentage: 85, resetsAt: moodReset),
+                                warning: nil, elapsedRatio: 0.10, now: moodNow)
+    check(computeMood(hasActiveBlock: true, ratio: highServer.ratio) == .hot,
+          "mood: 서버 85% + 경과 10% → hot (초반에 빨리 태우면 조용하면 안 된다)")
     if let w = computeUsageWarning(tokens: 950, cost: 0, tokenBudget: 1000, costBudget: 0, warnAt: 0.9, critAt: 1.0) {
-        check(computeMood(hasActiveBlock: true, elapsedRatio: 0.1, warning: w) == .critical,
-              "mood: 예산 설정 시 warning.ratio(0.95)가 elapsedRatio(0.1) 대신 우선 적용")
-    } else { check(false, "mood: warning override 테스트용 UsageWarning 생성 실패") }
+        let budget = blockUsage(serverFiveHour: nil, warning: w, elapsedRatio: 0.1, now: moodNow)
+        check(budget.source == .budget && computeMood(hasActiveBlock: true, ratio: budget.ratio) == .critical,
+              "mood: 서버 값이 없으면 예산 비율(0.95)이 경과율(0.1)보다 우선")
+    } else { check(false, "mood: 예산 우선 테스트용 UsageWarning 생성 실패") }
+    let elapsedOnly = blockUsage(serverFiveHour: nil, warning: nil, elapsedRatio: 0.5, now: moodNow)
+    check(elapsedOnly.source == .elapsed && computeMood(hasActiveBlock: true, ratio: elapsedOnly.ratio) == .warm,
+          "mood: 서버·예산이 모두 없으면 경과율 — statusLine 미연동 사용자의 기존 동작 불변")
 
     // TitleSettings.isFunModeFeatureEnabled / toggleFunModeFeature (전용 UserDefaults suite로 격리)
     let funModeSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
@@ -7159,6 +7200,65 @@ func runSelfTests() -> Never {
         }
     }
 
+    // 무드 아이콘 배색 — 불꽃 겉색은 같은 비율의 limit 램프(= 옆 블록 숫자 색)와 정확히 같아야 한다.
+    func srgbTuple(_ color: NSColor) -> (r: CGFloat, g: CGFloat, b: CGFloat)? {
+        guard let c = color.usingColorSpace(.sRGB) else { return nil }
+        return (c.redComponent, c.greenComponent, c.blueComponent)
+    }
+    for isDark in [false, true] {
+        for r in [0.05, 0.2, 0.5, 0.78, 0.95] {
+            let tier = computeMood(hasActiveBlock: true, ratio: r)
+            let mc = moodColors(tier: tier, ratio: r, isDark: isDark)
+            let c = usageColorComponents(ratio: r, family: .limit, isDark: isDark)
+            let want = hsbToSRGB(hue: c.hue, saturation: c.saturation, brightness: c.brightness)
+            if let got = srgbTuple(mc.outer) {
+                check(abs(got.r - want.r) < 1e-4 && abs(got.g - want.g) < 1e-4 && abs(got.b - want.b) < 1e-4,
+                      "moodColors: \(isDark ? "다크" : "라이트") \(Int(r * 100))% 겉색 == 같은 비율의 limit 램프")
+                check(contrastRatio(got, isDark ? darkBar : lightBar) >= 3.0,
+                      "moodColors: \(isDark ? "다크" : "라이트") \(Int(r * 100))% 아이콘 명암비 3:1 이상(비텍스트 기준)")
+            } else { check(false, "moodColors: sRGB 변환 실패") }
+            if let inner = mc.inner?.usingColorSpace(.sRGB), let outer = mc.outer.usingColorSpace(.sRGB) {
+                check(abs(inner.hueComponent - outer.hueComponent) < 0.01,
+                      "moodColors: \(isDark ? "다크" : "라이트") \(Int(r * 100))% 코어는 같은 색상각(계열 규칙)")
+                // 코어가 아이콘 면적 대부분을 덮으므로 겉색만 검사하면 "불꽃이 배경에 묻히는" 경우를 놓친다.
+                check(contrastRatio((inner.redComponent, inner.greenComponent, inner.blueComponent),
+                                    isDark ? darkBar : lightBar) >= 3.0,
+                      "moodColors: \(isDark ? "다크" : "라이트") \(Int(r * 100))% 코어 명암비 3:1 이상")
+            } else { check(false, "moodColors: 활성 단계는 코어 색이 있어야 함") }
+        }
+    }
+    check(moodColors(tier: .idle, ratio: 0.9, isDark: true).inner == nil,
+          "moodColors: idle은 비율과 무관하게 식은 회색 단색(코어 없음)")
+    if let lava = volcanoColors(for: .critical, ratio: 1.0).inner.flatMap(srgbTuple) {
+        let c = usageColorComponents(ratio: 1.0, family: .limit, isDark: true)
+        let want = hsbToSRGB(hue: c.hue, saturation: c.saturation, brightness: c.brightness)
+        check(abs(lava.r - want.r) < 1e-4 && abs(lava.g - want.g) < 1e-4,
+              "volcanoColors: 용암은 외관과 무관하게 다크 램프 — 어두운 바위 위에 놓이므로")
+    } else { check(false, "volcanoColors: critical은 용암 색이 있어야 함") }
+
+    // 외관 전환 — 상태바 이미지는 한 번 설정된 뒤 외관이 바뀐다. 같은 인스턴스를 라이트→다크 순으로
+    // 그려 두 번째가 새로 만든 다크 이미지와 같아야 한다(첫 렌더를 캐시해 재사용하면 여기서 깨진다).
+    func renderPixels(_ image: NSImage, _ name: NSAppearance.Name) -> Data? {
+        guard let appearance = NSAppearance(named: name),
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 22, pixelsHigh: 28,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        rep.size = image.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        appearance.performAsCurrentDrawingAppearance { image.draw(in: NSRect(origin: .zero, size: image.size)) }
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.tiffRepresentation
+    }
+    for theme in [MoodGlyphTheme.flame, .thermometer, .battery, .gauge] {
+        let shared = currentMoodImage(theme: theme, tier: .hot, ratio: 0.8, elapsed: 0)
+        let lightPx = renderPixels(shared, .aqua)
+        let darkPx = renderPixels(shared, .darkAqua)
+        let freshDarkPx = renderPixels(currentMoodImage(theme: theme, tier: .hot, ratio: 0.8, elapsed: 0), .darkAqua)
+        check(lightPx != nil && lightPx != darkPx && darkPx == freshDarkPx,
+              "무드 아이콘(\(theme.rawValue)): 같은 인스턴스를 라이트→다크로 그리면 다크 색으로 다시 그려진다")
+    }
+
     // 필드 → 계열 배선. 같은 비율(blockRatio)을 쓰는 네 필드가 한 계열이어야 색이 갈리지 않는다.
     check(titleFieldFamily(.totalTokens) == .limit && titleFieldFamily(.outputTokens) == .limit
           && titleFieldFamily(.cost) == .limit && titleFieldFamily(.remainingTime) == .limit,
@@ -7637,6 +7737,29 @@ func runSelfTests() -> Never {
         let activeData = wireApp.makeBlockDisplayData(fromEntries: [activeEntry], reader: wireReader, now: wireNow)
         check(activeData.rateLimitReset == nil,
               "makeBlockDisplayData(fromEntries:): 활성 블록이 있으면 한도 도달 캐시가 신선해도 rateLimitReset은 nil")
+
+        // 무드 배선 — 경과율이 높아도 서버가 16%라고 하면 기분 비율은 16%여야 한다. 기준 시각이 실제 현재인
+        // 이유는 FiveHourBlock.progress가 주입된 now가 아니라 Date()로 경과를 재기 때문이다.
+        let moodWireNow = Date()
+        wireApp.cachedRateLimits = RateLimitsCache(
+            fiveHour: RateLimitWindow(usedPercentage: 16, resetsAt: Int(moodWireNow.timeIntervalSince1970) + 1200),
+            sevenDay: nil)
+        // 블록 시작이 UTC 정시 내림이라, 첫 엔트리를 "현재 정시 − 4시간" 직후에 둬야 분(minute)과 무관하게
+        // 블록이 활성이고 경과율이 80~100%다(상대 오프셋은 현재 분에 따라 블록이 이미 끝나 버린다).
+        let moodBlockStart = floor(moodWireNow.timeIntervalSince1970 / 3600) * 3600 - 4 * 3600
+        let longRun = [moodBlockStart + 60, moodBlockStart + 3600, moodBlockStart + 7200,
+                       moodWireNow.timeIntervalSince1970 - 30].map { t in
+            UsageEntry(timestamp: Date(timeIntervalSince1970: t), model: "claude-sonnet-5",
+                       inputTokens: 0, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0)
+        }
+        let moodData = wireApp.makeBlockDisplayData(fromEntries: longRun, reader: wireReader, now: moodWireNow)
+        if case .ready(let block?, _, _, _) = moodData.state {
+            check(block.progressRatio >= 0.8, "무드 배선 픽스처: 경과율이 높아야 시나리오가 성립한다(\(Int(block.progressRatio * 100))%)")
+            check(abs(block.moodRatio - 0.16) < 1e-9 && block.moodSource == .server,
+                  "makeBlockDisplayData(fromEntries:): 기분 비율은 경과율이 아니라 서버 실측 16%")
+        } else {
+            check(false, "무드 배선: 활성 블록이 있는 .ready 상태여야 함")
+        }
     }
 
     // migrateLegacyDefaultsIfNeeded (전용 legacy/new suite 쌍으로 격리 — 실제 ClaudeMonitor 도메인은 건드리지 않음)
