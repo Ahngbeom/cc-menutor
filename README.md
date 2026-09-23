@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/in
 최신 릴리스가 자동으로 선택됩니다. 특정 버전을 원하면 `CC_MENUTOR_VERSION`을 지정하세요:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/install.sh | CC_MENUTOR_VERSION=1.16 bash
+curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/install.sh | CC_MENUTOR_VERSION=1.17 bash
 ```
 
 제거: `curl -fsSL https://raw.githubusercontent.com/Ahngbeom/cc-menutor/main/scripts/uninstall.sh | bash`
