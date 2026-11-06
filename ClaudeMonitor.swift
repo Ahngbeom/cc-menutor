@@ -2618,6 +2618,14 @@ struct StatsCache: Codable {
         blocks?.blocks.first(where: { $0.isActive && !$0.isExpired(now: now) })
     }
 
+    // now 기준 나이로 바꾸지 말 것 — 쓰는 쪽(statusLine)은 활동 중에만 돌아 유휴 동안엔 캐시가 오래된 게
+    // 정상이라, 나이로 재면 쉴 때마다 추정 모드로 빠진다.
+    func staleSince(latestActivity: Date?, threshold: TimeInterval = STATS_CACHE_STALE_THRESHOLD) -> Date? {
+        guard let ts = timestamp, let latest = latestActivity else { return nil }
+        let written = Date(timeIntervalSince1970: ts)
+        return latest.timeIntervalSince(written) > threshold ? written : nil
+    }
+
     // CLI가 stats-cache.json에 쓰는 daily 키는 **그레고리력** "yyyy-MM-dd"다. 따라서 비교용
     // 문자열도 반드시 그레고리력으로 만들어야 한다(gregorianDayString 주석 참고) — 예전엔 로케일
     // 기본 DateFormatter를 써서, 시스템 달력이 불교력/일본 연호면 "2569-07-29" 같은 키가 나와
@@ -2678,6 +2686,26 @@ struct StatsCache: Codable {
         }
         return (cur, prev, start, tz)
     }
+}
+
+// statusLine은 도구 호출 사이에만 다시 그려져, 긴 단일 작업(서브에이전트·빌드) 동안엔 다른 세션이 JSONL을
+// 쌓아도 캐시가 멈춰 있다 — 좁히면 그때마다 추정 모드가 거짓으로 깜빡인다.
+let STATS_CACHE_STALE_THRESHOLD: TimeInterval = 60 * 60
+
+func primaryStatsCache(_ stats: StatsCache?, latestActivity: Date?) -> (stats: StatsCache?, staleSince: Date?) {
+    guard let stats = stats else { return (nil, nil) }
+    if let since = stats.staleSince(latestActivity: latestActivity) { return (nil, since) }
+    return (stats, nil)
+}
+
+func estimateBannerText(staleCacheSince: Date?, now: Date = Date(), defaults: UserDefaults = .standard) -> String {
+    guard let since = staleCacheSince else {
+        return t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)",
+                 "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)", defaults: defaults)
+    }
+    let ago = formatTime(now.timeIntervalSince(since))
+    return t("⚠ 추정 모드 — stats-cache.json 갱신 멈춤 (\(ago) 전, 비용은 근사치)",
+             "⚠ Estimate Mode — stats-cache.json not updated for \(ago) (costs are approximate)", defaults: defaults)
 }
 
 final class StatsCacheReader {
@@ -3232,9 +3260,10 @@ struct BlockSectionData {
 
 struct BlockDisplayData {
     let isEstimate: Bool              // 폴백 경로에서만 true → "추정 모드" 배너
+    let staleCacheSince: Date?        // 폴백 사유가 "파일 없음"이 아니라 "갱신 멈춤"일 때 그 기록 시각
     // 1차(stats-cache) 경로에서 리셋 앵커가 활성화돼 이 블록의 토큰/비용을 CLI의 costUSD 대신
     // JSONL 기반 추정치로 재계산했을 때만 true → "⚓ 앵커 적용 중 — 비용 추정치" 배너(isEstimate와
-    // 별개 조건 — 둘 다 true일 일은 없다. isEstimate는 stats-cache 자체가 없을 때만이므로).
+    // 별개 조건 — 둘 다 true일 일은 없다. isEstimate는 stats-cache를 1차로 쓰지 못할 때만이므로).
     let anchorIsEstimating: Bool
     // 활성 블록이 없을 때(idle)만 채워진다 — rate-limits-cache.json이 신선하고 five_hour 사용률이
     // 100%에 도달했으면 그 리셋 시각. 그 외(데이터 없음/stale/블록 활성 중)에는 nil — 호출부가
@@ -3270,11 +3299,12 @@ struct BlockDisplayData {
     // Swift의 synthesized memberwise init은 저장 프로퍼티 기본값을 파라미터 기본값으로 승격시켜주지
     // 않는다. 기본값 nil이 곧 회귀 가드다: 이 필드를 모르는 기존 호출부·셀프테스트가 수정 없이
     // 컴파일되고 통과하는 것이 "기존 사용자 화면 불변"의 증거다(통화 기능 도입 때와 같은 방식).
-    init(isEstimate: Bool, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil,
+    init(isEstimate: Bool, staleCacheSince: Date? = nil, anchorIsEstimating: Bool = false, rateLimitReset: Date? = nil,
          serverLimits: ServerLimitsSectionData? = nil, currency: CurrencyDisplay = .none,
          week: PeriodSectionData? = nil, month: PeriodSectionData? = nil,
          limitTrend: LimitTrendSectionData? = nil, state: State) {
         self.isEstimate = isEstimate
+        self.staleCacheSince = staleCacheSince
         self.anchorIsEstimating = anchorIsEstimating
         self.rateLimitReset = rateLimitReset
         self.serverLimits = serverLimits
@@ -3294,7 +3324,8 @@ extension BlockDisplayData {
         // currency도 반드시 함께 전파한다 — 빠뜨리면 메뉴가 열린 채 새로고침될 때 금액이
         // 달러로 한 프레임 되돌아가 행 폭이 흔들린다. week/month도 같은 이유로 전파한다
         // (빠뜨리면 새로고침 중에만 두 섹션이 통째로 사라져 메뉴 높이가 튄다).
-        return BlockDisplayData(isEstimate: isEstimate, anchorIsEstimating: anchorIsEstimating,
+        return BlockDisplayData(isEstimate: isEstimate, staleCacheSince: staleCacheSince,
+                                 anchorIsEstimating: anchorIsEstimating,
                                  rateLimitReset: rateLimitReset, serverLimits: serverLimits,
                                  currency: currency, week: week, month: month, limitTrend: limitTrend,
                                  state: .loading(block: block, model: model, today: today, allTime: allTime))
@@ -3312,6 +3343,7 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastUpdateTime = Date(timeIntervalSince1970: 0)
     var cachedAll: [UsageEntry] = []
     var cachedStats: StatsCache?
+    var staleStatsCacheSince: Date?
     var cachedRateLimits: RateLimitsCache?
     // 한도 소진 이력. 앱 시작 시 디스크에서 부트스트랩하므로 재시작해도 이어서 쌓인다
     // (LaunchAgent로 상시 실행되지만 재부팅·업데이트로 끊기는 것을 감당해야 한다).
@@ -3540,7 +3572,9 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let entries = self.reader.readAll()
             let rateLimits = self.rateLimitsReader.load()
             DispatchQueue.main.async {
-                self.cachedStats = stats
+                let primary = primaryStatsCache(stats, latestActivity: entries.last?.timestamp)
+                self.cachedStats = primary.stats
+                self.staleStatsCacheSince = primary.staleSince
                 self.cachedAll = entries
                 self.cachedRateLimits = rateLimits
                 self.lastUpdateTime = Date()
@@ -4137,14 +4171,16 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .loading(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
                                  week: data.week, month: data.month, limitTrend: data.limitTrend,
-                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
+                                 isEstimate: data.isEstimate, staleCacheSince: data.staleCacheSince,
+                                 anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
                                  currency: data.currency, skeleton: true, into: menu)
 
         case .ready(let block, let model, let today, let allTime):
             renderBlockSections(block: block, model: model, today: today, allTime: allTime,
                                  week: data.week, month: data.month, limitTrend: data.limitTrend,
-                                 isEstimate: data.isEstimate, anchorIsEstimating: data.anchorIsEstimating,
+                                 isEstimate: data.isEstimate, staleCacheSince: data.staleCacheSince,
+                                 anchorIsEstimating: data.anchorIsEstimating,
                                  rateLimitReset: data.rateLimitReset, serverLimits: data.serverLimits,
                                  currency: data.currency, skeleton: false, into: menu)
         }
@@ -4157,12 +4193,12 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                       allTime: AllTimeSectionData?,
                                       week: PeriodSectionData? = nil, month: PeriodSectionData? = nil,
                                       limitTrend: LimitTrendSectionData? = nil,
-                                      isEstimate: Bool, anchorIsEstimating: Bool,
+                                      isEstimate: Bool, staleCacheSince: Date? = nil, anchorIsEstimating: Bool,
                                       rateLimitReset: Date?, serverLimits: ServerLimitsSectionData? = nil,
                                       currency: CurrencyDisplay = .none,
                                       skeleton: Bool, into menu: NSMenu) {
         if isEstimate {
-            addSectionHeader(menu, t("⚠ 추정 모드 — stats-cache.json 없음 (비용은 근사치)", "⚠ Estimate Mode — stats-cache.json missing (costs are approximate)"))
+            addSectionHeader(menu, estimateBannerText(staleCacheSince: staleCacheSince))
             menu.addItem(.separator())
         } else if anchorIsEstimating {
             addSectionHeader(menu, t("⚓ 리셋 앵커 적용 중 — 이 블록 비용은 추정치", "⚓ Reset anchor active — this block's cost is estimated"))
@@ -5130,7 +5166,8 @@ class ClaudeMonitorApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let rateLimitReset = activeBlock == nil ? rateLimitResetIfExceeded(self.cachedRateLimits, now: now) : nil
         let periods = makePeriodSections(fromEntries: cachedAll, now: now)
 
-        return BlockDisplayData(isEstimate: true, rateLimitReset: rateLimitReset,
+        return BlockDisplayData(isEstimate: true, staleCacheSince: staleStatsCacheSince,
+                                 rateLimitReset: rateLimitReset,
                                  serverLimits: makeServerLimitsSection(from: self.cachedRateLimits, now: now),
                                  currency: currencyDisplay(currency: CurrencySettings.currency(),
                                                            rate: cachedExchangeRate, now: now),
@@ -6018,6 +6055,32 @@ func runSelfTests() -> Never {
           "makeBlockDisplayData(fromEntries:): 한도 추이가 BlockDisplayData까지 배선됨")
     check(trendWired.asLoadingSkeleton()?.limitTrend != nil,
           "asLoadingSkeleton(): 한도 추이도 전파(새로고침 중 섹션이 사라지지 않음)")
+    let staleWrittenAt = lhNow.addingTimeInterval(-2 * 86400)
+    let staleApp = ClaudeMonitorApp()
+    staleApp.staleStatsCacheSince = staleWrittenAt
+    let staleWired = staleApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow, anchor: nil)
+    check(staleWired.isEstimate && staleWired.staleCacheSince == staleWrittenAt,
+          "makeBlockDisplayData(fromEntries:): 갱신 멈춤 시각이 BlockDisplayData까지 배선됨")
+    check(staleWired.asLoadingSkeleton()?.staleCacheSince == staleWrittenAt,
+          "asLoadingSkeleton(): 갱신 멈춤 시각도 전파(새로고침 중 배너 문구가 바뀌지 않음)")
+    check(trendWired.staleCacheSince == nil,
+          "makeBlockDisplayData(fromEntries:): 캐시 파일이 없을 때는 갱신 멈춤 시각 nil")
+
+    let bannerSuite = "ClaudeMonitorSelfTest.\(UUID().uuidString)"
+    if let bd = UserDefaults(suiteName: bannerSuite) {
+        TitleSettings.setLanguagePreference(.korean, defaults: bd)
+        let missingBanner = estimateBannerText(staleCacheSince: nil, now: lhNow, defaults: bd)
+        let staleBanner = estimateBannerText(staleCacheSince: staleWrittenAt, now: lhNow, defaults: bd)
+        check(missingBanner.contains("없음"), "추정 모드 배너: 캐시 없음 → '없음' 문구")
+        check(staleBanner.contains("갱신 멈춤") && !staleBanner.contains("없음"),
+              "추정 모드 배너: 갱신 멈춤 → 파일 없음과 다른 문구")
+        check(staleBanner.contains(formatTime(2 * 86400)),
+              "추정 모드 배너: 마지막 갱신 후 경과 시간 표기")
+        bd.removePersistentDomain(forName: bannerSuite)
+    } else {
+        check(false, "추정 모드 배너: 전용 UserDefaults suite 생성 성공해야 함")
+    }
+
     let emptyTrendApp = ClaudeMonitorApp()
     emptyTrendApp.cachedLimitHistory = .empty
     check(emptyTrendApp.makeBlockDisplayData(fromEntries: [], reader: trendReader, now: lhNow, anchor: nil).limitTrend == nil,
@@ -6164,6 +6227,28 @@ func runSelfTests() -> Never {
         check(sc.activeBlock(now: inBlock)?.projection?.remainingMinutes == 77, "stats: projection remainingMinutes")
         // isActive:true 이지만 endTime(10:00Z) 이후 시각 → stale 캐시로 보고 배제
         check(sc.activeBlock(now: parseISO8601("2026-06-30T11:00:00.000Z")!) == nil, "stats: 만료된 활성 블록 배제(stale)")
+
+        let written = Date(timeIntervalSince1970: 1782808979)
+        check(sc.staleSince(latestActivity: written.addingTimeInterval(60)) == nil,
+              "stats 갱신 멈춤: 최신 활동이 기록 후 1분 → 신선(정상 TTL 범위)")
+        check(sc.staleSince(latestActivity: written.addingTimeInterval(STATS_CACHE_STALE_THRESHOLD)) == nil,
+              "stats 갱신 멈춤: 시차가 정확히 임계값이면 아직 신선(경계)")
+        check(sc.staleSince(latestActivity: written.addingTimeInterval(STATS_CACHE_STALE_THRESHOLD + 1)) == written,
+              "stats 갱신 멈춤: 시차가 임계값 초과 → 캐시 기록 시각 반환")
+        check(sc.staleSince(latestActivity: nil) == nil,
+              "stats 갱신 멈춤: 활동 기록이 없으면 판정하지 않음(쉬는 중엔 캐시가 오래돼도 정상)")
+        check(sc.staleSince(latestActivity: written.addingTimeInterval(-3600)) == nil,
+              "stats 갱신 멈춤: 최신 활동이 캐시보다 앞서면 신선")
+
+        let freshPick = primaryStatsCache(sc, latestActivity: written.addingTimeInterval(60))
+        check(freshPick.stats != nil && freshPick.staleSince == nil,
+              "primaryStatsCache: 신선한 캐시는 1차 소스로 채택")
+        let stalePick = primaryStatsCache(sc, latestActivity: written.addingTimeInterval(2 * 86400))
+        check(stalePick.stats == nil && stalePick.staleSince == written,
+              "primaryStatsCache: 갱신 멈춘 캐시는 버리고(JSONL 폴백) 기록 시각을 넘김")
+        let missingPick = primaryStatsCache(nil, latestActivity: written)
+        check(missingPick.stats == nil && missingPick.staleSince == nil,
+              "primaryStatsCache: 캐시 파일 없음 → 갱신 멈춤이 아니라 그냥 없음")
         check(sc.todayPeriod()?.totalCost == 1.5, "stats: todayPeriod 날짜 매칭")
         check(sc.todayPeriod()?.modelBreakdowns?.first?.tokens == 10, "stats: modelBreakdown 토큰 합")
         check(sc.cumulative?.totalTokens == 12345, "stats: cumulative = monthly.totals")
@@ -6446,6 +6531,8 @@ func runSelfTests() -> Never {
     if let sc2 = try? JSONDecoder().decode(StatsCache.self, from: Data(partialJSON.utf8)) {
         check(sc2.activeBlock(now: inBlock) == nil, "stats: 활성 블록 없음")
         check(sc2.cumulative?.totalTokens == 5, "stats: monthly 없으면 daily.totals 폴백")
+        check(sc2.staleSince(latestActivity: Date()) == nil,
+              "stats 갱신 멈춤: timestamp 없는 캐시는 판정 불가 → 기존처럼 1차로 신뢰")
     } else {
         check(false, "부분 캐시 디코드 성공해야 함")
     }
